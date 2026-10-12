@@ -1123,9 +1123,9 @@ Template:
   holds and retro-masks them like a complete result's, fails closed the same
   way when they cannot be applied, and marks the re-emit candidate in their
   reach, but sets `covered` only for a complete cycle. The gate
-  (`Lookahead::gate()`) is unchanged. Public API unchanged (`ScanResult`
-  fields and `Scheduler` signatures are the same; only what an incomplete
-  result carries changed).
+  (`Lookahead::gate()`) is unchanged. `Scheduler` signatures are unchanged;
+  `ScanResult` gains one field, `detections_lost` (see the review follow-up
+  below).
 - Decisions (no one to ask; recall over precision, smallest change):
   (1) A recognizer or policy failure keeps **every** region, including any
   the policy judged safe before it threw: no text stage that finished
@@ -1164,6 +1164,29 @@ Template:
 - Eval delta: not measured locally; the agent sandbox refuses the eval
   command. Nothing feeds the scheduler a real pipeline until SPG-11; see the
   PR's Check log for the CI stage.
-- Open issues or follow-ups: none new. The coverage-assumption risk in
-  scheduler.md (content that appears and disappears between cycles) is
-  unchanged.
+- Review follow-up (Greptile, P1): an allocation failure while `run_scan()`
+  collected boxes a stage had returned (the face insert, the per-region
+  policy flags, appending regions) returned only what was collected, so
+  `complete()` held less than the cycle saw. `ScanResult::detections_lost`
+  now marks that case and `complete()` fails closed the boxes' whole window
+  (`ApplyFailed`, `ts - retro` to `ts + hold`). Tests: a sweep that fails
+  each allocation of one cycle in turn (`tests/unit/fail_alloc.cpp` replaces
+  `operator new` for `spg-unit-tests`) and a `complete()` case; both fail
+  with the fix removed.
+- CI follow-up: the ubuntu-24.04 job failed the property test at seed 1444
+  (frame 67 released clean, "no complete cycle covers it"). libstdc++ and
+  libc++ implement `uniform_int_distribution`, `bernoulli_distribution` and
+  `std::shuffle` differently, so each platform runs different scenes for one
+  seed; replaying libstdc++'s algorithms on macOS reproduced it exactly. The
+  scheduler was right: that scene's one-off resize landed on a flapping frame
+  that toggled straight back, so the pushed size did not change, but the
+  oracle counted two resizes and a new segment. The oracle now counts a
+  resize only when the pushed size differs from the previous frame's (the
+  only thing the scheduler can see); its assertions are unchanged. All 1500
+  seeds pass under both libc++ and the replayed libstdc++ sequence.
+- Open issues or follow-ups: `native_secure_platform()` and
+  `SecureHeap::process()` (core/src/secure/secure_memory.cpp) allocate on
+  first use; the former is `noexcept`, so an allocation failure on the
+  first `Secret` of a process terminates instead of throwing. Pre-existing,
+  outside this ticket. The coverage-assumption risk in scheduler.md (content
+  that appears and disappears between cycles) is unchanged.

@@ -17,6 +17,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "fail_alloc.hpp"
 #include "mask/mask_rects.hpp"
 #include "schedule_fakes.hpp"
 #include "spg/error.hpp"
@@ -1171,6 +1172,114 @@ TEST_CASE("a failed cycle whose boxes cannot be applied fails closed every frame
   const auto out = sim.release_at(1900);
   REQUIRE(out.size() == 4);
   CHECK(out[0].reason == FallbackReason::ApplyFailed);  // on main: clean, without the box
+  CHECK(out[1].reason == FallbackReason::ApplyFailed);
+  CHECK(out[2].reason == FallbackReason::ApplyFailed);
+  CHECK(out[3].action == FallbackAction::None);
+}
+
+// Greptile on PR #58: an allocation failure while run_scan() collects the
+// boxes a stage returned (the face insert, the policy's per-region flags,
+// appending regions) used to return only what was collected so far, so the
+// scheduler held less than the cycle saw.
+TEST_CASE("a cycle that cannot keep every box its stages returned says so", "[schedule]") {
+  const Rect face{10, 10, 20, 20};
+  const Rect r1{0, 50, 60, 10};
+  const Rect r2{0, 70, 60, 10};
+  const auto regions = std::make_shared<spg_test::ScriptedDetector>([=](Timestamp, Size) {
+    return std::vector<Detection>{text_at(r1.x, r1.y, r1.width, r1.height), text_at(r2.x, r2.y, r2.width, r2.height)};
+  });
+  // r1 reads "fine", r2 reads "SECRET" (sensitive to ScriptedPolicy).
+  const auto recognizer = std::make_shared<spg_test::ScriptedRecognizer>(
+      [](const Detection& d) { return std::string(d.box.rect.y == 50.0F ? "fine" : "SECRET"); });
+  const spg::ScanStages stages{faces_always(face), regions, recognizer, std::make_shared<spg_test::ScriptedPolicy>()};
+  Sim sim(small_config());
+  sim.push(1000, true);
+  std::optional<spg::ScanJob> job = sim.la.take_job();
+  REQUIRE(job.has_value());
+  const spg::ScanLimits& all = sim.la.config().scan;
+  const auto rects = [](const spg::ScanResult& r) {
+    std::vector<Rect> out;
+    for (const Detection& d : r.detections) {
+      out.push_back(d.box.rect);
+    }
+    return out;
+  };
+
+  // One clean cycle first, so one-time setup (the secure heap behind Secret)
+  // is done and the sweep sees only the allocations of a cycle.
+  REQUIRE(spg::run_scan(stages, *job, all).complete);
+  // Fail each allocation the cycle makes in turn, until one runs clean.
+  std::uint64_t n = 0;
+  int lost = 0;
+  for (;; ++n) {
+    REQUIRE(n < 10000);
+    spg::ScanResult r;
+    bool fired = false;
+    {
+      const spg_test::FailAllocations fail(n);
+      r = spg::run_scan(stages, *job, all);
+      fired = fail.fired();
+    }
+    INFO("allocation " << n);
+    if (!fired) {
+      CHECK(r.complete);
+      CHECK_FALSE(r.detections_lost);
+      CHECK(rects(r) == std::vector<Rect>{face, r2});
+      break;
+    }
+    CHECK_FALSE(r.complete);
+    switch (r.failure) {
+      case spg::ScanFailure::FaceDetector:  // the stage itself failed
+        CHECK_FALSE(r.detections_lost);
+        CHECK(r.detections.empty());
+        break;
+      case spg::ScanFailure::TextDetector:
+        CHECK_FALSE(r.detections_lost);
+        CHECK(rects(r) == std::vector<Rect>{face});
+        break;
+      case spg::ScanFailure::Recognizer:
+      case spg::ScanFailure::Policy:
+        CHECK_FALSE(r.detections_lost);
+        CHECK(rects(r) == std::vector<Rect>{face, r1, r2});
+        break;
+      default:
+        // Every stage output here is valid: an InvalidOutput result is an
+        // allocation failure while collecting, and must say boxes were lost.
+        CHECK(r.failure == spg::ScanFailure::InvalidOutput);
+        CHECK(r.detections_lost);
+        ++lost;
+        break;
+    }
+  }
+  CHECK(lost > 0);
+}
+
+TEST_CASE("a cycle that lost boxes it found fails closed every frame they could mask", "[schedule]") {
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;  // retro 100 ms, hold 200 ms
+  Sim sim(config, spg::ScanStages{nothing(), nullptr, nullptr, nullptr});
+  sim.push(1000, true);
+  sim.scan_now();  // an empty cycle covers 1000
+  sim.push(1050, true);
+  auto [job, result] = sim.run();
+  // What run_scan() returns when collecting the boxes fails: the face the
+  // cycle found is missing from `detections`, and the result says so.
+  result.complete = false;
+  result.failure = spg::ScanFailure::InvalidOutput;
+  result.detections.clear();
+  result.detections_lost = true;
+  sim.la.complete(job, result);
+  CHECK(sim.la.stats().scans_failed == 1);
+  CHECK(sim.la.stats().scans_completed == 1);
+  sim.push(1100, true);  // within the hold after 1050
+  sim.scan_now();
+  sim.push(1300, true);  // past it
+  sim.scan_now();
+  const auto out = sim.release_at(1900);
+  REQUIRE(out.size() == 4);
+  // Without the flag, 1000 and 1100 aired clean: an empty incomplete result
+  // changes nothing.
+  CHECK(out[0].reason == FallbackReason::ApplyFailed);
   CHECK(out[1].reason == FallbackReason::ApplyFailed);
   CHECK(out[2].reason == FallbackReason::ApplyFailed);
   CHECK(out[3].action == FallbackAction::None);

@@ -142,6 +142,13 @@ coverage: an incomplete cycle never sets `covered`, so it never lets a frame
 air clean (rule 1). It counts in `scans_failed`, never in `scans_completed`.
 An incomplete result with no boxes changes nothing but `scans_failed`.
 
+If an allocation fails while `run_scan()` collects the boxes a stage returned
+(appending faces or regions, or the per-region policy flags), `detections`
+holds only part of what the cycle saw, and nothing can hold the rest. The
+result then sets `detections_lost`, and `complete()` fails closed exactly as
+for a result it cannot apply (`ApplyFailed` from `ts - retro` to `ts + hold`)
+instead of holding the partial list.
+
 ## Masks
 
 `MaskPlan.rects` for a frame at `t` is the union of:

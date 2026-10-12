@@ -188,8 +188,10 @@ ScanResult run_scan(const ScanStages& stages, const ScanJob& job, const ScanLimi
       }
     }
   } catch (...) {
-    // Allocation failure while collecting results. What was collected is
-    // valid and still held.
+    // Allocation failure while collecting the boxes a stage returned: some
+    // are missing from `detections`, so the scheduler must fail closed
+    // their whole window (retro and hold) rather than hold only what is here.
+    result.detections_lost = true;
     return failed(std::move(result), ScanFailure::InvalidOutput);
   }
   result.complete = true;

@@ -169,12 +169,18 @@ struct ScanResult {
   // none), and the valid boxes of a stage whose output was malformed. The
   // scheduler holds them without counting the cycle as a scan.
   std::vector<Detection> detections;
+  // True when a stage returned boxes that `detections` could not all keep
+  // (an allocation failure while collecting them). Nothing can hold a box it
+  // never received, so the scheduler fails closed every frame they could
+  // have masked, as for a result it cannot apply. Implies !complete.
+  bool detections_lost = false;
 };
 
 // Runs one cycle, stopping at the first failure. Never throws: any exception
 // from a stage (InferenceFailed, DecodeError, ContractError, bad_alloc, or a
 // non-std exception) or invalid output yields an incomplete result with the
-// detections found before it. Never logs, and keeps no text.
+// detections found before it; an allocation failure while collecting them
+// sets detections_lost. Never logs, and keeps no text.
 [[nodiscard]] ScanResult run_scan(const ScanStages& stages, const ScanJob& job,
                                   const ScanLimits& limits) noexcept;
 

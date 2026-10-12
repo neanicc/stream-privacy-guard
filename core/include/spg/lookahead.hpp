@@ -133,8 +133,9 @@ struct SchedulerStats {
 //     stages that finished before a failure) are held and masked
 //     retroactively like a complete cycle's, but the cycle covers no frame.
 //   * A cycle whose detections cannot be fully applied (an allocation
-//     or tracker failure, or a result from before more resizes than the size
-//     history holds) fails closed every frame it could have masked: buffered
+//     or tracker failure, a result from before more resizes than the size
+//     history holds, or a scan that lost some of the boxes it found) fails
+//     closed every frame it could have masked: buffered
 //     frames from ts - retro on, frames pushed up to ts + hold, and the frame
 //     HoldLastScanned would show again.
 //   * Frames are released once each, in push order, never before
@@ -175,7 +176,8 @@ class Lookahead {
   // Applies a finished job. An incomplete result covers nothing, but its
   // detections are held and masked retroactively; a complete result, or an
   // incomplete one with detections, that cannot be applied fails closed what
-  // it could have masked.
+  // it could have masked, as does one whose detections were lost
+  // (ScanResult::detections_lost).
   // Throws ContractError for a job that was not taken or was already
   // completed.
   void complete(const ScanJob& job, const ScanResult& result);

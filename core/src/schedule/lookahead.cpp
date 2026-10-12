@@ -187,6 +187,13 @@ void Lookahead::complete(const ScanJob& job, const ScanResult& result) {
     throw ContractError("lookahead: complete() for a job that is not in flight");
   }
   in_flight_.erase(it);
+  if (result.detections_lost) {
+    // The cycle found boxes it could not return: nothing can hold or
+    // retro-mask what is missing, so every frame they could have masked
+    // fails closed.
+    fail_closed(job);
+    return;
+  }
   // An incomplete cycle covers no frame, but the boxes its finished stages
   // found are still held and masked retroactively (a partial cycle), so a
   // later cycle that misses them cannot air them inside the hold.
