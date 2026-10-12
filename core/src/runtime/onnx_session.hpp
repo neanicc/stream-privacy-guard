@@ -137,6 +137,10 @@ class Session {
   Session(Session&&) noexcept;
   Session& operator=(Session&&) noexcept;
 
+  // A moved-from Session holds no model: only destroy it or assign to it.
+  // metadata(), run() and warmup() on it throw RuntimeError InvalidInput; the
+  // noexcept accessors below require a session that was not moved from.
+
   // The provider the session was created with. ONNX Runtime may still run
   // individual nodes the provider does not support on CPU.
   [[nodiscard]] Provider provider() const noexcept;

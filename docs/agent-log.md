@@ -131,7 +131,8 @@ Template:
   (rank, fixed dimensions, positive dimensions, overflow-safe element count)
   with the same helper as `run()` before allocating any buffer, so a wrong or
   huge shape is `InvalidInput` instead of a multi-GB allocation; opening a
-  session with a moved-from `Environment` is `InvalidInput`, not a null
+  session with a moved-from `Environment`, or calling `run()`, `warmup()` or
+  `metadata()` on a moved-from `Session`, is `InvalidInput`, not a null
   dereference. The default-provider tests now check the recorded attempts
   (earlier providers failed with a reason, the selected one is last) so a
   listed GPU provider that fails on a machine is not a false failure; macOS
@@ -142,4 +143,7 @@ Template:
   1.24.4 or Windows ML, or CUDA) with a Windows GPU test machine; give the
   PP-OCR detector fixed tile shapes (or ORT free-dimension overrides) so
   CoreML can accelerate it (SPG-06/SPG-16); `Session::provider()` names the
-  registered provider, and ORT may still place unsupported nodes on CPU.
+  registered provider, and ORT may still place unsupported nodes on CPU;
+  `run()` allocates its input values and copies every output per call, so
+  SPG-05/06 should measure that in `bench` and decide whether to add a
+  caller-owned-output (or `Ort::IoBinding`) overload.

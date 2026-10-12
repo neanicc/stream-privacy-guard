@@ -334,6 +334,18 @@ TEST_CASE("A moved session keeps working", "[runtime]") {
   const Session second = std::move(first);
   const std::vector<float> input{1, 2, 3, 4, 5, 6};
   CHECK(doubled(second, input, {2, 3}) == times_two(input));
+
+  SECTION("the moved-from session fails closed with InvalidInput") {
+    const std::vector<std::int64_t> shape{2, 3};
+    const TensorView view{input, shape};
+    // NOLINTBEGIN(bugprone-use-after-move): the moved-from state is under test
+    const std::string message =
+        error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(first.run({&view, 1})); });
+    CHECK_THAT(message, ContainsSubstring("moved from"));
+    error_of(ErrorCode::InvalidInput, [&] { first.warmup({}); });
+    error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(first.metadata("spg_fixture")); });
+    // NOLINTEND(bugprone-use-after-move)
+  }
 }
 
 TEST_CASE("Pinned models load, warm up and run", "[runtime][models]") {

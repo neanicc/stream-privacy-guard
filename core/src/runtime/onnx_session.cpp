@@ -59,18 +59,17 @@ std::optional<std::size_t> fitted_count(std::span<const std::int64_t> shape, std
     return std::nullopt;
   }
   constexpr std::size_t kMaxCount = std::numeric_limits<std::size_t>::max() / sizeof(float);
-  constexpr auto kMaxDim = static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
   std::size_t count = 1;
   for (std::size_t d = 0; d < shape.size(); ++d) {
     const std::int64_t dim = shape[d];
     if (dim <= 0 || (spec[d] >= 0 && spec[d] != dim)) {
       return std::nullopt;
     }
-    const auto size = static_cast<std::size_t>(dim);
-    if (size > kMaxDim || size > kMaxCount / count) {
+    // Compared as uint64 before narrowing, so a 32-bit size_t cannot truncate.
+    if (static_cast<std::uint64_t>(dim) > kMaxCount / count) {
       return std::nullopt;
     }
-    count *= size;
+    count *= static_cast<std::size_t>(dim);
   }
   return count;
 }
@@ -276,6 +275,15 @@ std::unique_ptr<Session::Impl> create_impl(Ort::Env& env, const fs::path& path, 
   return impl;
 }
 
+// A moved-from Session has no Impl. Calls that can throw fail closed with an
+// error instead of dereferencing null.
+const Session::Impl& live(const std::unique_ptr<Session::Impl>& impl) {
+  if (!impl) {
+    throw RuntimeError(ErrorCode::InvalidInput, "spg runtime: this Session was moved from and holds no model");
+  }
+  return *impl;
+}
+
 }  // namespace
 
 Session::Session(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -361,8 +369,9 @@ const std::vector<TensorInfo>& Session::inputs() const noexcept { return impl_->
 const std::vector<TensorInfo>& Session::outputs() const noexcept { return impl_->outputs; }
 
 std::optional<std::string> Session::metadata(std::string_view key) const {
+  const Impl& impl = live(impl_);
   const Ort::AllocatorWithDefaultOptions allocator;
-  const Ort::ModelMetadata meta = impl_->session.GetModelMetadata();
+  const Ort::ModelMetadata meta = impl.session.GetModelMetadata();
   const Ort::AllocatedStringPtr value = meta.LookupCustomMetadataMapAllocated(std::string(key).c_str(), allocator);
   if (!value) {
     return std::nullopt;
@@ -371,7 +380,7 @@ std::optional<std::string> Session::metadata(std::string_view key) const {
 }
 
 std::vector<Tensor> Session::run(std::span<const TensorView> inputs) const {
-  const Impl& impl = *impl_;
+  const Impl& impl = live(impl_);
   if (inputs.size() != impl.inputs.size()) {
     impl.fail(ErrorCode::InvalidInput, "expected " + std::to_string(impl.inputs.size()) + " input tensor(s), got " +
                                            std::to_string(inputs.size()));
@@ -431,7 +440,7 @@ std::vector<Tensor> Session::run(std::span<const TensorView> inputs) const {
 }
 
 void Session::warmup(std::span<const std::vector<std::int64_t>> shapes, int runs) const {
-  const Impl& impl = *impl_;
+  const Impl& impl = live(impl_);
   std::vector<std::vector<std::int64_t>> resolved;
   if (shapes.empty()) {
     for (const TensorInfo& spec : impl.inputs) {
