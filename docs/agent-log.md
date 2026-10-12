@@ -69,7 +69,7 @@ Template:
   later; OBS plugin builds may need the OpenCV libraries checked
   for position-independent code on Linux (SPG-13).
 
-## 2026-10-12 — SPG-13 OBS plugin shell (#PR)
+## 2026-10-12 — SPG-13 OBS plugin shell (#26)
 
 - Decision / change: `plugin/` holds `obs-spg`, a C++20 OBS module in the
   obs-plugintemplate layout (`src/`, `data/locale/`, `buildspec.json` at the
