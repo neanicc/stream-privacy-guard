@@ -86,6 +86,13 @@ See [plugin-render.md](plugin-render.md).
 
 Record the Stats dock "average time to render frame" with and without the
 filter, the number of missed or skipped frames, and the GPU memory seen.
+The filter maps a stage surface on the render thread every frame
+(`gs_stagesurface_map` of the copy staged one frame earlier), and this map
+can wait on the GPU. If the render time with the filter is more than about
+1 ms above the time without it, or rendering-lag frames appear, profile one
+render (Instruments, or OBS's profiler in the log at exit) and record the
+time spent in the map separately. SPG-16 decides whether to skip a map that
+is not ready.
 
 ## Record
 
