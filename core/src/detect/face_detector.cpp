@@ -8,6 +8,7 @@
 #include <string_view>
 #include <utility>
 
+#include "detect/source_clip.hpp"
 #include "spg/error.hpp"
 
 namespace spg::detect {
@@ -55,32 +56,6 @@ Size check_input(const runtime::Session& session) {
                             ", expected static [1, 3, H, W] with H and W multiples of 32");
   }
   return {static_cast<std::uint32_t>(shape[3]), static_cast<std::uint32_t>(shape[2])};
-}
-
-// A Source-space box clipped to the source, or nothing when no part of it is
-// inside. Edges are clipped in double and the far edge narrows outward, so a
-// clipped box never loses a pixel the unclipped one covered inside the frame.
-std::optional<Rect> clip_to(const Rect& rect, Size bounds) {
-  const auto axis = [](float origin, float length, std::uint32_t limit) -> std::optional<std::pair<float, float>> {
-    const double lo = std::max(static_cast<double>(origin), 0.0);
-    const double hi = std::min(static_cast<double>(origin) + static_cast<double>(length), static_cast<double>(limit));
-    if (!(hi > lo)) {
-      return std::nullopt;
-    }
-    // lo is 0 or the original float origin, so it narrows exactly.
-    const auto start = static_cast<float>(lo);
-    auto span = static_cast<float>(hi - lo);
-    while (static_cast<double>(start) + static_cast<double>(span) < hi) {
-      span = std::nextafter(span, std::numeric_limits<float>::infinity());
-    }
-    return std::pair{start, span};
-  };
-  const auto x = axis(rect.x, rect.width, bounds.width);
-  const auto y = axis(rect.y, rect.height, bounds.height);
-  if (!x || !y) {
-    return std::nullopt;
-  }
-  return Rect{x->first, y->first, x->second, y->second};
 }
 
 }  // namespace
