@@ -9,6 +9,7 @@
 // check never prints what was read.
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -369,6 +370,42 @@ TEST_CASE("Vertical text is read turned either way", "[ocr][model]") {
   REQUIRE(read.size() == 1);
   INFO((counter_clockwise ? "turned counter-clockwise" : "turned clockwise"));
   CHECK(reads_as(read[0].text, "zorbly quanticor"));
+}
+
+TEST_CASE("A long vertical line is read in chunks in reading order", "[ocr][model]") {
+  // A max_width below the turned line's full width forces chunks in both
+  // turned views; clockwise lists them bottom to top. Chunks in the wrong
+  // order would put the end of the line before its start.
+  SPG_REQUIRE_MODEL(rec_path());
+  const bool counter_clockwise = GENERATE(true, false);
+  TextRecognizerConfig config;
+  config.max_width = 480;
+  const TextRecognizer chunked = TextRecognizer::open(shared_env(), rec_path(), config, cpu_only());
+  const std::string text = "shipping note for zorbly quanticor at 1600 maple street";
+  const Scene scene = panel({1000, 60}, {240, 240, 240}, {30, 30, 30}, {text}, 14.0);
+  const Canvas turned = turn(scene.canvas, counter_clockwise);
+  const Rect ink = turn(scene.lines[0].ink, {1000, 60}, counter_clockwise);
+  const OwnedFrame frame = spg::test::to_frame(turned, PixelFormat::BGRA);
+  const Size size{turned.width(), turned.height()};
+  const spg::Detection line = region(ink, size, size);
+  // The turned views really are chunked (the padded box is 48 x ~800 turned).
+  const double full_width = std::ceil(static_cast<double>(config.input_height) * line.box.rect.height /
+                                      line.box.rect.width);
+  REQUIRE(full_width > config.max_width);
+  const std::vector<Recognition> read = chunked.recognize(frame.view, size, std::vector<spg::Detection>{line});
+  REQUIRE(read.size() == 1);
+  INFO((counter_clockwise ? "turned counter-clockwise" : "turned clockwise"));
+  // One view (one '\n'-separated line) reads the first word before the last.
+  // No chunk holds both, so this fails when the chunks are out of order.
+  bool in_order = false;
+  std::istringstream views{std::string(read[0].text.reveal())};
+  for (std::string view; std::getline(views, view);) {
+    const std::string squashed = squash(view);
+    const std::size_t start = squashed.find("shipping");
+    const std::size_t end = squashed.find("street");
+    in_order = in_order || (start != std::string::npos && end != std::string::npos && start < end);
+  }
+  CHECK(in_order);
 }
 
 TEST_CASE("Batched runs read the same strings", "[ocr][model]") {

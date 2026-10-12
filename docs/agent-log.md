@@ -780,7 +780,10 @@ Template:
   class counts, and a missing dictionary. Mutation checks: no line views
   failed the merged-lines case; no rotated views failed the vertical case
   both ways; a cache that ignores content failed the unit and model cache
-  cases; chunks without overlap failed the 2000-region planning property.
+  cases; chunks without overlap failed the 2000-region planning property;
+  clockwise chunks left top to bottom failed the reading-order planning case,
+  the planning property (now half tall regions) and a chunked vertical model
+  case (review follow-up).
 - Eval delta: not measured. The recognizer is not wired into a pipeline yet
   (SPG-10/11), and the eval stage was not run in this session.
 - Open issues or follow-ups: Hershey strokes are not UI fonts, so SPG-12 must

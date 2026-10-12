@@ -313,23 +313,58 @@ TEST_CASE("plan_reads: whole region, then each line, then both rotations when ta
   CHECK_THROWS_AS(ocr::plan_reads(region, {{0, 20}, {20, 41}}, params), std::invalid_argument);
 }
 
+TEST_CASE("plan_reads lists the chunks of a turned view in reading order", "[ocr][plan]") {
+  // 20 x 600, tall: each turned view is 48 x 1440 at full size, so a
+  // max_width of 480 forces chunks of 200 source rows overlapping by 100.
+  ocr::ViewParams params;
+  params.max_width = 480;
+  const PixelRect tall{7, 3, 20, 600};
+  const std::vector<ocr::ReadJob> jobs = ocr::plan_reads(tall, {{0, 600}}, params);
+  const auto starts = [&](ocr::Rotation rotation) {
+    std::vector<std::int32_t> out;
+    for (const ocr::ReadJob& job : jobs) {
+      if (job.rotation == rotation) {
+        CHECK(job.rect.x == tall.x);
+        CHECK(job.rect.width == tall.width);
+        CHECK(job.rect.height == 200);
+        CHECK(job.width == 480);
+        out.push_back(job.rect.y - tall.y);
+      }
+    }
+    return out;
+  };
+  // Counter-clockwise reads top to bottom, clockwise bottom to top.
+  CHECK(starts(ocr::Rotation::CounterClockwise) == std::vector<std::int32_t>{0, 100, 200, 300, 400});
+  CHECK(starts(ocr::Rotation::Clockwise) == std::vector<std::int32_t>{400, 300, 200, 100, 0});
+  // Each view's chunks share its view number and come after the views before it.
+  std::size_t previous_view = 0;
+  for (const ocr::ReadJob& job : jobs) {
+    CHECK(job.view >= previous_view);
+    previous_view = job.view;
+  }
+}
+
 TEST_CASE("plan_reads chunks long views with overlap and covers every pixel", "[ocr][plan]") {
   std::mt19937 rng(11);
+  std::size_t chunked_turned_views = 0;
   for (int trial = 0; trial < 2000; ++trial) {
     ocr::ViewParams params;
     params.max_width = 32 * std::uniform_int_distribution<std::uint32_t>(2, 40)(rng);
     params.chunk_overlap = std::uniform_real_distribution<float>(0.0F, 0.5F)(rng);
-    const auto w = std::uniform_int_distribution<std::int32_t>(1, 3000)(rng);
-    const auto h = std::uniform_int_distribution<std::int32_t>(1, 300)(rng);
+    // Every other trial is a tall region, so the turned views get chunked too.
+    const bool tall = trial % 2 == 1;
+    const auto w = std::uniform_int_distribution<std::int32_t>(1, tall ? 300 : 3000)(rng);
+    const auto h = std::uniform_int_distribution<std::int32_t>(1, tall ? 3000 : 300)(rng);
     const PixelRect region{std::uniform_int_distribution<std::int32_t>(0, 50)(rng), 5, w, h};
     const std::vector<ocr::ReadJob> jobs = ocr::plan_reads(region, {{0, static_cast<std::uint32_t>(h)}}, params);
     INFO("trial " << trial << " region " << w << "x" << h << " max_width " << params.max_width);
     REQUIRE_FALSE(jobs.empty());
-    for (const bool upright : {true, false}) {
+    for (const ocr::Rotation rotation :
+         {ocr::Rotation::None, ocr::Rotation::CounterClockwise, ocr::Rotation::Clockwise}) {
+      const bool upright = rotation == ocr::Rotation::None;
       std::vector<const ocr::ReadJob*> view;
       for (const ocr::ReadJob& job : jobs) {
-        if ((job.rotation == ocr::Rotation::None) == upright &&
-            (upright || job.rotation == ocr::Rotation::CounterClockwise)) {
+        if (job.rotation == rotation) {
           view.push_back(&job);
         }
       }
@@ -337,8 +372,17 @@ TEST_CASE("plan_reads chunks long views with overlap and covers every pixel", "[
         CHECK_FALSE(upright);
         continue;
       }
+      if (!upright && view.size() > 1) {
+        ++chunked_turned_views;
+      }
+      // Clockwise reads bottom to top: its chunks are listed last-first, so
+      // walk them backwards to check coverage from the start of the region.
+      if (rotation == ocr::Rotation::Clockwise) {
+        std::reverse(view.begin(), view.end());
+      }
       const std::int32_t length = upright ? w : h;
-      std::int32_t covered = 0;  // chunks are in reading order, so coverage grows
+      std::int32_t covered = 0;
+      std::int32_t previous_start = -1;
       for (std::size_t i = 0; i < view.size(); ++i) {
         const ocr::ReadJob& job = *view[i];
         CHECK(job.width >= 1);
@@ -346,16 +390,19 @@ TEST_CASE("plan_reads chunks long views with overlap and covers every pixel", "[
         const std::int32_t start = upright ? job.rect.x - region.x : job.rect.y - region.y;
         const std::int32_t size = upright ? job.rect.width : job.rect.height;
         CHECK((upright ? job.rect.height : job.rect.width) == (upright ? h : w));
+        CHECK(start > previous_start);  // reading order, as listed (reversed above for clockwise)
         CHECK(start <= covered);
         if (i > 0) {
           const auto overlap = static_cast<std::int32_t>(std::floor(static_cast<double>(params.chunk_overlap) * size));
           CHECK(covered - start >= std::min(overlap, size - 1));
         }
+        previous_start = start;
         covered = std::max(covered, start + size);
       }
       CHECK(covered == length);
     }
   }
+  CHECK(chunked_turned_views > 100);  // the turned branches were exercised chunked
 }
 
 // --- Tensor, crop and config --------------------------------------------------------
@@ -477,6 +524,22 @@ TEST_CASE("same_content: any change of the crop is new content", "[ocr][cache]")
     Canvas recoloured = strokes({30, 40, 50, 60});
     recoloured.rect(70, 20, 73, 36, {255, 230, 220});  // luma 230, as the paper
     CHECK_FALSE(ocr::same_content(print_of(recoloured), before));
+  }
+  SECTION("strokes moved within a block keep its average") {
+    // Seven-segment '2' and '5' differ by which side of a cell holds the
+    // upright strokes. Here the top half of a 10 x 10 cell is inked on its
+    // left and the bottom half on its right, then the reverse: every block
+    // average (and so any thumbnail of the crop) stays the same.
+    const auto segments = [](bool two) {
+      Canvas canvas(200, 60, {230, 230, 230});
+      // The cell [40, 50) x [18, 28) is aligned with kBox's top-left corner.
+      canvas.rect(two ? 40 : 45, 18, two ? 45 : 50, 23, {20, 20, 20});
+      canvas.rect(two ? 45 : 40, 23, two ? 50 : 45, 28, {20, 20, 20});
+      return canvas;
+    };
+    const ocr::Fingerprint two = print_of(segments(true));
+    CHECK(ocr::same_content(print_of(segments(true)), two));
+    CHECK_FALSE(ocr::same_content(print_of(segments(false)), two));
   }
   SECTION("one pixel in a large crop") {
     const spg::Box large{{0.0F, 0.0F, 200.0F, 60.0F}, spg::Space::Source};
