@@ -1053,3 +1053,58 @@ Template:
   so that comparison is missing; the change there is one `memset` per
   fingerprint (about 100 KB per six-region cycle). Pixel copies in the
   detector, the lookahead's `OwnedFrame` and ONNX Runtime stay unzeroed.
+
+## 2026-10-12 — SPG-10b Release gate parity in Lookahead (#47)
+
+- Decision / change: the background security review reported "fail-open
+  (sibling-path gate parity)" in `core/src/schedule/lookahead.cpp` with no
+  detail. Audit of every path that airs a frame or decides it is clean
+  (table in [scheduler.md](scheduler.md#one-gate-for-every-path-that-airs-a-frame)):
+  `release_due()` on the deadline and on buffer overflow applied the full
+  rule inline; everything else only feeds it. Two gaps found, both fixed:
+  (1) **Re-emit.** `hold_last_scanned` re-emitted the last clean frame after
+  checking only its segment. That frame airs again with the masks it had
+  when released, so a complete cycle that finished afterwards and whose boxes
+  reach it (held over it, or retroactive from `ts - retro`), or a result that
+  could not be applied, did not stop it being shown again unmasked, although
+  the same result fails or masks every buffered frame in that reach.
+  (2) **Result older than the size history.** A complete result from before
+  more than 64 resizes was dropped like an incomplete one, while a result
+  that fails to apply fails closed every frame it could have masked; frames of
+  later sizes that another cycle covered aired without its held boxes
+  (temporal hold broken, for example while a window is dragged and a cycle
+  stalls). Fix: one private `Lookahead::gate(frame, at)` decides
+  clean or the `FallbackReason` for both release paths; the re-emit candidate
+  is kept as a `FrameRecord`, is marked `apply_failed` by any later result in
+  its reach (or any result that cannot be applied, as buffered frames are),
+  and must pass `gate()` as of its own release; `fail_closed()` is shared by
+  apply failures and too-old results. Public API unchanged (SPG-11 drives
+  `Lookahead`). Decision: an invalidated candidate falls back to
+  `BlurSource` rather than searching for an older clean frame (fail closed,
+  simplest; an older frame is likelier still in reach). A result with no
+  detections does not invalidate the candidate (nothing to add to it).
+- Evidence (automated, dev Mac, macOS 26.5.2 arm64): new
+  `lookahead_test.cpp` cases (re-emit after a held result, after a retroactive
+  result, after a failed apply; an empty later result keeps the candidate;
+  63 vs 64 resizes with a cycle in flight) and the property-test extension
+  were run against `main`'s `lookahead.{hpp,cpp}` first: 4 test cases and 11
+  assertions failed, including the property oracle's new check that a
+  re-emitted frame covers every box that reaches it (seed 33: frame at 1200
+  re-emitted without the box of a cycle at 1467 within its retro window).
+  With the fix: `[schedule]` passes under AppleClang (42 cases, 1,603,171
+  assertions) and GCC 14 with `-Werror -Wsign-conversion` (core-only build).
+  Property totals (AppleClang): 27,796 clean, 197,204 fallback, 41,175
+  re-emits each checked against every reaching box (43,551 box checks),
+  5,742 re-emits refused, 14,727 `ApplyFailed` releases, 1,135 rejected and
+  121 too-old results. The oracle's old rule "fallback is BlurSource only
+  when no clean frame of the same segment exists" was replaced by "... or a
+  later result could have masked it"; every other assertion is unchanged or
+  stricter (a re-emit must now also cover every reaching box).
+- Eval delta: not measured. Nothing feeds the scheduler a pipeline until
+  SPG-11, and the agent sandbox refuses the eval command; see the PR's Check
+  log for the CI stage.
+- Open issues or follow-ups: `run_scan()` discards detections found by the
+  stages that finished when a later stage fails (for example faces found, text
+  detector threw); they are not held, so a frame covered by a later cycle
+  whose face detector flickers airs without them. Treating partial
+  detections as held boxes is a recall question for SPG-12/lane:policy.
