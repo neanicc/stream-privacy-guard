@@ -9,6 +9,7 @@
 #include "spg/detection.hpp"
 #include "spg/policy_config.hpp"
 #include "spg/secret.hpp"
+#include "spg/secure_memory.hpp"
 
 // The text policy (SPG-08): decides whether recognized text is sensitive and
 // why. Rules are in docs/policy.md.
@@ -60,7 +61,12 @@ class PolicyEngine {
  private:
   CategorySet categories_;
   FuzzyLimits fuzzy_;
-  std::vector<std::u32string> watchlist_;  // normalized entries
+  // Normalized entries, in protected memory like the Secrets they come from.
+  // The vector's own buffer is on SecureAllocator too, so a short entry held
+  // in a string's inline (short-string) buffer is covered here. evaluate()'s
+  // temporaries are local objects: their inline buffers sit on the worker's
+  // stack (docs/settings.md, "Watch-list text in memory").
+  std::vector<SecureU32String, SecureAllocator<SecureU32String>> watchlist_;
 };
 
 }  // namespace spg

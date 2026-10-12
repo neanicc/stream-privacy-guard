@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <new>
@@ -52,6 +53,10 @@ struct FilterState {
   // changes none of them skips the rebuild.
   bool policy_current = false;
   Notice notice = Notice::None;
+  // What the user has typed into the masked entry field. The field's modified
+  // callback moves each keystroke's text here and out of the settings, so the
+  // OBS undo stack, which snapshots the settings, never holds it.
+  Secret pending_entry;
 };
 
 const char *text(const char *key) {
@@ -115,6 +120,28 @@ FilterSettings read_settings(obs_data_t *settings) {
   set_string_if_changed(settings, kSensitivityKey, to_string(clean.sensitivity));
   set_string_if_changed(settings, kFallbackKey, spg::to_string(clean.fallback));
   return clean;
+}
+
+// Moves the masked entry field out of the settings: copies it into a Secret,
+// overwrites the stored string in place (libobs reuses an item's storage for a
+// value of the same length, so the typed bytes do not linger in the freed
+// item) and erases the key.
+Secret take_masked_entry(obs_data_t *settings) noexcept {
+  if (!obs_data_has_user_value(settings, kWatchlistNewEntryKey)) {
+    return {};
+  }
+  const char *typed = obs_data_get_string(settings, kWatchlistNewEntryKey);
+  Secret entry;
+  try {
+    entry = Secret::copy_of(typed);
+    if (const std::size_t length = std::strlen(typed); length > 0) {
+      obs_data_set_string(settings, kWatchlistNewEntryKey, std::string(length, '*').c_str());
+    }
+  } catch (...) {
+    // Allocation failure: the field is still erased below.
+  }
+  obs_data_erase(settings, kWatchlistNewEntryKey);
+  return entry;
 }
 
 void log_store_error(StoreError error) {
@@ -334,9 +361,11 @@ void filter_destroy(void *data) {
 }
 
 // OBS calls this just before it serializes the settings into the scene
-// collection: an entry typed but never added must not be saved there.
+// collection (and before the filters dialog snapshots a deleted filter for
+// undo): an entry typed but never added must not be saved there. The
+// properties view never leaves it in the settings; a script might.
 void filter_save(void *data, obs_data_t *settings) {
-  obs_data_erase(settings, kWatchlistNewEntryKey);
+  static_cast<void>(take_masked_entry(settings));
   auto *state = static_cast<FilterState *>(data);
   const std::lock_guard lock{state->mutex};
   if (state->store_error == StoreError::None) {
@@ -372,6 +401,31 @@ void finish_action(FilterState &state, Notice notice) {
   rebuild_policy_locked(state);
 }
 
+// The masked field's modified callback, run by the properties view right after
+// each keystroke is written to the settings. OBS 32's view records an undo
+// step 500 ms after the last change, from the settings as they are then
+// (shared/properties-view/properties-view.cpp, WidgetInfo::ControlChanged), so
+// the text has left the settings before any snapshot is taken. libobs also
+// calls it whenever the properties are built (obs_source_properties applies
+// the settings), so a rebuilt view, whose masked field is empty, resets
+// pending_entry: Add never adds text the field no longer shows, and a script
+// that set the field before a build still gets it added. Returns false:
+// rebuilding the properties would clear the field while the user types.
+bool masked_entry_modified(void *data, obs_properties_t * /*props*/, obs_property_t * /*property*/,
+                           obs_data_t *settings) {
+  Secret typed = take_masked_entry(settings);
+  if (auto *state = static_cast<FilterState *>(data); state != nullptr) {
+    try {
+      const std::lock_guard lock{state->mutex};
+      state->pending_entry = std::move(typed);
+    } catch (...) {
+      // Called from C: the text is already out of the settings and is wiped
+      // when `typed` goes out of scope.
+    }
+  }
+  return false;
+}
+
 bool watchlist_add_clicked(obs_properties_t * /*props*/, obs_property_t * /*property*/, void *data) {
   auto *state = static_cast<FilterState *>(data);
   if (state == nullptr) {
@@ -379,8 +433,19 @@ bool watchlist_add_clicked(obs_properties_t * /*props*/, obs_property_t * /*prop
   }
   obs_data_t *settings = obs_source_get_settings(state->context);
   try {
-    Secret entry{std::string(obs_data_get_string(settings, kWatchlistNewEntryKey))};
-    obs_data_erase(settings, kWatchlistNewEntryKey);
+    // The text is in pending_entry, or still in the settings when a script
+    // set the field and pressed Add on properties built before that. A field
+    // the settings hold as empty means "nothing to add", not "use what was
+    // typed earlier".
+    const bool in_settings = obs_data_has_user_value(settings, kWatchlistNewEntryKey);
+    Secret entry = take_masked_entry(settings);
+    {
+      const std::lock_guard lock{state->mutex};
+      if (!in_settings) {
+        entry = std::move(state->pending_entry);
+      }
+      state->pending_entry = Secret{};
+    }
     WatchlistSnapshot next = snapshot(*state);
     Notice notice = Notice::None;
     if (next.error != StoreError::None) {
@@ -393,7 +458,7 @@ bool watchlist_add_clicked(obs_properties_t * /*props*/, obs_property_t * /*prop
     }
     finish_action(*state, notice);
   } catch (...) {
-    obs_data_erase(settings, kWatchlistNewEntryKey);
+    static_cast<void>(take_masked_entry(settings));
   }
   obs_data_release(settings);
   return true;
@@ -526,10 +591,12 @@ void add_watchlist_group(obs_properties_t *props, FilterState *state) {
              notice_is_error(notice) ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
   }
 
-  // Masked entry: OBS draws a password field with a show/hide toggle.
+  // Masked entry: OBS draws a password field with a show/hide toggle. Its text
+  // moves to pending_entry as it is typed (masked_entry_modified).
   obs_property_t *entry =
       obs_properties_add_text(group, kWatchlistNewEntryKey, text("SPG.Watchlist.NewEntry"), OBS_TEXT_PASSWORD);
   obs_property_set_long_description(entry, text("SPG.Watchlist.NewEntryHelp"));
+  obs_property_set_modified_callback2(entry, masked_entry_modified, state);
   obs_property_t *add =
       obs_properties_add_button(group, kWatchlistAddKey, text("SPG.Watchlist.Add"), watchlist_add_clicked);
   obs_property_set_enabled(add, !broken);

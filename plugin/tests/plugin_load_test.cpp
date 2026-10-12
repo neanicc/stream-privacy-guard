@@ -3,7 +3,9 @@
 // and drive their settings and watch-list buttons the way the OBS properties
 // view does, capturing every libobs log line, to check clamping, fail-closed
 // storage errors, and that watch-list text never reaches the log or the saved
-// scene collection data (SPG-15). All entries are synthetic.
+// scene collection data (SPG-15), and that typing into the masked field the
+// way the OBS properties view does never leaves it in an undo snapshot
+// (SPG-15b). All entries are synthetic.
 //
 //   obs-spg-load-test <module binary> <module data directory> <config directory>
 
@@ -12,6 +14,7 @@
 #include "settings/watchlist_store.hpp"
 #include "spg-filter.hpp"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -35,8 +38,10 @@ std::string captured_log;
 // digits are not a fragment: a log line can hold them by chance (an address).
 constexpr const char *kSentinel = "Qorvexian Blathermoor 7319";
 constexpr const char *kTypedOnly = "Wyndlequist Pellinore";
+constexpr const char *kTypedInView = "Zanthorpe Quillibrand";
 constexpr const char *kFragments[] = {"Qorvexian",   "qorvexian",   "qorvexlan", "Blathermoor", "lathermo",
-                                      "Wyndlequist", "wyndlequlst", "Pellinore", "pellinore"};
+                                      "Wyndlequist", "wyndlequlst", "Pellinore", "pellinore",   "Zanthorpe",
+                                      "zanthorpe",   "Quillibrand", "quillibrand", "qulllbrand"};
 
 void check(bool ok, const char *what) {
   std::printf("%s: %s\n", ok ? "ok  " : "FAIL", what);
@@ -236,6 +241,142 @@ void check_watchlist(const fs::path &watchlist_dir) {
   }
 }
 
+// The OBS 32.1.2 properties view, for one edit of a field
+// (shared/properties-view/properties-view.cpp, WidgetInfo::ControlChanged):
+// when a burst of edits starts it snapshots the settings, then it writes the
+// widget's whole value to the settings, calls the visual update (for filters,
+// obs_source_update) and then the property's modified callback. Returns true
+// when the view would rebuild the properties.
+bool view_edit(obs_source_t *source, obs_properties_t *props, obs_data_t *settings, const char *key,
+               obs_data_t *&burst_snapshot, void (*write)(obs_data_t *, const char *, const char *),
+               const char *value) {
+  if (burst_snapshot == nullptr) {
+    burst_snapshot = obs_data_create();
+    obs_data_apply(burst_snapshot, settings);
+  }
+  write(settings, key, value);
+  obs_source_update(source, settings);
+  return obs_property_modified(obs_properties_get(props, key), settings);
+}
+
+void write_string(obs_data_t *settings, const char *key, const char *value) {
+  obs_data_set_string(settings, key, value);
+}
+
+void write_int(obs_data_t *settings, const char *key, const char *value) {
+  obs_data_set_int(settings, key, std::stoll(value));
+}
+
+// Settings keys the filter owns. A snapshot holding anything else (the masked
+// entry field) fails the check.
+bool only_known_keys(obs_data_t *data) {
+  std::vector<std::string> known = {plugin::kWatchlistRefKey, plugin::kWatchlistCountKey, plugin::kWatchlistSelectedKey,
+                                    plugin::kLookaheadKey,    plugin::kHoldKey,           plugin::kSensitivityKey,
+                                    plugin::kFallbackKey,     plugin::kDebugOverlayKey};
+  for (const spg::Category category : spg::kAllCategories) {
+    known.push_back(plugin::category_key(category));
+  }
+  bool ok = true;
+  for (obs_data_item_t *item = obs_data_first(data); item != nullptr; obs_data_item_next(&item)) {
+    ok = ok && std::find(known.begin(), known.end(), obs_data_item_get_name(item)) != known.end();
+  }
+  return ok;
+}
+
+// 500 ms after the last edit of a burst the view calls the filters dialog's
+// FilterChangeUndoRedo (frontend/dialogs/OBSBasicFilters.cpp) with the
+// snapshot and the live settings; it stores both as JSON in the undo stack.
+void view_record_undo(obs_data_t *settings, obs_data_t *&burst_snapshot, std::vector<std::string> &undo_stack) {
+  check(only_known_keys(burst_snapshot) && only_known_keys(settings),
+        "undo snapshots hold only the filter's own settings (watch-list reference and count, no entry)");
+  undo_stack.emplace_back(obs_data_get_json(burst_snapshot));
+  undo_stack.emplace_back(obs_data_get_json(settings));
+  obs_data_release(burst_snapshot);
+  burst_snapshot = nullptr;
+}
+
+// Typing into the masked field in the OBS properties view never leaves the
+// text in the settings, so neither the undo stack nor a save can hold it, and
+// Add still stores what was typed.
+void check_undo_snapshots(const fs::path &watchlist_dir) {
+  obs_source_t *source = obs_source_create(plugin::kFilterId, "spg-undo", nullptr, nullptr);
+  check(source != nullptr, "filter source for the undo checks is created");
+  if (source == nullptr) {
+    return;
+  }
+  obs_data_t *settings = obs_source_get_settings(source);
+  const std::string ref = obs_data_get_string(settings, plugin::kWatchlistRefKey);
+  const fs::path file = watchlist_dir / (ref + ".txt");
+  std::vector<std::string> undo_stack;
+  obs_data_t *burst = nullptr;
+
+  // The view builds its properties once, then the user types one key at a time.
+  obs_properties_t *props = obs_source_properties(source);
+  const std::string typed = kTypedInView;
+  bool refreshed = false;
+  bool prefix_in_settings = false;
+  for (std::size_t n = 1; n <= typed.size(); ++n) {
+    const std::string prefix = typed.substr(0, n);
+    refreshed = view_edit(source, props, settings, plugin::kWatchlistNewEntryKey, burst, write_string,
+                          prefix.c_str()) ||
+                refreshed;
+    prefix_in_settings = prefix_in_settings || (n >= 3 && std::string_view{obs_data_get_json(settings)}.find(
+                                                              prefix) != std::string_view::npos);
+  }
+  check(!refreshed, "typing in the masked field does not rebuild the properties");
+  check(!prefix_in_settings, "no typed prefix is left in the settings after its keystroke");
+  check(!obs_data_has_user_value(settings, plugin::kWatchlistNewEntryKey), "the masked field is not in the settings");
+  view_record_undo(settings, burst, undo_stack);
+
+  // A slider moved in the same dialog records its own undo step.
+  view_edit(source, props, settings, plugin::kLookaheadKey, burst, write_int, "700");
+  view_record_undo(settings, burst, undo_stack);
+
+  // Add, pressed in the same view, stores what was typed.
+  check(obs_property_button_clicked(obs_properties_get(props, plugin::kWatchlistAddKey), source),
+        "Add asks the view to refresh");
+  obs_properties_destroy(props);
+  check(obs_data_get_int(settings, plugin::kWatchlistCountKey) == 1, "Add stores the entry typed in the view");
+  check(read_file(file).find(kTypedInView) != std::string::npos, "the typed entry is in the watch-list file");
+
+  // Text typed and then dropped by a rebuilt view (the field shows empty) is
+  // never added.
+  props = obs_source_properties(source);
+  view_edit(source, props, settings, plugin::kWatchlistNewEntryKey, burst, write_string, kTypedOnly);
+  view_record_undo(settings, burst, undo_stack);
+  obs_properties_destroy(props);
+  props = obs_source_properties(source);
+  obs_property_button_clicked(obs_properties_get(props, plugin::kWatchlistAddKey), source);
+  obs_properties_destroy(props);
+  check(obs_data_get_int(settings, plugin::kWatchlistCountKey) == 1, "text the rebuilt field no longer shows is not added");
+  check(read_file(file).find(kTypedOnly) == std::string::npos, "the dropped text is not in the watch-list file");
+
+  // Text typed in the view, then the field set to empty in the settings (a
+  // script) before Add: Add sees an empty entry and adds nothing.
+  props = obs_source_properties(source);
+  view_edit(source, props, settings, plugin::kWatchlistNewEntryKey, burst, write_string, kTypedOnly);
+  view_record_undo(settings, burst, undo_stack);
+  obs_data_set_string(settings, plugin::kWatchlistNewEntryKey, "");
+  obs_property_button_clicked(obs_properties_get(props, plugin::kWatchlistAddKey), source);
+  obs_properties_destroy(props);
+  check(obs_data_get_int(settings, plugin::kWatchlistCountKey) == 1, "an emptied field adds nothing");
+  check(read_file(file).find(kTypedOnly) == std::string::npos, "text typed before the field was emptied is not added");
+  check(!obs_data_has_user_value(settings, plugin::kWatchlistNewEntryKey), "Add clears the emptied field");
+
+  bool secret_in_undo = false;
+  bool ref_in_undo = true;
+  for (const std::string &json : undo_stack) {
+    secret_in_undo = secret_in_undo || contains_secret(json);
+    ref_in_undo = ref_in_undo && json.find(ref) != std::string::npos;
+  }
+  check(!undo_stack.empty() && !secret_in_undo, "no undo snapshot holds watch-list text");
+  check(ref_in_undo, "every undo snapshot holds the watch-list reference");
+  check(!contains_secret(saved_json(source)), "saved scene collection data holds no typed text");
+
+  obs_data_release(settings);
+  obs_source_release(source);
+}
+
 // A watch-list that cannot be read turns detection off and shows an error;
 // "Remove all entries" is the way back.
 void check_storage_errors() {
@@ -351,6 +492,7 @@ void run_filter_checks(obs_module_t *module) {
   bfree(dir);
   check_clamping();
   check_watchlist(watchlist_dir);
+  check_undo_snapshots(watchlist_dir);
   check_storage_errors();
   check_broken_copy(watchlist_dir);
   check_unreplaceable_file(watchlist_dir);

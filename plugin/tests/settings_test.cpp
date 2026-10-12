@@ -265,7 +265,7 @@ TEST_CASE("the watch-list file format round-trips any entry", "[watchlist]") {
   const std::vector<Secret> entries =
       secrets({"Zorblax Quentivar", "back\\slash \\n literal", "line\nbreak", "carriage\rreturn",
                "\xC3\x89lodie Qu\xC3\xA9tzal", "#not a comment", " leading and trailing "});
-  const std::string body = encode_watchlist(entries);
+  const std::string body{encode_watchlist(entries)};
   CHECK(std::count(body.begin(), body.end(), '\n') == static_cast<std::ptrdiff_t>(entries.size() + 1));
   CHECK(body.find('\r') == std::string::npos);
   const auto decoded = decode_watchlist(body);
@@ -278,7 +278,7 @@ TEST_CASE("the watch-list file format round-trips any entry", "[watchlist]") {
 }
 
 TEST_CASE("anything but a well-formed v1 file is rejected", "[watchlist]") {
-  const std::string header = encode_watchlist({});
+  const std::string header{encode_watchlist({})};
   CHECK_FALSE(decode_watchlist("").has_value());
   CHECK_FALSE(decode_watchlist("Zorblax Quentivar\n").has_value());
   CHECK_FALSE(decode_watchlist(header.substr(0, header.size() - 1)).has_value());  // no newline after header
@@ -354,8 +354,23 @@ TEST_CASE("the store saves, replaces and loads a user-only file", "[watchlist]")
     fs::create_directories(dir);
     write_file(store.file(), "Zorblax Quentivar\n");
     CHECK(store.load(0).error == StoreError::Corrupt);
-    write_file(store.file(), encode_watchlist({}) + std::string(1 << 20, 'q') + "\n");
+    write_file(store.file(), std::string{encode_watchlist({})} + std::string(1 << 20, 'q') + "\n");
     CHECK(store.load(0).error == StoreError::Corrupt);
+  }
+  SECTION("a list at the limits is read whole, past every buffer growth") {
+    // Escaped backslashes make the file ~130 KB, just under the size limit.
+    std::vector<Secret> full;
+    for (std::size_t i = 0; i < kMaxWatchlistEntries; ++i) {
+      std::string entry(kMaxEntryBytes - 6, '\\');
+      const std::string index = std::to_string(100000 + i);
+      entry += index;
+      full.push_back(Secret::copy_of(entry));
+    }
+    REQUIRE(store.save(full) == StoreError::None);
+    REQUIRE(fs::file_size(store.file()) > 120U * 1024U);
+    const WatchlistLoad loaded = store.load(static_cast<long long>(full.size()));
+    CHECK(loaded.error == StoreError::None);
+    CHECK(loaded.entries == full);
   }
   SECTION("a directory where the file should be is unreadable") {
     fs::create_directories(store.file());
@@ -410,7 +425,7 @@ TEST_CASE("watch-list text never reaches output or error descriptions", "[watchl
     // Corrupt files that contain the sentinel.
     write_file(store.file(), sentinel + "\n");
     messages.emplace_back(describe(store.load(1).error));
-    write_file(store.file(), encode_watchlist({}) + sentinel + "\\q\n");
+    write_file(store.file(), std::string{encode_watchlist({})} + sentinel + "\\q\n");
     messages.emplace_back(describe(store.load(1).error));
 
     // Bad references, including one made from the sentinel.
