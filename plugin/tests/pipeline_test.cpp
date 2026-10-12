@@ -596,9 +596,10 @@ TEST_CASE("random stalls and failures never air an unscanned frame", "[plugin][p
     const Rect face{300, 300, 90, 90};
     const auto detector = std::make_shared<spg_test::ScriptedDetector>(
         [face](Timestamp, Size s) {
-          const float w = static_cast<float>(s.width) / 4.0F;
-          const float h = static_cast<float>(s.height) / 4.0F;
-          return std::vector<Detection>{spg_test::face_at(face.x, face.y, std::min(face.width, w), std::min(face.height, h))};
+          const float max_w = static_cast<float>(s.width) / 4.0F;
+          const float max_h = static_cast<float>(s.height) / 4.0F;
+          return std::vector<Detection>{
+              spg_test::face_at(face.x, face.y, std::min(face.width, max_w), std::min(face.height, max_h))};
         },
         [seed](Timestamp t) {
           if ((spg::to_ns(t) / 1'000'000 + seed) % 7 == 0) {
