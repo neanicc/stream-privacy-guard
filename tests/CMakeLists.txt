@@ -22,6 +22,8 @@ target_compile_definitions(spg-unit-tests PRIVATE
   SPG_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 spg_target_defaults(spg-unit-tests)
 catch_discover_tests(spg-unit-tests TEST_PREFIX "unit." DISCOVERY_MODE PRE_TEST)
+# Tracker and temporal hold (SPG-09).
+target_sources(spg-unit-tests PRIVATE unit/tracker_test.cpp)
 
 # Prebuilt dependencies link, load and run ------------------------------------
 if(SPG_WITH_DEPS)
