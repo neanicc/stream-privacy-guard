@@ -48,6 +48,12 @@ class Scheduler {
   // ContractError for a zero source size.
   FrameId push(Timestamp t, Size source, const FrameView* readback = nullptr);
 
+  // As above, for a readback the caller already owns (a pooled buffer
+  // wrapped with OwnedFrame::adopt), so nothing is copied or allocated for
+  // the pixels. The caller checks wants_scan(readback timestamp) first to
+  // skip the readback when the cadence would not scan it.
+  FrameId push(Timestamp t, Size source, std::shared_ptr<const OwnedFrame> readback);
+
   // Appends every frame due now, oldest first (see Lookahead::release_due).
   void release_due(std::vector<ReleasedFrame>& out);
 

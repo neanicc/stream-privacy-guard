@@ -122,12 +122,20 @@ class OwnedFrame {
  public:
   // Throws ContractError when validate(frame) fails.
   [[nodiscard]] static std::shared_ptr<const OwnedFrame> copy(const FrameView& frame);
+  // Wraps pixels the caller already owns, without copying: `owner` keeps
+  // every plane of `frame` alive and unchanged until the last reference to
+  // the result is gone (on whatever thread drops it). For a pooled readback
+  // buffer, `owner`'s deleter returns the buffer to the pool. Throws
+  // ContractError when validate(frame) fails or `owner` is null.
+  [[nodiscard]] static std::shared_ptr<const OwnedFrame> adopt(const FrameView& frame,
+                                                               std::shared_ptr<const void> owner);
   // Valid for the lifetime of this object.
   [[nodiscard]] const FrameView& view() const noexcept { return view_; }
 
  private:
   OwnedFrame() = default;
   std::vector<std::uint8_t> bytes_;
+  std::shared_ptr<const void> owner_;
   FrameView view_;
 };
 

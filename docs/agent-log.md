@@ -1160,3 +1160,160 @@ Template:
   the entries or the error. Not checked: whether OBS waits for the destroy
   queue before it loads a scene collection, which would rule this out in
   live use.
+
+## 2026-10-12 — SPG-14 Lookahead buffer, readback and GPU blur (#52)
+
+- Decision / change: the filter's `video_render` now runs the lookahead
+  pipeline ([plugin-render.md](plugin-render.md)). Once per video frame time
+  (however many views render the source): capture the target into a ring
+  slot (one `gs_texrender` per slot, rendered as
+  `obs_source_process_filter_begin` does), map the stage surface staged on
+  the previous tick, copy it into a pooled buffer and push it with that
+  frame's timestamp, stage this frame (scaled to fit 1920x1080, never up,
+  into the other of two stage surfaces) when the scheduler wants it, release
+  due frames, draw the newest. The decisions are an OBS-free library
+  (`plugin/src/pipeline/`: `Pipeline`, `FrameRing`, `ReadbackPool`,
+  `mask_levels`, `Reaper`); `plugin/src/render/` executes them with libobs
+  graphics and `plugin/data/effects/spg-mask.effect` (bilinear and point
+  sampling). Choices: (1) Blur is a box-filter chain of halvings; a mask
+  samples the level whose cells are at least a third of its shorter side
+  (8 px floor), the whole-source fallback cells of 1/16 of the shorter side
+  (16 px floor); regions are rounded outward to whole cells; Pixelate samples
+  the same level with point sampling. The output is composed in its own
+  texture with replace blending, so a mask replaces the pixels under it,
+  alpha included, then drawn like any filter output. (2) Fail closed
+  everywhere: a frame is drawn with only its rects masked only when released
+  `FallbackAction::None`; before the first release, while
+  `FilterState::policy` is empty, after a failed scheduler build, without a
+  texture, or when the effect fails to load, the source is covered whole
+  (blur, or solid fill per setting or when there is nothing to blur).
+  `HoldLastScanned` re-emits the last clean frame's texture with its masks,
+  kept in the ring. (3) A settings change builds a new scheduler in the
+  settings path (video or UI thread) and hands it over under a lock held
+  only to swap a pointer; the old scheduler drains with its own masks, and
+  new frames within the old hold of the switch are covered whole, since
+  their held detections were in the old tracker. A debug overlay toggle does
+  not restart it. (4) Resize and 0x0: nothing is reset; buffered frames of
+  the old size are drawn scaled with their masks; a 0x0 target draws
+  nothing, drops frames that come due unseen, and marks a discontinuity when
+  frames return. (5) Ring: `2 * max_buffered_frames + 2` slots (a draining
+  scheduler, the frame on screen, the last clean frame), textures created
+  lazily and idle ones beyond four freed; a frame without a slot is still
+  scheduled and drawn black. No byte budget: memory is what is buffered
+  (about 240 MB at 1080p60 and 500 ms); the plan's "shorter lookahead with a
+  warning" under a memory cap is a follow-up. (6) Unload: schedulers are
+  destroyed only on a reaper thread (their destructors wait for workers);
+  the plugin builds them with a one-hour `shutdown_timeout` so they join
+  rather than detach, and `obs_module_unload` joins the reaper, so no worker
+  runs module code after it returns. (7) Readback copy: `Scheduler::push`
+  gains an overload taking a `shared_ptr<const OwnedFrame>`, and
+  `OwnedFrame::adopt` wraps caller-owned pixels without copying; the
+  plugin's pool reuses buffers the workers drop (a minimal additive change
+  to lane:policy's core API). (8) Visible fallback: the whole-source cover
+  itself; the properties count frames aired masked-only and covered whole,
+  with the last reason; the log gets one line per reason change (at most
+  every 10 s, fixed names); the debug overlay draws green mask outlines and
+  a corner square coloured by reason, never text. (9) Audio: guidance only
+  (SPG-13 decision): a properties line tells the user to set Sync Offset to
+  the lookahead on the audio that belongs with the video; the filter changes
+  no other source. (10) Lookahead and hold are clamped again where the
+  scheduler config is built. (11) Not done: moving the watch-list reload off
+  the video thread (issue comment, "if feasible"): `load_or_fork` writes the
+  source's `obs_data` settings, which is not safe from another thread, the
+  state would need shared ownership, and PR #42 is changing the same
+  functions; it stays a follow-up. (12) The plugin does not load detection
+  models yet (`make_stages()` returns no detectors): every cycle fails with
+  `MissingStage` and every frame airs covered whole. Loading ONNX Runtime,
+  OpenCV and the models in the module is proposed as a follow-up ticket.
+- Evidence (automated, dev Mac, Apple M4, macOS 26.5.2, AppleClang):
+  `scripts/ci/run.sh setup`, `build` (plugin included, warnings as errors)
+  and `test` pass, 255/255 ctest tests, of which 14 new `plugin.pipeline.*`
+  cases and 2 new `unit.*` scheduler cases. A fake GPU and a synchronous
+  scheduler (`spg::Lookahead` on a `ManualClock` with a scan latency) check
+  on every tick that a frame drawn with only its masks was released clean
+  (or is that scheduler's re-emitted clean frame) and that every slot drawn
+  is still held: warm-up; retroactive and held masks from the first frame of
+  a face; readback mapped one tick late, credited by timestamp, alternating
+  surfaces; the three fallback modes; resize (old-size frames keep their
+  masks, held masks scaled); 0x0 (nothing drawn, buffered frames and masks
+  kept, one discontinuity); settings change (old frames drain with old
+  masks, the old hold is covered, the old scheduler is retired, not
+  destroyed); losing the policy; repeated renders of one frame time; capture
+  failure and a full ring; 40 seeded runs with failing cycles, random
+  latency, resizes, 0x0 ticks and restarts; plus ring, pool, readback size,
+  mask geometry (2000 seeded rects: the region covers the clipped rect) and
+  the reaper (destroys off the caller, joins on shutdown). Mutation checks:
+  11 mutations (fail open on unscanned frames, no settings-change cover,
+  readback credited to the pushed frame, no discontinuity after 0x0, old
+  generations never retired, re-emit of the unscanned frame, 0x0 dropping
+  buffered frames, no cover without a policy, masked frame without a
+  texture, mask regions rounded inward, mask cells not scaled) each failed
+  at least one test. Render-thread cost (hidden `[bench]` case: real
+  `spg::Scheduler`, two workers, 60 fps for 10 s, a 1920x1080 readback every
+  frame, a 15 ms detector returning 40 boxes; two runs): readback copy plus
+  `push` p50 405 to 440 us, p99 1.33 to 1.55 ms, max 1.65 ms; `release_due`
+  p50 25 to 30 us, p99 88 to 167 us, max 175 us; the pool allocated 2
+  buffers for 600 frames. That is CPU time without a GPU; map latency and
+  GPU cost are not measured. Not tested: the GPU code and the effect
+  (headless libobs in CI has no graphics context, so `plugin.loads` still
+  does not exercise the render path), loading in OBS, HDR sources (captured
+  as 8-bit BGRA). The live steps are in [live-check.md](live-check.md)
+  ("Render path").
+- Eval delta: not measured. No core pipeline behavior changed (the core
+  change is an additive overload), and the agent sandbox cannot run the eval
+  stage; the PR's Check log has the CI eval stage output.
+- Open issues or follow-ups: load detection models and ONNX Runtime in the
+  plugin (with packaging, SPG-17); run the live render checks (human);
+  SPG-16 measures readback size and cadence against the copy cost above
+  (about 0.4 ms per scanned 1080p frame) and GPU time; a VRAM budget with a
+  shorter effective lookahead and a warning; move the watch-list reload off
+  the video thread after #42; HDR capture; SPG-18 should confirm with
+  `scrub` that the blur cell sizes leave nothing readable.
+- Review fixes (security review on `f1f63d9`, "fail-open state drift" in the
+  render path): (1) a failed adoption used to drop the new generation and
+  keep the old scheduler running, so a policy that had just become empty
+  could keep airing frames masked under the old one; `Pipeline::adopt` now
+  has the strong guarantee and the new `PipelineHost` covers the frame solid
+  and retries the same generation next frame. (2) A failed scheduler build
+  covers every frame solid until a later hand-over succeeds (it used to rely
+  on a flag a repeated identical publish could skip). (3) Every plan names
+  the capture serial of its texture and the GPU side rechecks the slot
+  (`checked_kind`) right before drawing: a recycled, freed, failed or
+  resized slot draws solid. (4) A release that does not match the frame
+  buffered under its id is covered (`Cover::Inconsistent`). (5) An invalid
+  or non-Source mask rect blurs the whole frame instead of being skipped.
+  (6) A released frame repeats for at most 100 ms (`Cover::Stalled`).
+  (7) A frame-time gap over 200 ms (filter disabled, source not rendered) or
+  a step backwards marks a discontinuity and drops the re-emit anchor.
+  (8) Exceptions from GPU calls are caught inside the tick without leaking a
+  ring slot, and a repeated render of a failed frame time stays solid.
+  Evidence: 10 new `plugin.pipeline.*` cases (276/276 ctest tests pass on
+  the dev Mac); the harness now also checks on every tick that the GPU would
+  draw exactly the planned kind; 10 mutations (one per rule, plus losing the
+  spec on a failed adopt) each failed a test; the threaded hand-off race
+  case passed 20 repeated runs.
+- Review fixes (Greptile threads on `ceea871`, after merging `main` at
+  `cc5da96`): (1) after a settings change that shortens the lookahead, an
+  old generation's frame could air after a newer one's (a skipped render
+  left the new generation nothing due), so the picture jumped back; now,
+  once a newer generation has aired, older releases are dropped and that
+  generation is retired. (2) Live generations are capped at two (current
+  plus one draining, keeping the one on screen), so rapid settings changes
+  cannot pile up workers or ring slots. (3) The aired counters count the
+  plan each tick ends with, not every frame released in a tick. (4) A
+  released frame's slot is held by a scope guard, so a failed mask copy no
+  longer leaks it. (5) The reaper queue is linked through the schedulers
+  (no allocation) and a failed thread start leaves the scheduler queued
+  instead of destroying it on the render thread. (6) The GPU mask levels
+  are a fixed array and `draw` closes its texrender and blend state if
+  composing throws (`render()` is `noexcept`, so a throw used to terminate
+  OBS). Declined: making `push`/`release_due` lock-free. They take the
+  scheduler's lock for bookkeeping, and a worker holds it only to apply a
+  result, never during inference. This is the SPG-10 contract in
+  `scheduler.md`; its cost is measured above, and SPG-16 owns the p99.
+  Evidence: 5 new `plugin.pipeline.*` cases (290/290 ctest tests pass on
+  the dev Mac with `main` at `0425e86` merged; the pipeline suite passed 10
+  repeated runs); 5 mutations, one per fix (1) to (5), each failed a test.
+  The drop and the retire of older generations back each other up, so (1)
+  reverts both. The GPU change needs a graphics context and is
+  covered only by the live check.

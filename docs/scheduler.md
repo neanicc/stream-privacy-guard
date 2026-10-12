@@ -165,8 +165,12 @@ cadence wants a scan. That copy allocates and copies one readback on the
 render thread per queued scan (every frame at the default `scan_interval` of
 0), and `release_due` waits for the mutex while a worker applies a result,
 whose cost grows with detections times buffered frames. Neither waits on
-inference, but SPG-16 must measure the p99 of the render-facing calls; a
-pooled readback buffer would remove the allocation. The queue holds at most `queue_capacity` jobs; a new job
+inference, but SPG-16 must measure the p99 of the render-facing calls. The
+plugin (SPG-14) avoids that allocation: it copies the mapped stage surface
+into a pooled buffer, wraps it with `OwnedFrame::adopt` (no copy; the
+buffer returns to the pool when the worker drops the frame) and calls the
+`push` overload that takes a `shared_ptr<const OwnedFrame>`
+([plugin-render.md](plugin-render.md)). The queue holds at most `queue_capacity` jobs; a new job
 pushes out the oldest, and workers take the newest. The clock is read from
 worker threads (the tracker prunes on update), so it must be thread-safe
 (`SteadyClock` is; `ManualClock` is not).

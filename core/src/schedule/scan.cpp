@@ -7,6 +7,7 @@
 #include <exception>
 #include <iterator>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "spg/error.hpp"
@@ -88,6 +89,17 @@ std::shared_ptr<const OwnedFrame> OwnedFrame::copy(const FrameView& frame) {
     owned->view_.strides[p] = static_cast<std::uint32_t>(bytes);
     offset += bytes * count;
   }
+  return owned;
+}
+
+std::shared_ptr<const OwnedFrame> OwnedFrame::adopt(const FrameView& frame, std::shared_ptr<const void> owner) {
+  validate(frame);
+  if (owner == nullptr) {
+    throw ContractError("scan: OwnedFrame::adopt needs an owner");
+  }
+  std::shared_ptr<OwnedFrame> owned(new OwnedFrame());
+  owned->owner_ = std::move(owner);
+  owned->view_ = frame;
   return owned;
 }
 

@@ -3,6 +3,7 @@
 
 #include <obs-module.h>
 
+#include "pipeline/reaper.hpp"
 #include "plugin-support.hpp"
 #include "spg-filter.hpp"
 #include "spg/secure_memory.hpp"
@@ -33,5 +34,8 @@ bool obs_module_load(void) {
 }
 
 void obs_module_unload(void) {
+  // Scheduler workers run code from this module: wait until every retired
+  // scheduler has joined its workers before the module can be unmapped.
+  spg::plugin::module_reaper().shutdown();
   spg::plugin::log(LOG_INFO, "unloaded");
 }

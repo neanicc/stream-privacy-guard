@@ -2,10 +2,12 @@
 
 // The "Privacy Guard" video filter: an OBS source of type FILTER.
 //
-// Shell (SPG-13): there is no detection pipeline yet, so the filter fails
-// closed. It never draws the unscanned source; it covers the whole source with
-// an opaque fill (the plan's "solid fill" fallback). SPG-14 replaces this with
-// readback, the lookahead buffer and the blur effect.
+// Render (SPG-14): each frame is captured into a lookahead ring of textures,
+// read back downscaled for the scheduler's workers, and drawn once it is due,
+// with its masks blurred, or covered whole when it was not fully scanned
+// (render/filter_render.hpp, docs/plugin-render.md). It never draws an
+// unscanned frame uncovered. Detection models are not loaded by this build
+// yet, so every frame gets the fallback.
 //
 // Settings (SPG-15): the properties of plan section 7. Watch-list entries are
 // never stored in the filter settings (which OBS saves in plain text in the
@@ -23,6 +25,8 @@ inline constexpr const char *kFilterId = "spg_privacy_guard_filter";
 // Settings keys. Saved in scene collections, so they must never change.
 inline constexpr const char *kStatusKey = "spg_status";
 inline constexpr const char *kIssueKey = "spg_issue";
+inline constexpr const char *kRenderStatusKey = "spg_render_status";
+inline constexpr const char *kAudioKey = "spg_audio";
 inline constexpr const char *kLookaheadKey = "lookahead_ms";
 inline constexpr const char *kHoldKey = "hold_ms";
 inline constexpr const char *kSensitivityKey = "sensitivity";
