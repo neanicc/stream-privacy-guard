@@ -15,6 +15,7 @@ if(NOT SPG_CCACHE_PROGRAM)
 endif()
 
 if(CMAKE_GENERATOR MATCHES "Visual Studio")
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/ccache-msvc")
   file(COPY_FILE "${SPG_CCACHE_PROGRAM}" "${CMAKE_BINARY_DIR}/ccache-msvc/cl.exe" ONLY_IF_DIFFERENT)
   # /Zi writes a shared PDB, which ccache cannot cache; embed debug info instead.
   set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
