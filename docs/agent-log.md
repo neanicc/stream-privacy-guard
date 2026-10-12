@@ -1563,3 +1563,61 @@ Template:
   `models_changed` uses SPG-14c's rule: after a failed settings change it
   rebuilds nothing. Building schedulers off the graphics thread is SPG-14d;
   the model hand-over adds no model work to that path.
+
+## 2026-10-12 — SPG-14d Build schedulers off the graphics thread (#62)
+
+- Decision / change: OBS runs a filter's `update` and `video_tick` on the
+  graphics thread, which also runs `video_render`, so neither may construct a
+  `ThreadedScheduler` (worker threads, stages around the loaded models).
+  `publish` (settings), `tick` (VRAM refit) and the models' hand-over now only
+  record a request and post the build to a per-filter `TaskThread`, started
+  when the filter is created so asking never starts a thread. The rules live
+  in `GenerationBuilder` (`plugin/src/pipeline/builder.{hpp,cpp}`, no OBS):
+  (1) a settings change covers every frame (`Cover::SettingsChanged`, via a
+  new `PipelineHost::fail(Cover)`) from the request until its generation is
+  offered, since the running one scans with the old settings; (2) a rebuild of
+  the same settings (refit, models ready) keeps the running generation until
+  the new one is offered; (3) only the latest request is offered: one
+  superseded before it starts is never built, one superseded while building
+  goes to the reaper; (4) a failed build covers (`NoDetection`), a failed
+  rebuild of settings built once is asked for again every `kRefitRetryNs`
+  (`RefitSchedule::failed` now forgets a fit marked done when it was asked
+  for), a settings change that never produced a generation is not retried.
+  The build copies everything it needs and runs without the settings lock;
+  the build thread takes that lock only to hand the generation to
+  `PipelineHost` and log. `tick` only try-locks it. The filter's destructor
+  stops the build thread (a build in progress finishes, queued ones are
+  dropped). Review items from SPG-14c: the `&policy != &published_` guard is
+  gone, replaced by copies (`request_locked` takes the policy by value and
+  `tick`/`models_changed` pass a copy of `requested_`); `tick` has no catch
+  that logs any more, and the shared `log_not_started()` is `noexcept` with a
+  `static_assert` that `log` is `noexcept` (it formats into a stack buffer and
+  calls `blogva`, so it cannot throw or allocate in C++). Comments and docs
+  now say "graphics thread" for `video_tick`/`update` (`docs/plugin-render.md`
+  "Building generations", `docs/settings.md`, headers). Hold clamping is
+  untouched (SPG-08b changes it in parallel).
+- Evidence: 8 new `[build]` pipeline cases (all OSes): a settings change is
+  solid until its build runs and masks after; a rebuild keeps masking while
+  pending; superseded requests are never built or are retired, never offered;
+  failed builds cover and only rebuilds are retried, once per failure; a post
+  or prepare failure fails closed; `TaskThread` order and stop (the stop case
+  waits for `post` to refuse instead of sleeping); a build through a real
+  `TaskThread` records the thread it ran on, which is the build thread and
+  not the caller, with frames solid until the hand-over; 150 builds racing
+  with frames never draw a `Masked` frame from failing scans and never leave
+  more than two generations live. `RefitSchedule` gains a case for a fit
+  marked done whose build then failed. `plugin.loads` now waits for both
+  filters' "scanning with the detection models" lines, which the build thread
+  writes. Mutations: dropping the `SettingsChanged` cover failed 3 of the 8
+  `[build]` cases (35 assertions); building on the caller and handing over on
+  the executor failed the off-thread case (`built_on == thread.id()`). Dev
+  Mac (Apple M4): `scripts/ci/run.sh build` and `test` passed, 334/334,
+  on `main` at `79dd38b`; the `[build]` cases passed 8 repeated runs.
+- Eval delta: not affected. The core pipeline is unchanged (plugin-only);
+  `scripts/ci/run.sh eval` was not run.
+- Open issues or follow-ups: a source resized while a settings change is
+  still building supersedes it with a rebuild of the new settings; if that
+  build fails it is not retried (no generation of those settings existed
+  yet), so the source stays covered until the next settings change. Fail
+  closed, but worth revisiting if refits fail in practice. Live check (OBS on
+  a real source) of the solid frames during a settings change: not done.

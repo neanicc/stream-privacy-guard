@@ -2,11 +2,12 @@
 
 // Loads the detection models once per module, on a thread of its own
 // (SPG-14b), without OBS. Opening and warming up the models takes from
-// hundreds of milliseconds to seconds, so it never runs on the render, video
-// or UI thread: start() only starts the thread, and a filter keeps covering
-// every frame whole until the models are ready. When loading ends (ready or
-// not) every subscribed listener is called on the loader thread, so each
-// filter can rebuild its scheduler with the models. The reporter is told the
+// hundreds of milliseconds to seconds, so it never runs on the graphics
+// thread (render, video tick, update) or the UI thread: start() only starts
+// the thread, and a filter keeps covering every frame whole until the models
+// are ready. When loading ends (ready or not) every subscribed listener is
+// called on the loader thread, so each filter can ask for a scheduler with
+// the models (built on the filter's build thread, SPG-14d). The reporter is told the
 // outcome exactly once, with a reason even when the loader threw or its
 // thread could not be started, so the log always says why detection is off.
 //

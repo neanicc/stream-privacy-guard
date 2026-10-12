@@ -26,9 +26,11 @@ target_include_directories(obs-spg-settings PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(obs-spg-settings PUBLIC spg::core)
 spg_target_defaults(obs-spg-settings)
 
-# Lookahead ring, readback scheduling, draw plans and scheduler retirement
-# without OBS (SPG-14), unit-tested on every OS with a fake GPU.
+# Lookahead ring, readback scheduling, draw plans, scheduler builds off the
+# graphics thread (SPG-14d) and scheduler retirement without OBS (SPG-14),
+# unit-tested on every OS with a fake GPU.
 add_library(obs-spg-pipeline STATIC
+  src/pipeline/builder.cpp
   src/pipeline/frame_ring.cpp
   src/pipeline/host.cpp
   src/pipeline/mask_levels.cpp

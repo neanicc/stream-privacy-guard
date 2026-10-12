@@ -93,13 +93,15 @@ fall back to a shorter lookahead with a visible warning"). The setting
   can finish and is covered.
 - **Through a new generation:** the fit is made in `publish` (settings
   change) and again in the filter's `video_tick` when the source size or the
-  frame rate changes. A different result builds a new scheduler off the
-  render path, handed over like any settings change, so the old one's
-  buffered frames still air with their masks and the switch rules above
-  apply. A hidden (0x0) source keeps its last fit. A refit that fails
-  (allocation, a worker thread that cannot start) covers the whole source
-  and is retried once a second until one succeeds (`RefitSchedule`); a
-  failed settings change is not, since the old settings must not run again.
+  frame rate changes. A different result asks for a new scheduler of the
+  same settings, built on the filter's build thread (see "Building
+  generations" below); the running one keeps going until it is ready, then
+  it is handed over like any settings change, so the old one's buffered
+  frames still air with their masks and the switch rules above apply. A
+  hidden (0x0) source keeps its last fit. A refit that fails (allocation, a
+  worker thread that cannot start) covers the whole source and is asked for
+  again once a second until one succeeds (`RefitSchedule`); a failed
+  settings change is not, since the old settings must not run again.
 - **Fail closed:** a shorter lookahead only gives scans less time; frames
   not scanned within it get the fallback as always. The scheduler's
   retroactive window is clamped to the shorter lookahead.
@@ -137,9 +139,13 @@ fall back to a shorter lookahead with a visible warning"). The setting
   unseen, and the scheduler, the buffered frames and the held masks are
   kept. When frames return the scheduler is told the content may have
   changed (`mark_discontinuity`).
-- A **settings change** builds a new scheduler off the render thread (in
-  `update` or the watch-list button handler). The old one keeps releasing its
-  buffered frames with its own masks until it is empty. Frames of the new one
+- A **settings change** (`update` on the graphics thread, or the watch-list
+  buttons on the UI thread) asks for a new scheduler, built on the filter's
+  build thread. Until it is ready every frame is covered with a solid fill
+  (`SettingsChanged`): the running scheduler scans with the old settings,
+  which may lack a watch-list entry or a category just added. Once the new
+  one is swapped in, the old one keeps releasing its buffered frames with its
+  own masks until it is empty. Frames of the new one
   within the old hold of the switch are covered whole (`SettingsChanged`),
   because their held detections were in the old tracker. A debug overlay
   toggle does not restart the scheduler.
@@ -160,7 +166,8 @@ solid fill when there is nothing trustworthy to blur) and is unit-tested:
 
 | Case | Rule |
 | --- | --- |
-| Settings change racing with render | The settings side hands over a complete generation under a lock held only for a pointer swap; the render thread takes it at the start of a frame (`PipelineHost`). A failed build (`fail()`) covers every frame with a solid fill until the next successful hand-over; the old scheduler is never left running in its place |
+| Settings change racing with render | The build thread hands over a complete generation under a lock held only for a pointer swap; the render thread takes it at the start of a frame (`PipelineHost`). From the request until then every frame is solid (`SettingsChanged`). A failed build (`fail()`) covers every frame with a solid fill until the next successful hand-over; the old scheduler is never left running in its place |
+| A newer request while a build runs | Only the latest request is offered: an older one not started is never built, one finished late is retired unseen (`GenerationBuilder`), so a slow build can never put superseded settings on air |
 | Adoption fails (allocation) | `Pipeline::adopt` has the strong guarantee; the frame is solid, a second render of the same frame time is solid too, and the next frame retries the same generation |
 | Policy becomes empty (storage error, no categories, rejected settings) | The next frame covers the live frame whole; the old scheduler's frames are never shown again |
 | A release that does not match the frame buffered under its id (time, size, unknown id, clean action with a fallback flag or reason) | Solid, `Inconsistent` |
@@ -174,12 +181,45 @@ solid fill when there is nothing trustworthy to blur) and is unit-tested:
 | Composing the output fails | The output texrender and blend state are closed first, then the output is solid. Mask levels are a fixed array, so composing allocates nothing |
 | First frames | Covered whole until the scheduler releases a frame (`Starting`), or while no policy is set or the detection models are not loaded (`NoDetection`) |
 
+## Building generations (SPG-14d)
+
+In OBS a filter's `update` and `video_tick` run on the graphics thread, the
+thread that also runs `video_render`, so nothing there may build a
+scheduler (start its worker threads, wrap the loaded models in stages).
+`publish` (settings), `tick` (VRAM refit) and the models' hand-over (loader
+thread) only decide that a generation is needed: they compare what it
+would be built from (policy, fallback, budget, fitted lookahead, models
+generation) with the latest request and, if different, post the build to
+the filter's build thread (`TaskThread`, started when the filter is created,
+so asking never starts a thread). The build copies everything it needs;
+the filter's settings lock is held only to record the request and, on the
+build thread, to hand the result to `PipelineHost`. `tick` only tries that
+lock and never waits. The rules live in `GenerationBuilder`
+(`plugin/src/pipeline/builder.hpp`, no OBS) and are unit-tested with a
+manual executor and with a real build thread:
+
+- A settings change covers every frame (solid, `SettingsChanged`) from the
+  request until its generation is offered.
+- A rebuild of the same settings (refit, models ready) leaves the running
+  generation in place until the new one is offered.
+- Only the latest request is offered; superseded ones are never built or
+  are retired to the reaper. At most two generations stay live, as before
+  (`Pipeline::kMaxGenerations`).
+- A failed build covers every frame (solid, `NoDetection`). A failed
+  rebuild of settings that were built once is asked for again every
+  `kRefitRetryNs`; a settings change that never produced a generation is
+  not retried and covers until the next change.
+- The filter's destructor stops the build thread: a build in progress
+  finishes (the models are already loaded, so it is short), queued ones are
+  dropped.
+
 ## Threads and unload
 
 The render thread never takes the filter's settings lock; it takes a hand-off
-lock only to swap in a new scheduler. Schedulers are never destroyed on the
-render, video or UI thread: retired ones go to a reaper thread, whose
-destructor calls wait for their workers. Queueing one allocates nothing (the
+lock only to swap in a new scheduler. Schedulers are never built (see above)
+or destroyed on the graphics thread (which runs `video_render`, `video_tick`
+and a deferred `update`) or the UI thread: retired ones go to a reaper
+thread, whose destructor calls wait for their workers. Queueing one allocates nothing (the
 queue is linked through the schedulers); if the reaper thread cannot be
 started, the scheduler stays queued until a later retire starts it or unload
 destroys it. The render thread does take each scheduler's own lock in `push`
@@ -210,7 +250,7 @@ would hold OBS shutdown; detection stages have no unbounded wait today.
 | Magenta | Bad frame timestamp |
 | Violet | A result could not be applied |
 | Grey | Starting, or detection off (no PolicyConfig, or no detection models) |
-| Blue | Settings changed (old hold) |
+| Blue | Settings changed (old hold, or the new scheduler still being built) |
 | White | The frame could not be kept (no texture) |
 | Yellow | Nothing released for over 100 ms (stall) |
 | Cyan | Inconsistent state (see below) |
@@ -227,7 +267,7 @@ other sources' offsets itself (SPG-13 decision).
 
 The module loads YuNet, PP-OCR det and PP-OCR rec once, for every filter, on a
 loader thread of its own (`plugin/src/models/`, `plugin/src/model_loading.cpp`)
-that the first filter starts; the render, video and UI threads never open or
+that the first filter starts; the graphics and UI threads never open or
 warm up a model. It looks in the plugin's data directory (`models/`, for a
 packaged build) and then in `$SPG_CACHE_DIR/models` or `~/.cache/spg/models`
 (`%USERPROFILE%` on Windows), where `scripts/fetch_models.py` puts them. It
@@ -240,7 +280,7 @@ to open, a filter builds no scheduler: every frame is covered whole
 (`Cover::NoDetection`), the properties say why, and the log has one line
 (`detection models missing, covering every frame whole: <model>: <path>`;
 a loader that threw or a thread that could not start gets a fixed reason in
-the same line). When loading ends the loader hands each filter's current
+the same line). When loading ends the loader asks for each filter's current
 policy a new scheduler whose stages are the shared detectors, the recognizer
 and a `PolicyEngine` built from the filter's `PolicyConfig` (no model is
 opened there: the stages share the loaded ones); the log says `'<filter
@@ -266,7 +306,14 @@ seeded rects) and the reaper; `plugin/tests/ring_budget_test.cpp` and the
 `[budget]` pipeline cases: the budget math (5000 seeded fits), the warning
 and its log line, refusal past the budget, a fitting budget that never
 refuses (with HoldLastScanned re-emits), a lower budget that keeps buffered
-frames, and a resize followed by a refitted generation. The GPU code and the effect need a graphics
+frames, and a resize followed by a refitted generation; the `[build]` cases
+(SPG-14d): a settings change covered until its generation is built, a
+rebuild that keeps the running generation, superseded requests never
+offered, failed builds covered and retried only as a rebuild, a build that
+cannot be posted or prepared, the build thread's order and stop, a build
+that runs on the build thread and never on the caller, and builds racing
+with frames that never air an unscanned frame or leave more than two
+generations live. The GPU code and the effect need a graphics
 context, which headless libobs in CI does not have: they are checked live
 ([live-check.md](live-check.md)). HDR sources are captured as 8-bit BGRA
 (untested). The render-thread cost measured on the dev Mac is in the SPG-14
