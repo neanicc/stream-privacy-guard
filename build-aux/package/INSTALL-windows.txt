@@ -1,0 +1,48 @@
+Stream Privacy Guard (obs-spg) for OBS Studio on Windows x64
+============================================================
+
+An OBS filter that blurs faces, watch-listed text and personal data on a
+source before it airs. It is a safety net, not a guarantee: anything it
+misses has already aired. Read "Limitations" in the project README before
+relying on it: https://github.com/neanicc/stream-privacy-guard
+
+Requirements
+  - Windows 10 or 11, x64.
+  - OBS Studio 32.1 or a later 32.x release (64-bit). Built against
+    libobs 32.1.2; other OBS versions are untested.
+  - Python 3 (3.12 tested), once, to fetch the detection models.
+  - Detection runs on the CPU (no GPU acceleration in this build).
+
+Install
+  1. Quit OBS.
+  2. Copy the obs-spg folder into
+       C:\ProgramData\obs-studio\plugins\
+     (create the folder if it does not exist), so that the module is at
+       C:\ProgramData\obs-studio\plugins\obs-spg\bin\64bit\obs-spg.dll
+  3. Fetch the models (next section).
+  4. Start OBS. Right-click a source > Filters > Effect Filters > + >
+     Privacy Guard.
+
+  This build is not code-signed. onnxruntime.dll beside obs-spg.dll is the
+  ONNX Runtime version the plugin was built with; keep the two together.
+
+Models
+  The package carries no model weights. From this folder, run once:
+       python scripts\fetch_models.py
+  It downloads YuNet and PP-OCR from the pinned URLs in models\manifest.json,
+  checks each file's size and SHA-256, and installs them in
+  %USERPROFILE%\.cache\spg\models (or %SPG_CACHE_DIR%\models). The plugin
+  checks them again before loading and never downloads anything itself.
+  Without the models the filter fails closed: it blurs the whole source.
+
+Audio
+  The filter delays the video by its Lookahead (500 ms by default). Set the
+  same Sync Offset in Edit > Advanced Audio Properties on every audio source
+  that belongs with the video.
+
+Uninstall
+  Delete C:\ProgramData\obs-studio\plugins\obs-spg. Watch-list files stay in
+  %APPDATA%\obs-studio\plugin_config\obs-spg\ until you delete them; the
+  models stay in %USERPROFILE%\.cache\spg\models.
+
+License: GPL-2.0 (LICENSE.txt). Third-party notices: obs-spg\data\licenses\.

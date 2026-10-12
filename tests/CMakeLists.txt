@@ -77,6 +77,10 @@ add_test(NAME scripts.fetch_deps
 add_test(NAME scripts.fetch_models
   COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_models.py")
 
+# Package check and archive helper (scripts/package.sh) ---------------------------
+add_test(NAME scripts.package_tool
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_package_tool.py")
+
 # Eval scorer and suite generators (lane:eval) -------------------------------------
 # The scorer test is standard library only. The generator test fetches the
 # Pillow wheel pinned in eval/pydeps.json into the cache on first use.
