@@ -230,7 +230,10 @@ class ArchiveTest(unittest.TestCase):
                 members = {m.name: m for m in tar.getmembers()}
             self.assertTrue(all(n.split("/")[0] == stage.name for n in members))
             entry = members[f"{stage.name}/obs-spg/bin/64bit/obs-spg.so"]
-            self.assertEqual(entry.mode & 0o777, 0o755)
+            # Windows has no exec bit to set or keep; the Linux package is
+            # built on Linux, where the mode must survive.
+            if sys.platform != "win32":
+                self.assertEqual(entry.mode & 0o777, 0o755)
             self.assertTrue(all(m.uid == 0 and m.uname == "" for m in members.values()))
             zipped = package_tool.archive(stage, out, "windows-x64")
             with zipfile.ZipFile(zipped) as zf:
