@@ -132,6 +132,11 @@ void FilterRender::models_changed() noexcept {
       log(LOG_WARNING, "could not start detection for these settings: covering the whole source");
     }
   }
+  // OBS does not rebuild a properties view on its own, so one opened while
+  // the models loaded would keep saying "loading". This only emits the
+  // source's update_properties signal; the frontend reloads the view on its
+  // own (UI) thread.
+  obs_source_update_properties(filter_);
 }
 
 void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback,

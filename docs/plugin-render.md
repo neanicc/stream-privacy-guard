@@ -230,19 +230,23 @@ loader thread of its own (`plugin/src/models/`, `plugin/src/model_loading.cpp`)
 that the first filter starts; the render, video and UI threads never open or
 warm up a model. It looks in the plugin's data directory (`models/`, for a
 packaged build) and then in `$SPG_CACHE_DIR/models` or `~/.cache/spg/models`
-(`%USERPROFILE%` on Windows), where `scripts/fetch_models.py` puts them, and
-checks every file's size and SHA-256 against `models/manifest.json` before ONNX
-Runtime opens it. It never downloads anything.
+(`%USERPROFILE%` on Windows), where `scripts/fetch_models.py` puts them. It
+reads each file once into memory, checks the size and SHA-256 of those bytes
+against `models/manifest.json`, and hands ONNX Runtime the same bytes, so a
+file replaced after the check is never loaded. It never downloads anything.
 
 Until the models are ready, and for good when one is missing, damaged or fails
 to open, a filter builds no scheduler: every frame is covered whole
 (`Cover::NoDetection`), the properties say why, and the log has one line
-(`detection models missing, covering every frame whole: <model>: <path>`).
-When loading ends the loader hands each filter's current policy a new
-scheduler whose stages are the shared detectors, the recognizer and a
-`PolicyEngine` built from the filter's `PolicyConfig`; the log says
-`'<filter name>': scanning with the detection models`. A failed load is not
-retried until OBS restarts.
+(`detection models missing, covering every frame whole: <model>: <path>`;
+a loader that threw or a thread that could not start gets a fixed reason in
+the same line). When loading ends the loader hands each filter's current
+policy a new scheduler whose stages are the shared detectors, the recognizer
+and a `PolicyEngine` built from the filter's `PolicyConfig` (no model is
+opened there: the stages share the loaded ones); the log says `'<filter
+name>': scanning with the detection models`, and the filter asks OBS to
+rebuild a properties view that is open on it. A failed load is not retried
+until OBS restarts.
 
 ONNX Runtime 1.30.0 ships next to the module (`obs-spg.plugin/Contents/Frameworks`
 with the module's only rpath on macOS, `onnxruntime.dll` beside `obs-spg.dll`,

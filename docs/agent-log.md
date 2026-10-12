@@ -1484,7 +1484,10 @@ Template:
   build) and then `$SPG_CACHE_DIR/models` or `~/.cache/spg/models`
   (`%USERPROFILE%` on Windows), as `scripts/fetch_models.py` does, and checks
   its size and SHA-256 (pins generated from `models/manifest.json` at
-  configure time) before ONNX Runtime opens it; `load_models` opens and warms
+  configure time) on bytes read once into memory, which are then what ONNX
+  Runtime parses (new `runtime::ModelBytes` overloads of `Session::open` and
+  the three detectors' `open`), so a file swapped after the check is never
+  loaded; `load_models` opens and warms
   up the three sessions through the spg-core wrapper; `make_stages` returns
   the shared detectors, a recognizer adapter and an `EnginePolicy` built from
   the filter's `PolicyConfig` (the same stages as `spg-cli`'s
@@ -1547,3 +1550,16 @@ Template:
   (SPG-17); another plugin that already loaded a different `onnxruntime.dll`
   into OBS on Windows wins by module name (obs-backgroundremoval and
   obs-localvocal share this problem); a retry button for a failed load.
+- Review follow-up (babysit, after merging `main` at `e2a3911`, SPG-14c):
+  the staff review's P2 (hash-then-reopen window) is closed by opening from
+  the verified bytes; Greptile's three findings are fixed: `ModelHub` takes a
+  reporter called once per load with fixed reasons for a throwing loader,
+  out of memory, Ready without models and a thread that cannot start (the
+  module logs it, so "the OBS log has the reason" holds); the loader's
+  hand-over calls `obs_source_update_properties` so an open properties view
+  stops saying "loading" (`plugin.loads` counts the signal; removing the
+  call failed it); and the lifetime case drops its snapshot so the stages
+  are the models' only owners, then checks the models die with the stages.
+  `models_changed` uses SPG-14c's rule: after a failed settings change it
+  rebuilds nothing. Building schedulers off the graphics thread is SPG-14d;
+  the model hand-over adds no model work to that path.

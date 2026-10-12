@@ -19,6 +19,7 @@
 #include "spg-filter.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -534,6 +535,14 @@ std::string captured() {
   return captured_log;
 }
 
+// update_properties signals on the first filter: what makes OBS rebuild a
+// properties view that is already open on it.
+std::atomic<int> early_refreshes{0};
+
+void count_refresh(void * /*data*/, calldata_t * /*params*/) {
+  early_refreshes.fetch_add(1);
+}
+
 // The models load on the module's loader thread once a filter exists; the
 // properties show "loading" (a warning) until then. Ready is a normal info
 // line, missing models an error. Creating more filters loads nothing again.
@@ -573,6 +582,14 @@ void check_models(bool present, obs_source_t *early) {
           "a filter created before the models were ready rebuilds its scheduler with them");
     check(log.find("[obs-spg] 'spg-models-2': scanning with the detection models") != std::string::npos,
           "a filter created once they are ready builds its scheduler with them");
+    // A properties view opened while loading said "loading": the hand-over
+    // asks OBS to rebuild it (the frontend reloads on update_properties),
+    // just after the rebuild logged above.
+    const auto refreshed = std::chrono::steady_clock::now() + std::chrono::minutes{1};
+    while (early_refreshes.load() == 0 && std::chrono::steady_clock::now() < refreshed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    check(early_refreshes.load() == 1, "the hand-over asks OBS once to refresh the first filter's properties");
   } else {
     check(type == OBS_TEXT_INFO_ERROR, "missing models are an error in the properties");
     const std::string log = captured();
@@ -698,8 +715,17 @@ int main(int argc, char **argv) {
     // Created first, so it starts the model loader and publishes before the
     // models are ready.
     obs_source_t *early = obs_source_create(plugin::kFilterId, "spg-early", nullptr, nullptr);
+    // Loading the pinned models takes hundreds of milliseconds, so this is
+    // connected long before the hand-over (models-present checks it).
+    signal_handler_t *early_signals = early != nullptr ? obs_source_get_signal_handler(early) : nullptr;
+    if (early_signals != nullptr) {
+      signal_handler_connect(early_signals, "update_properties", count_refresh, nullptr);
+    }
     run_filter_checks(module);
     check_models(models_present, early);
+    if (early_signals != nullptr) {
+      signal_handler_disconnect(early_signals, "update_properties", count_refresh, nullptr);
+    }
     obs_source_release(early);
   }
 

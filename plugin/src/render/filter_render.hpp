@@ -73,7 +73,8 @@ class FilterRender {
   void log_transition(const DrawPlan& plan) noexcept;
   // Caller holds publish_mutex_.
   void publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback, std::uint64_t budget_bytes);
-  // The model loader thread: rebuild the published settings with the models.
+  // The model loader thread: rebuild the published settings with the models,
+  // then ask OBS to refresh a properties view open on this filter.
   void models_changed() noexcept;
   // The source size and frame interval the budget is fitted to, now.
   [[nodiscard]] Size source_size() const noexcept;
