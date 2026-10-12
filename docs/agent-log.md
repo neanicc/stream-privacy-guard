@@ -69,7 +69,7 @@ Template:
   later; OBS plugin builds may need the OpenCV libraries checked
   for position-independent code on Linux (SPG-13).
 
-## 2026-10-12 — SPG-04 Model manifest and runtime
+## 2026-10-12 — SPG-04 Model manifest and runtime (#24)
 
 - Decision / change: `models/manifest.json` pins three ONNX models by URL,
   size, SHA-256 and license: YuNet `face_detection_yunet_2023mar` (MIT,
