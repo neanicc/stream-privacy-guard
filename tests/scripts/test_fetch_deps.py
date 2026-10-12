@@ -249,6 +249,23 @@ class FetchDepsTest(unittest.TestCase):
         self.assertTrue((dest / "bin" / "a.dll").exists())
         self.assertFalse((dest / "bin" / "b.exe").exists())
 
+    def test_changed_include_filter_unpacks_again_from_the_same_archive(self) -> None:
+        sha = self.seed(make_tar({"pkg-1.0/include/pkg.h": b"// header\n",
+                                  "pkg-1.0/lib/libpkg.a": b"lib"}))
+        narrow = {"url": URL, "sha256": sha, "root": "pkg-1.0", "include": ["pkg-1.0/include/"]}
+        wide = dict(narrow, include=["pkg-1.0/include/", "pkg-1.0/lib/"])
+        dest = self.cache / "deps" / "pkg" / "1.0-linux-x64"
+        with mock.patch.object(fetch_deps, "download", self.no_network):
+            fetch_deps.install("pkg", "1.0", "linux-x64", narrow, self.cache, True)
+            self.assertFalse((dest / "lib").exists())
+            widened = fetch_deps.install("pkg", "1.0", "linux-x64", wide, self.cache, True)
+            again = fetch_deps.install("pkg", "1.0", "linux-x64", wide, self.cache, True)
+        self.assertIn("unpacked", widened)
+        self.assertIn("cached", again)
+        self.assertEqual((dest / "lib" / "libpkg.a").read_bytes(), b"lib")
+        marker = json.loads((dest / fetch_deps.MARKER).read_text(encoding="utf-8"))
+        self.assertEqual(marker["include"], wide["include"])
+
     def test_main_honors_unused_platforms_groups_and_unpack_false(self) -> None:
         packed = self.seed(make_tar({"pkg-1.0/a": b"a"}))
         raw_url = "https://example.invalid/raw-1.0.zip"

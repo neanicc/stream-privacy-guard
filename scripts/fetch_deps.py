@@ -242,9 +242,13 @@ def _install_locked(name: str, version: str, plat: str, entry: dict, cache: Path
                     unpack: bool, expected: str) -> str:
     dest = cache / "deps" / name / f"{version}-{plat}"
     marker = dest / MARKER
+    include = entry.get("include")
     if unpack and marker.exists():
         try:
-            if json.loads(marker.read_text(encoding="utf-8")).get("sha256") == expected:
+            # The unpacked tree depends on the archive and on the include filter,
+            # so a widened or narrowed filter unpacks again from the same archive.
+            recorded = json.loads(marker.read_text(encoding="utf-8"))
+            if recorded.get("sha256") == expected and recorded.get("include") == include:
                 return f"{name} {version} {plat}: cached at {dest}"
         except (OSError, ValueError):
             pass
@@ -255,7 +259,7 @@ def _install_locked(name: str, version: str, plat: str, entry: dict, cache: Path
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{name}-", dir=dest.parent))
     try:
-        extract(archive, staging, entry.get("include"))
+        extract(archive, staging, include)
         root = (staging / entry.get("root", ".")).resolve()
         if not root.is_dir() or staging.resolve() not in (root, *root.parents):
             raise FetchError(f"{name}/{plat}: root {entry.get('root')!r} not found in {archive.name}")
@@ -263,7 +267,8 @@ def _install_locked(name: str, version: str, plat: str, entry: dict, cache: Path
             shutil.rmtree(dest)
         shutil.move(str(root), str(dest))
         marker.write_text(json.dumps({"name": name, "version": version, "platform": plat,
-                                      "url": entry["url"], "sha256": expected}, indent=2) + "\n",
+                                      "url": entry["url"], "sha256": expected,
+                                      "include": include}, indent=2) + "\n",
                           encoding="utf-8")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
