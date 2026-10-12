@@ -221,8 +221,10 @@ TEST_CASE("settings become a valid PolicyConfig", "[settings]") {
   }
   SECTION("every lookahead and hold a slider or scene file can give is valid for spg-core") {
     // Slider ends, the old 250 ms hold floor, and values past both ends.
-    for (const long long lookahead : {LLONG_MIN, 0LL, kMinLookaheadMs, kDefaultLookaheadMs, kMaxLookaheadMs, LLONG_MAX}) {
-      for (const long long hold : {LLONG_MIN, 0LL, 250LL, kMinHoldMs, kDefaultHoldMs, kMaxHoldMs, LLONG_MAX}) {
+    const long long lookaheads[] = {LLONG_MIN, 0, kMinLookaheadMs, kDefaultLookaheadMs, kMaxLookaheadMs, LLONG_MAX};
+    const long long holds[] = {LLONG_MIN, 0, 250, kMinHoldMs, kDefaultHoldMs, kMaxHoldMs, LLONG_MAX};
+    for (const long long lookahead : lookaheads) {
+      for (const long long hold : holds) {
         RawFilterSettings raw;
         raw.lookahead_ms = lookahead;
         raw.hold_ms = hold;
@@ -230,6 +232,7 @@ TEST_CASE("settings become a valid PolicyConfig", "[settings]") {
         REQUIRE(config.has_value());
         CHECK_NOTHROW(validate(*config));
         CHECK(config->hold >= kMinHold);
+        CHECK(config->retro == config->lookahead);
         CHECK(config->retro >= kMinRetro);
       }
     }

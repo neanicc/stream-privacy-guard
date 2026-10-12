@@ -1608,6 +1608,8 @@ Template:
   values sanitize into a config `validate()` accepts.
 - Eval delta: none expected and not measured; the defaults are unchanged and
   `run.sh eval` still has no pipeline to run until SPG-11 (`spg-cli run`).
-- Open issues or follow-ups: SPG-10 must count a frame as scanned only through
-  a cycle on a frame at most `retro_ms` after it. Live OBS check of the hold
-  slider's new minimum not done.
+- Open issues or follow-ups: the scheduler already counts a frame as scanned
+  only through a cycle on a frame at most `retro_ms` after it (SPG-10,
+  `lookahead_test.cpp` "a frame counts as scanned only by a cycle within
+  retro after it"), so the retro floor needs no further ticket. Live OBS
+  check of the hold slider's new minimum not done.
