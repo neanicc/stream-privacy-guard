@@ -136,7 +136,7 @@ std::int64_t floor_div(std::int64_t a, std::int64_t b) noexcept {
   return q;
 }
 
-constexpr std::size_t kMaxRectsPerTrackLimit = 1024;
+constexpr std::size_t kMaxRectsPerTrackLimit = 64;
 
 }  // namespace
 
@@ -172,7 +172,7 @@ void validate(const TrackerConfig& config) {
     throw ContractError("tracker config: velocity_smoothing must be in (0, 1]");
   }
   if (config.max_rects_per_track < 1 || config.max_rects_per_track > kMaxRectsPerTrackLimit) {
-    throw ContractError("tracker config: max_rects_per_track must be in [1, 1024]");
+    throw ContractError("tracker config: max_rects_per_track must be in [1, 64]");
   }
 }
 

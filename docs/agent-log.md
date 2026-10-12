@@ -498,6 +498,8 @@ Template:
   coverage, and gains a buffer overload. The monotone-in-time property check
   moved into the scene, where nothing it compares has been pruned. Velocity is
   still unbounded for very short confirmation intervals; that only over-blurs
-  and is left to SPG-12. A mutation check (fresh margin on resize, no rounding
-  slack, unstable bucket grouping, buckets without hulls, prediction shrinking
-  over time) made at least one tracker test fail for each mutation.
+  and is left to SPG-12 (#13). The injected clock must share the frames'
+  `FrameClock` time base (documented on `Tracker`; SPG-10 must keep it). A
+  mutation check (fresh margin on resize, no rounding slack, unstable bucket
+  grouping, buckets without hulls, prediction shrinking over time) made at
+  least one tracker test fail for each mutation.

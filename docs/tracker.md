@@ -79,6 +79,13 @@ buffer before its mask is asked for. `masks()` is pure and never reads the
 clock. The tracker is not thread-safe; its single owner (the scheduler, SPG-10)
 serializes calls.
 
+Because `prune()` compares `clock.now()` with frame timestamps, the injected
+clock must report the same `FrameClock` time base (epoch and units) as the
+frames. A clock running ahead of frame time would drop held detections before
+their buffered frames are masked, which fails open; one running behind would
+never drop them. SPG-10 must pass frame timestamps from the clock it injects,
+or assert that the two agree.
+
 `masks(t)` covers detections seen at or before `t`. Applying a detection to
 buffered frames before it (retroactive masking within `retro_ms`) is the
 scheduler's job in SPG-10.
@@ -115,6 +122,8 @@ The margin and the tracker numbers have no eval evidence yet; SPG-12 tunes
 them against the synthetic suites. Velocity is not bounded: two confirmations
 very close in frame time with a few pixels of jitter give a large velocity and
 a long predicted hull. That only over-blurs (it never removes coverage), so it
-is left for SPG-12 to bound against the clean-frame blur budget rather than
-trading prediction recall away without eval evidence. A floor for zero hold or margin is #28
-(SPG-08b); `validate()` accepts zero today.
+is left for SPG-12 (#13) to bound against the clean-frame blur budget rather
+than trading prediction recall away without eval evidence. A floor for zero
+hold or margin is #28 (SPG-08b); `validate()` accepts zero today.
+`max_rects_per_track` is validated to [1, 64], which keeps the per-track
+containment pass at most 4096 comparisons.

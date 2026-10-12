@@ -52,7 +52,7 @@ struct TrackerConfig {
 // Throws ContractError naming the field when a value is out of range: a
 // negative duration, a negative or non-finite margin, an IoU threshold
 // outside (0, 1], a smoothing weight outside (0, 1] or a
-// max_rects_per_track outside [1, 1024]. A zero hold or margin
+// max_rects_per_track outside [1, 64]. A zero hold or margin
 // is accepted here; whether to impose a floor is #28 (SPG-08b).
 void validate(const TrackerConfig& config);
 
@@ -75,8 +75,12 @@ void validate(const TrackerConfig& config);
 //     track, in O(held + max_rects_per_track^2) work per track.
 //
 // Time is frame time (FrameClock nanoseconds). The injected Clock is read only
-// to drop detections whose hold ended more than `retain` ago. Not thread-safe:
-// one owner (the scheduler, SPG-10) serializes calls.
+// to drop detections whose hold ended more than `retain` ago, by comparing
+// clock.now() with frame timestamps, so it must report the same FrameClock
+// time base (same epoch and units) as the frame timestamps passed in. A clock
+// ahead of frame time would drop held detections early (fail open); one behind
+// it would keep them forever. The owner (the scheduler, SPG-10) must guarantee
+// this. Not thread-safe: that owner serializes calls.
 class Tracker {
  public:
   // Throws ContractError when `config` is invalid. `clock` must outlive the

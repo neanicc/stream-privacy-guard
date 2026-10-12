@@ -148,7 +148,7 @@ TEST_CASE("tracker: config comes from the policy and is validated", "[tracker]")
   rejects([](TrackerConfig& c) { c.velocity_smoothing = 0.0F; });
   rejects([](TrackerConfig& c) { c.velocity_smoothing = std::nanf(""); });
   rejects([](TrackerConfig& c) { c.max_rects_per_track = 0; });
-  rejects([](TrackerConfig& c) { c.max_rects_per_track = 1025; });
+  rejects([](TrackerConfig& c) { c.max_rects_per_track = 65; });
 
   // Zero hold and margin are accepted here (a floor is #28).
   TrackerConfig zero;
