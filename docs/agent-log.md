@@ -608,3 +608,90 @@ Template:
   deadline. The Check logs for 1ee7ab8 show `ppocr-det-en` cached on all
   three runners before the test stage and no skipped `detect.*` case, so
   the model-backed cases run in CI.
+
+## 2026-10-12 — SPG-07 Text recognizer (#PR)
+
+- Decision / change: `spg-ocr` (`core/src/ocr/`, lane:vision) reads the
+  detector's Source-space text regions with the pinned PP-OCRv4 English
+  recognizer (`en_PP-OCRv4_rec_mobile.onnx`) through `spg::runtime::Session`.
+  Each region's box goes to Readback through `spg::convert()` and
+  `enclosing_pixels()` only; preprocessing, CTC decoding and the alphabet
+  follow RapidOCR v3.9.2 (height 48, aspect kept, `(v / 255 - 0.5) / 0.5`
+  BGR planes, right padding with zeros to at least 320; greedy CTC with
+  blank 0, the metadata `character` lines and an appended space: 97 classes,
+  which the pinned model's output has; one step per 8 input columns,
+  measured). Output is `Recognition{Secret text, score}`; nothing is dropped
+  for a low score (RapidOCR cuts at 0.5), the policy decides.
+- Crop and rectify (issue #8 notes): boxes stay axis-aligned. A region is read
+  as several views and all texts are kept, joined by newlines: the whole
+  crop; each line band when `split_lines()` finds rows without horizontal
+  edges between text rows (cut in the middle of the gap, runs shorter than
+  half the tallest joined to a neighbour so i-dots and underlines do not
+  split); and both quarter turns when the crop is at least 1.5 times as tall
+  as wide (RapidOCR turns one way; there is no direction classifier). This
+  handles the cross-tile merge joining adjacent lines: the test "Two lines
+  merged into one box are read line by line" fails 24 assertions without the
+  line views. Lines that touch (no empty row) stay one band. Text turned 180
+  degrees is not read.
+- Long lines: a view wider than `max_width` 2560 input px is read in chunks
+  overlapping by half a chunk, so any stretch up to 1280 input px (about 50
+  characters) is whole in one chunk; a card number is never read only in
+  pieces, and a longer watch-list entry is read in pieces over half a chunk
+  each, which the policy's partial rule matches.
+- Batching: crops are sorted by width and run in batches of `max_batch`,
+  padded to the batch's widest. Default `max_batch` 1, measured: on the dev
+  Mac (M4, ORT 1.30.0 CPU, scratch probe, median of 15 to 20 runs) one 48x320
+  crop took 4.5 ms, while batches of 2 to 8 took 7.5 to 12 ms per crop (with
+  one intra-op thread: 9.4 ms alone, 19 ms per crop batched). A fixture
+  model that reads columns independently proves batch sizes 2, 4 and 64 give
+  exactly the same text as 1.
+- CoreML (dispatch note): fixed-width buckets were considered and not
+  adopted. The pinned model's input is `[DynamicDimension.0, 3, ?,
+  DynamicDimension.1]`; the height has no name, so free-dimension overrides
+  cannot make the input static and CoreML with `RequireStaticInputShapes=1`
+  takes no node. Probe with batch and width overridden: CoreML 4.55 ms
+  (1x320) and 16.0 ms (1x1280) against CPU 4.56 ms and 15.2 ms. Widths are
+  rounded up to a multiple of 8 instead, with no bucket padding. A static
+  model would mean re-exporting it, a new pinned artifact.
+- Per-track cache: `RecognitionCache` reuses a track's text while its readback
+  crop size is within 10% and a luma thumbnail (square cells, six across the
+  short side) differs by at most 6 levels in every cell, for at most 1 s of
+  frame time. The readback is pre-encoder, so a still region repeats exactly
+  and a changed digit misses (test: one digit of a card number changes, only
+  that track is read again and reads the new digit). `recognize_tracks()`
+  sends all misses to one `recognize()` call and stores results only after
+  it succeeds, so a failed frame leaves the cache unchanged. One owner, not
+  synchronized.
+- Fail closed: an output whose shape is not `[n, width / 8, 97]`, or that
+  holds a value that is not a finite probability, throws `ocr::DecodeError`;
+  a model without the dictionary or with a class count that does not match
+  it is refused when opened. Messages carry sizes and indices only. The
+  sentinel test reads a made-up sentinel string with the pinned model through
+  the cache and the policy (verdict WATCHLIST) while capturing the standard
+  streams, then fails two broken fixture recognizers on the same frame:
+  nothing is printed and no error holds any fragment of it.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang):
+  `scripts/ci/run.sh build` (plugin included) and `test` pass, 181/181
+  ctest tests, 30 new `ocr.*` cases, no skips. Model cases: six made-up
+  strings on three panel styles, cap heights 10, 14 and 22 readback px,
+  readback scale 1 and 1/2, BGRA/NV12/I420, each read within two edits
+  (Hershey's 'a' reads as 'o' at cap height 8 to 10); merged lines; chunked
+  long lines with the policy flagging the watch-list entry and the card;
+  vertical text both ways; batched runs; detector boxes on a half-scale
+  1280x720 NV12 frame feeding recognition and policy (watch-list and card
+  lines flagged, the decoy not); four threads agree; the cache sequence. Six
+  regions of a 900x420 panel take about 35 ms on CPU in the tests (not a
+  `bench` result). Fixture models generated at build time
+  (`make_runtime_fixtures.py`: `rec_softmax`, `rec_sqrt`, `rec_wrong_classes`,
+  `rec_no_dictionary`) cover batching equality, NaN output, wrong step and
+  class counts, and a missing dictionary. Mutation checks: no line views
+  failed the merged-lines case; no rotated views failed the vertical case
+  both ways; a cache that ignores content failed the unit and model cache
+  cases; chunks without overlap failed the 2000-region planning property.
+- Eval delta: not measured. The recognizer is not wired into a pipeline yet
+  (SPG-10/11), and the eval stage was not run in this session.
+- Open issues or follow-ups: Hershey strokes are not UI fonts, so SPG-12 must
+  measure recall on the text suite; 180-degree text needs PP-OCR's direction
+  classifier (another pinned model); lines that touch stay one crop;
+  `spg-cli bench` should measure recognition cost and the cache hit rate
+  (a box that jitters by a pixel misses, which costs time, not recall).
