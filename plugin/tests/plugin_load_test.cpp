@@ -145,6 +145,7 @@ void check_clamping() {
   obs_data_set_int(settings, plugin::kHoldKey, 9999999);
   obs_data_set_string(settings, plugin::kFallbackKey, "show_unscanned");
   obs_data_set_string(settings, plugin::kSensitivityKey, "lenient");
+  obs_data_set_int(settings, plugin::kVramBudgetKey, 0);
   obs_source_t *source = obs_source_create(plugin::kFilterId, "spg-clamp", settings, nullptr);
   obs_data_release(settings);
   check(source != nullptr, "filter source is created");
@@ -159,6 +160,8 @@ void check_clamping() {
         "an unknown fallback becomes blur_source");
   check(std::string_view{obs_data_get_string(applied, plugin::kSensitivityKey)} == "standard",
         "an unknown sensitivity becomes standard");
+  check(obs_data_get_int(applied, plugin::kVramBudgetKey) == plugin::kMinVramBudgetMb,
+        "a VRAM budget of 0 is raised to the floor");
   check(plugin::is_valid_watchlist_ref(obs_data_get_string(applied, plugin::kWatchlistRefKey)),
         "a new filter gets a watch-list reference");
   obs_data_release(applied);
@@ -169,6 +172,7 @@ void check_clamping() {
   settings = obs_data_create();
   obs_data_set_int(settings, plugin::kLookaheadKey, 999999);
   obs_data_set_int(settings, plugin::kHoldKey, -5);
+  obs_data_set_int(settings, plugin::kVramBudgetKey, 1LL << 40);
   source = obs_source_create(plugin::kFilterId, "spg-clamp-2", settings, nullptr);
   obs_data_release(settings);
   check(source != nullptr, "second filter source is created");
@@ -179,6 +183,8 @@ void check_clamping() {
   check(obs_data_get_int(applied, plugin::kLookaheadKey) == plugin::kMaxLookaheadMs,
         "an oversized lookahead is capped");
   check(obs_data_get_int(applied, plugin::kHoldKey) == plugin::kMinHoldMs, "a negative hold is raised to the floor");
+  check(obs_data_get_int(applied, plugin::kVramBudgetKey) == plugin::kMaxVramBudgetMb,
+        "an oversized VRAM budget is capped");
   obs_data_release(applied);
   obs_source_release(source);
 }
@@ -292,7 +298,7 @@ void write_int(obs_data_t *settings, const char *key, const char *value) {
 bool only_known_keys(obs_data_t *data) {
   std::vector<std::string> known = {plugin::kWatchlistRefKey, plugin::kWatchlistCountKey, plugin::kWatchlistSelectedKey,
                                     plugin::kLookaheadKey,    plugin::kHoldKey,           plugin::kSensitivityKey,
-                                    plugin::kFallbackKey,     plugin::kDebugOverlayKey};
+                                    plugin::kFallbackKey,     plugin::kDebugOverlayKey,   plugin::kVramBudgetKey};
   for (const spg::Category category : spg::kAllCategories) {
     known.push_back(plugin::category_key(category));
   }

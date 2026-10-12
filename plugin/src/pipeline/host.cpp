@@ -117,6 +117,7 @@ const DrawPlan& PipelineHost::frame(Timestamp t, Size source) noexcept {
     }
     clean_.store(counters.shown[0], std::memory_order_relaxed);
     covered_.store(covered, std::memory_order_relaxed);
+    over_budget_.store(counters.over_budget, std::memory_order_relaxed);
     last_cover_.store(static_cast<std::uint8_t>(plan.cover), std::memory_order_relaxed);
     return plan;
   } catch (...) {
@@ -132,6 +133,7 @@ RenderStatus PipelineHost::status() const noexcept {
   status.clean = clean_.load(std::memory_order_relaxed);
   status.covered = covered_.load(std::memory_order_relaxed);
   status.last_cover = static_cast<Cover>(last_cover_.load(std::memory_order_relaxed));
+  status.over_budget = over_budget_.load(std::memory_order_relaxed);
   return status;
 }
 

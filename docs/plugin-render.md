@@ -65,8 +65,68 @@ scheduler's buffer, by the frame on screen and by the last clean frame (for
 scheduler draining after a settings change, plus those two), and memory is
 what is actually buffered: about `fps * lookahead` frames, roughly 8 MB each
 at 1080p (500 ms at 60 fps is about 240 MB of video memory). A frame that
-cannot get a slot (ring full or texture creation failed) is still scheduled
-and is drawn as opaque black when released.
+cannot get a slot (ring full, VRAM budget reached or texture creation
+failed) is still scheduled and is drawn as opaque black when released.
+
+## VRAM budget
+
+SPG-14c ([plan section 7](plan.md#7-obs-integration): "expose the limit and
+fall back to a shorter lookahead with a visible warning"). The setting
+**Video memory for the lookahead** (`vram_budget_mb`, default 512 MiB,
+[settings.md](settings.md)) bounds the ring's textures. The math is in
+`plugin/src/pipeline/ring_budget.cpp` and unit-tested.
+
+- **Cost of a frame:** width x height x the ring format's bytes per pixel
+  (`gs_get_format_bpp(GS_BGRA)` returns 32 bits, so 4 bytes), at the
+  source's base size now: 7.9 MiB at 1080p, 31.6 MiB at 2160p. Driver
+  padding is not counted.
+- **Frames a lookahead needs:** `floor(lookahead / frame interval) + 1` frames
+  inside the window, plus the frame on screen, the last clean frame and one
+  frame of timing slack (`kRingReserveSlots` = 3). 500 ms at 60 fps needs 34.
+  The frame interval is the canvas frame rate (`obs_get_video_info`).
+- **Shortening:** when the configured lookahead needs more frames than the
+  budget holds, the scheduler gets the longest lookahead that fits, rounded
+  down to whole milliseconds (`fit_lookahead`). With the default 512 MiB:
+  1080p60 holds 64 frames, enough for the default 500 ms and up to 1016 ms;
+  2160p60 holds 16 frames, so 500 ms becomes 216 ms. A budget below four
+  frames leaves a lookahead of 0: every frame is released before a scan
+  can finish and is covered.
+- **Through a new generation:** the fit is made in `publish` (settings
+  change) and again in the filter's `video_tick` when the source size or the
+  frame rate changes. A different result builds a new scheduler off the
+  render path, handed over like any settings change, so the old one's
+  buffered frames still air with their masks and the switch rules above
+  apply. A hidden (0x0) source keeps its last fit. A refit that fails
+  (allocation, a worker thread that cannot start) covers the whole source
+  and is retried once a second until one succeeds (`RefitSchedule`); a
+  failed settings change is not, since the old settings must not run again.
+- **Fail closed:** a shorter lookahead only gives scans less time; frames
+  not scanned within it get the fallback as always. The scheduler's
+  retroactive window is clamped to the shorter lookahead.
+- **Hard cap per capture:** `Pipeline` counts the bytes of every ring
+  texture it has allocated (held or idle) at the size it was captured. A
+  capture into an idle slot replaces that slot's texture, so only the
+  difference counts and a ring at the budget reuses textures instead of
+  recreating them. A capture that would pass the budget frees the other
+  idle textures first, then the one it would reuse; if it still does not
+  fit, the frame gets no texture, is counted
+  (`PipelineCounters::over_budget`) and is drawn as opaque black when
+  released (`Cover::NoTexture`). This covers the time between a resize and
+  the refitted generation, and the overlap of two generations after a
+  settings change (the reserve does not include a second generation). A
+  lower budget never takes a texture from a frame already buffered.
+- **What the streamer sees:** while the lookahead is shortened the
+  properties show a warning with the configured and the actual lookahead,
+  the frames the budget holds and the source size, and advise to raise the
+  budget or lower the lookahead and to set Sync Offset to the shorter value
+  (the video is now delayed less than the audio offset). Frames refused by
+  the budget are counted in the same warning. The log gets one line when the
+  lookahead is shortened, shortened to another value, or restored, for
+  example `VRAM budget: lookahead shortened from 2000 ms to 1016 ms; the
+  budget of 512 MiB holds 64 frames of 1920x1080 (7.9 MiB each)`.
+- **Not counted:** the readback, mask-level and output textures (at most a
+  few frames' worth), other filters' rings (each filter has its own budget),
+  and OBS itself.
 
 ## Resize, 0x0 and settings changes
 
@@ -198,7 +258,11 @@ count.
 of every case, warm-up, retroactive and held masks, readback timing, fallback
 modes, resize, 0x0, settings change, ring exhaustion, 40 seeded runs with
 failures, resizes, 0x0 ticks and restarts, ring, pool, mask geometry (2000
-seeded rects) and the reaper. The GPU code and the effect need a graphics
+seeded rects) and the reaper; `plugin/tests/ring_budget_test.cpp` and the
+`[budget]` pipeline cases: the budget math (5000 seeded fits), the warning
+and its log line, refusal past the budget, a fitting budget that never
+refuses (with HoldLastScanned re-emits), a lower budget that keeps buffered
+frames, and a resize followed by a refitted generation. The GPU code and the effect need a graphics
 context, which headless libobs in CI does not have: they are checked live
 ([live-check.md](live-check.md)). HDR sources are captured as 8-bit BGRA
 (untested). The render-thread cost measured on the dev Mac is in the SPG-14

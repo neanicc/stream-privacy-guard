@@ -21,6 +21,8 @@ class FrameRing {
   // A slot with one holder: the most recently idled one (its texture is warm),
   // else a never-used one. Empty when every slot is held.
   [[nodiscard]] std::optional<std::size_t> acquire();
+  // The slot acquire() would hand out now, without taking it.
+  [[nodiscard]] std::optional<std::size_t> peek() const noexcept;
   void retain(std::size_t slot);
   // Drops one holder; the slot is idle when none is left. Ignores a slot that
   // is not held, so a double release cannot free a slot still in use.

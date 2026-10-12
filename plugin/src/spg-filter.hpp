@@ -34,6 +34,8 @@ inline constexpr const char *kHoldKey = "hold_ms";
 inline constexpr const char *kSensitivityKey = "sensitivity";
 inline constexpr const char *kFallbackKey = "fallback";
 inline constexpr const char *kDebugOverlayKey = "debug_overlay";
+inline constexpr const char *kVramBudgetKey = "vram_budget_mb";
+inline constexpr const char *kBudgetStatusKey = "spg_budget_status";
 // Category checkboxes use category_key() ("category_face", ...).
 
 // Watch-list. Only the reference and the entry count are saved; the entry

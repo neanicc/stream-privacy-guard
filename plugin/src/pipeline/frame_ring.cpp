@@ -28,6 +28,16 @@ std::optional<std::size_t> FrameRing::acquire() {
   return slot;
 }
 
+std::optional<std::size_t> FrameRing::peek() const noexcept {
+  if (!idle_.empty()) {
+    return idle_.back();
+  }
+  if (!fresh_.empty()) {
+    return fresh_.back();
+  }
+  return std::nullopt;
+}
+
 void FrameRing::retain(std::size_t slot) {
   if (slot < holders_.size() && holders_[slot] > 0) {
     ++holders_[slot];

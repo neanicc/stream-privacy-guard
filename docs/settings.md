@@ -14,6 +14,7 @@ OBS-free in `plugin/src/settings/` and unit-tested on every OS.
 | Detect | `category_face`, `category_watchlist`, `category_pii_email`, `category_pii_phone`, `category_pii_card`, `category_pii_ip`, `category_pii_address`, `category_pii_token` | all on | Every category off is a configuration error: the filter covers the whole source |
 | Watch-list sensitivity | `sensitivity` | `standard` | `standard` = spg-core fuzzy defaults (2 edits, ratio 0.2, partials from 6 characters); `high` = 3, 0.3, 5. No preset below the defaults. Placeholders until SPG-12 measures them |
 | Lookahead | `lookahead_ms` | 500 | Clamped to [100, 2000] ms; the retroactive window equals it |
+| Video memory for the lookahead | `vram_budget_mb` | 512 | MiB, clamped to [64, 16384]. A lookahead that needs more at the source's size and frame rate is shortened to fit, with a warning ([plugin-render.md](plugin-render.md#vram-budget)); a low value only shortens it |
 | Mask hold | `hold_ms` | 750 | Clamped to [250, 10000] ms |
 | Fallback | `fallback` | `blur_source` | `blur_source`, `hold_last_scanned`, `solid_fill`; there is no fail-open choice |
 | Debug overlay | `debug_overlay` | off | Boxes and reason codes only, never text (drawn by SPG-14) |

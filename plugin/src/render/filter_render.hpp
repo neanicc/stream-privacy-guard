@@ -6,10 +6,12 @@
 //
 // Threads: publish() runs wherever the settings change (the video thread for
 // `update`, the UI thread for the watch-list buttons) and builds the new
-// scheduler there; when the module's detection models finish loading, the
-// model loader thread rebuilds it the same way (SPG-14b). Models are never
-// loaded on any of these threads. render() runs on the graphics thread;
-// status() may run on any thread.
+// scheduler there; tick() runs on the video thread before rendering and
+// rebuilds it when the VRAM budget needs another lookahead; when the module's
+// detection models finish loading, the model loader thread rebuilds it the
+// same way (SPG-14b). Models are only ever loaded on the loader thread: a
+// rebuild takes them ready-made from the ModelHub. render() runs on the
+// graphics thread; status() may run on any thread.
 
 #include <atomic>
 #include <chrono>
@@ -21,6 +23,7 @@
 
 #include "pipeline/host.hpp"
 #include "pipeline/pipeline.hpp"
+#include "pipeline/ring_budget.hpp"
 #include "render/obs_gpu.hpp"
 #include "spg/policy_config.hpp"
 
@@ -47,37 +50,54 @@ class FilterRender {
   FilterRender& operator=(const FilterRender&) = delete;
 
   // Hands the render thread a scheduler for `policy` with the module's
-  // detection models. No policy, or no models (still loading, missing or
-  // failed): no scheduler, and every frame is covered whole with the
-  // fallback. Skips the rebuild when neither the policy nor the models
-  // changed. On any failure every frame is covered with a solid fill until a
-  // later publish succeeds.
-  void publish(const std::optional<PolicyConfig>& policy, FallbackMode fallback) noexcept;
+  // detection models, with the lookahead shortened to fit `vram_budget_mb` at
+  // the source's current size (ring_budget.hpp). No policy, or no models
+  // (still loading, missing or failed): no scheduler, and every frame is
+  // covered whole with the fallback. Skips the rebuild when nothing changed.
+  // On any failure every frame is covered with a solid fill until a later
+  // publish succeeds.
+  void publish(const std::optional<PolicyConfig>& policy, FallbackMode fallback, long long vram_budget_mb) noexcept;
+  // The filter's video_tick: after a resize or a frame rate change, rebuilds
+  // the scheduler (a new generation) if the lookahead that fits the budget
+  // changed. A rebuild that fails covers everything and is retried every
+  // kRefitRetryNs (RefitSchedule). Never on the render path.
+  void tick() noexcept;
   void set_debug_overlay(bool on) noexcept { overlay_.store(on, std::memory_order_relaxed); }
 
   // The filter's video_render.
   void render() noexcept;
 
-  [[nodiscard]] RenderStatus status() const noexcept { return host_.status(); }
+  [[nodiscard]] RenderStatus status() const noexcept;
 
  private:
   void log_transition(const DrawPlan& plan) noexcept;
-  // publish_mutex_ held.
-  void publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback) noexcept;
-  // The model loader thread: rebuild the last published policy with the models.
+  // Caller holds publish_mutex_.
+  void publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback, std::uint64_t budget_bytes);
+  // The model loader thread: rebuild the published settings with the models.
   void models_changed() noexcept;
+  // The source size and frame interval the budget is fitted to, now.
+  [[nodiscard]] Size source_size() const noexcept;
 
   obs_source_t* filter_;
   ObsFrameGpu gpu_;
   PipelineHost host_;
 
-  std::mutex publish_mutex_;  // publishers; guards the fields below
+  mutable std::mutex publish_mutex_;  // publishers; guards the fields below
   std::optional<PolicyConfig> published_;
   FallbackMode published_fallback_ = FallbackMode::BlurSource;
+  std::uint64_t published_budget_ = kNoRingBudget;
+  Duration published_lookahead_{};  // what the scheduler got, after the fit
   bool have_published_ = false;
   bool publish_failed_ = false;
+  // The failure was a refit of the published settings (still the ones to
+  // run), not a settings change: tick() retries it.
+  bool refit_failed_ = false;
+  BudgetNotice budget_notice_;
   std::uint64_t published_models_ = 0;  // ModelHub generation the scheduler was built with
   std::uint64_t models_listener_ = 0;
+
+  // Video thread only (tick()).
+  RefitSchedule refits_;
 
   std::atomic<bool> overlay_{false};
   // Render thread only.

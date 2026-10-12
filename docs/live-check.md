@@ -105,7 +105,8 @@ source), that every other frame is covered whole, and the timing. See
    the preview and the Stats dock (View > Stats): no sharp frame at any
    switch, no frame-time spikes, no missed frames attributed to rendering
    lag, and video memory (Activity Monitor > GPU, or the OBS log) grows by
-   roughly 8 MB per buffered frame at 1080p (about 950 MB at 2000 ms 60 fps).
+   roughly 8 MB per buffered frame at 1080p, up to the VRAM budget (about
+   500 MB at 1000 ms 60 fps; longer lookaheads are shortened, step 14).
 10. Resize the capture (crop/pad or switch to a smaller display) and hide and
     show the source and the filter with the planted text on screen: the text
     is never sharp at any point; while hidden nothing is drawn.
@@ -116,6 +117,20 @@ source), that every other frame is covered whole, and the timing. See
 13. Record 30 s while doing steps 3 and 7 to 10 and scrub it frame by frame
     (or with `spg-cli scrub` once SPG-18 lands): no frame shows a planted
     string or a face sharp.
+14. VRAM budget (SPG-14c). With the 1080p60 canvas, set the lookahead to
+    2000 ms and leave **Video memory for the lookahead** at 512 MiB. Expect
+    one log line `VRAM budget: lookahead shortened from 2000 ms to 1016 ms;
+    the budget of 512 MiB holds 64 frames of 1920x1080 (7.9 MiB each)`, and
+    on reopening the properties a warning naming 2000 ms, 1016 ms and the
+    Sync Offset advice. Video memory grows by about 500 MB, not 1 GB. Set
+    the budget to 64 MiB: the lookahead drops to 83 ms, the
+    source stays covered (never sharp) through the switch, and the log has
+    one new line. Then give the source a 4K base size (a 3840x2160 image or
+    a scaled capture) at the default budget and 500 ms: one line about
+    216 ms appears after the resize, and frames refused while the old
+    lookahead drained are counted in the warning, drawn black, never sharp.
+    Return to 1080p: one `fits again` line. Record the video memory seen at
+    each step.
 
 Record the Stats dock "average time to render frame" with and without the
 filter, the number of missed or skipped frames, the GPU memory seen, and the

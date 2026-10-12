@@ -28,12 +28,21 @@ inline constexpr long long kMaxLookaheadMs = 2000;
 inline constexpr long long kDefaultHoldMs = 750;
 inline constexpr long long kMinHoldMs = 250;
 inline constexpr long long kMaxHoldMs = 10000;
+// VRAM the lookahead ring may hold, in MiB (plan section 7: "expose the
+// limit"; SPG-14c). The default holds the default 500 ms lookahead at 1080p60
+// (34 frames, about 270 MiB) with room to spare, and about 1000 ms there; a
+// larger source or lookahead is shortened to fit, with a warning. A low value
+// only shortens the lookahead (more frames covered), never weakens it.
+inline constexpr long long kDefaultVramBudgetMb = 512;
+inline constexpr long long kMinVramBudgetMb = 64;
+inline constexpr long long kMaxVramBudgetMb = 16384;
 
 static_assert(kMaxLookaheadMs <= kMaxLookahead.count(), "plugin lookahead must stay valid for spg-core");
 static_assert(kMaxHoldMs <= kMaxHold.count(), "plugin hold must stay valid for spg-core");
 
 [[nodiscard]] long long clamp_lookahead_ms(long long value) noexcept;
 [[nodiscard]] long long clamp_hold_ms(long long value) noexcept;
+[[nodiscard]] long long clamp_vram_budget_mb(long long value) noexcept;
 
 // How eagerly watch-list entries match OCR text. Both presets favour recall;
 // there is deliberately no preset below the spg-core defaults. The numbers are
@@ -54,6 +63,7 @@ enum class Sensitivity : std::uint8_t { Standard, High };
 struct RawFilterSettings {
   long long lookahead_ms = kDefaultLookaheadMs;
   long long hold_ms = kDefaultHoldMs;
+  long long vram_budget_mb = kDefaultVramBudgetMb;
   CategorySet categories = CategorySet::all();
   std::string_view sensitivity = "standard";
   std::string_view fallback = "blur_source";
@@ -65,6 +75,7 @@ struct RawFilterSettings {
 struct FilterSettings {
   long long lookahead_ms = kDefaultLookaheadMs;
   long long hold_ms = kDefaultHoldMs;
+  long long vram_budget_mb = kDefaultVramBudgetMb;
   CategorySet categories = CategorySet::all();
   Sensitivity sensitivity = Sensitivity::Standard;
   FallbackMode fallback = FallbackMode::BlurSource;
