@@ -370,7 +370,7 @@ Template:
   2-9, 3-3-4 grouping) or the scorer will count misses this validator rejects
   by design; postcodes and non-US address forms are not detected.
 
-## 2026-10-12 — SPG-15 Settings and watch-list storage (#PR)
+## 2026-10-12 — SPG-15 Settings and watch-list storage (#37)
 
 - Decision / change: plan question 4 resolved with the recommended default.
   Watch-list entries never enter OBS filter settings (saved in plain text in
