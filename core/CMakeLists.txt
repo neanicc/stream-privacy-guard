@@ -40,6 +40,15 @@ target_sources(spg-core PRIVATE src/secure/secret.cpp src/secure/secure_memory.c
 # Tracker and temporal hold (SPG-09).
 target_sources(spg-core PRIVATE src/track/tracker.cpp)
 
+# Scheduler, lookahead and fail-closed release (SPG-10). Worker threads.
+find_package(Threads REQUIRED)
+target_sources(spg-core PRIVATE
+  src/mask/mask_rects.cpp
+  src/schedule/lookahead.cpp
+  src/schedule/scan.cpp
+  src/schedule/scheduler.cpp)
+target_link_libraries(spg-core PUBLIC Threads::Threads)
+
 # ONNX Runtime session wrapper; needs the prebuilt ONNX Runtime.
 if(SPG_WITH_DEPS)
   add_subdirectory(src/runtime)

@@ -793,6 +793,109 @@ Template:
   (any pixel change misses, so animated or noisy sources get no hits, which
   costs time, not recall).
 
+## 2026-10-12 — SPG-10 Scheduler, lookahead and fail-closed (#40)
+
+- Decision / change: `spg::Lookahead` (single-threaded ring buffer, bounded
+  scan queue, cadence, coverage, retroactive masks, release and fallback),
+  `spg::Scheduler` (that state machine behind a mutex plus worker threads) and
+  `spg::run_scan()` (one cycle: faces, text regions, recognizer, policy), in
+  `core/include/spg/{lookahead,scheduler,scan}.hpp`, `core/src/schedule/` and
+  `core/src/mask/mask_rects.*`; rules in [scheduler.md](scheduler.md).
+  Choices: (1) Release rule: a frame at `t` airs clean only when a complete
+  cycle on a frame of the same segment (no resize or discontinuity between)
+  with time in `[t, t + retro]` finished before release, the release is by
+  `t + lookahead + release_grace`, and its timestamp increased and was within
+  `clock_tolerance` (1 s) of the injected clock; otherwise the configured
+  fallback. This is the issue's "scanned only by a cycle within retro_ms after
+  it" note; a cycle before the frame does not count. (2) Deadlines are
+  enforced at release, not by interrupting stages (detectors and the policy
+  cannot be cancelled): a stalled, late or overrunning cycle simply has not
+  finished when its frames come due. Its result is still applied later.
+  (3) Any exception from any stage, of any type, and any invalid output
+  (`validate()` failure, wrong kind, wrong text count) makes the cycle
+  incomplete. (4) Retroactive rects are the found boxes, grown by the
+  tracker's margin, on buffered frames in `[ts - retro, ts)`; static, no
+  velocity back-projection (SPG-12 measures scroll sequences). (5) Resize: a
+  result from before a resize is given to the tracker as the hull of its box
+  scaled to every size since, and to older-size frames as the hull with its
+  scaling to that size, so masks only grow; it does not count as a scan of
+  new-size frames. (6) Recognized text over 512 bytes is not given to the
+  policy; its region is masked. Without a recognizer or policy every text
+  region is masked. (7) `hold_last_scanned` re-emits the last clean frame of
+  the same segment (`ReleasedFrame::reemit`), else blurs the source.
+  (8) Degenerate configs (#28 not merged): no floors imposed; zero lookahead
+  or retro fail closed by the release rule, zero hold still masks the
+  detecting frame and retro frames. (9) Tracker `retain` is raised to
+  `lookahead + release_grace` so held detections outlive every frame that can
+  still be released on time. (10) Defaults without a plan value: 2 workers,
+  queue capacity 1 (newest frame, oldest dropped), cadence 0 (offer every
+  frame), 600 buffered frames, 64 retro rects per frame (then one hull),
+  500 ms release grace, 2 s shutdown timeout after which a worker still in a
+  stage call is detached (it owns the stages via `shared_ptr` and never
+  touches the scheduler or clock again).
+- Evidence (automated, dev Mac, macOS 26.5.2 arm64, AppleClang):
+  `scripts/ci/run.sh setup`, `build` (plugin included, warnings as errors) and
+  `test` pass, 184/184 ctest tests, 33 new `[schedule]` cases.
+  `lookahead_test.cpp`: 26 deterministic cases on a `ManualClock` with scripted
+  stages (stall, late return, slow policy advancing the clock, every stage
+  throwing `runtime_error`, `ContractError`, `bad_alloc` and a non-`std`
+  type, invalid output, text cap, categories, retro window bounds, coverage
+  window, resize with a cycle in flight, size round trip, bad timestamps,
+  zero lookahead/retro/hold, buffer overflow, late release, bounded queue,
+  cadence, hold-last-scanned, discontinuity, sentinel text never printed).
+  `lookahead_property_test.cpp`: 1500 seeded scenes (random lookahead 0 to
+  500 ms, retro, hold 0/100/750 ms, fallback modes, queue 1 to 3, cadence,
+  buffer limits, cycles that start late, take up to twice the lookahead, fail
+  20%, stall forever 10%, return out of order, render hiccups up to 1.5 s,
+  resizes, content switches, bad timestamps); an oracle kept by the test
+  checks every released frame: clean only with a qualifying complete cycle,
+  fallback action matches the mode, every box of a complete cycle within the
+  retro window after or the hold before the frame is covered (scaled across a
+  resize), release order and count. Totals: 33,902 clean and 191,098
+  fallback releases, 52,327 re-emits, 6,668 retro and 141,151 hold
+  containment checks. `scheduler_test.cpp`: real threads with an atomic
+  clock; render calls under a stalled detector and a stalled policy return
+  within a real-time timeout, shutdown with a stalled worker returns in under
+  3 s, a throwing worker keeps serving. Mutation checks: 16 mutations (no
+  coverage check, no retro rects, coverage window before t, ignoring
+  segments, no late check, no hull for late results, no retro scaling, no
+  text cap, failed cycles counting, bad timestamps accepted, releasing before
+  the deadline, no retain bump, hold-last across segments, invalid output
+  accepted, ignoring categories, unknown jobs accepted) each failed at least
+  one test.
+- Eval delta: not measured. Nothing feeds the scheduler a pipeline until
+  SPG-11 wires `spg-cli run`, and the eval stage was not run locally (the
+  agent sandbox refuses that command); the PR's Check log has the CI eval
+  stage output.
+- Open issues or follow-ups: SPG-11 drives `Lookahead` (offline) or
+  `Scheduler` and composes `ReleasedFrame`s; SPG-14 keeps the textures for
+  `reemit`, calls `release_due()` every render, sizes its texture ring to
+  `max_buffered_frames`, and must not unload the module while a detached
+  worker is still in a stage call. SPG-16 measures workers, cadence and the
+  fail-closed rate with `spg-cli bench`, and the cost of `complete()` (held
+  under the lock) for many detections. SPG-12 measures retro back-projection
+  for moving text and whether a short secret between two scans is missed
+  (the coverage rule assumes content seen at `t` persists to the next scan).
+- Review fixes (PR #40, after the first Check and staff review): (1) a null
+  detector for an enabled category now fails the cycle
+  (`ScanFailure::MissingStage`) instead of completing with no detections, and
+  `DetectorAdapter` and `EnginePolicy` reject null pointers; (2) a readback is
+  scanned for the buffered frame its timestamp names (a mapped stage surface
+  lags one frame), never credited to the frame pushed with it; (3) a result
+  that lands after a resize keeps its scaled margin, in the tracker and in
+  retroactive rects; (4) a complete result that `complete()` cannot fully
+  apply fails closed every frame it could have masked
+  (`FallbackReason::ApplyFailed`: buffered frames from `ts - retro`, frames
+  pushed up to `ts + hold`); (5) `take_job()` cannot throw (in-flight slots
+  reserved, a job it cannot record is dropped); (6) the duplicate
+  `SchedulerConfig::categories` is gone, `scan.categories` gates the stages;
+  (7) the threaded timeout helper releases the stalled stage before failing,
+  so a regression fails instead of hanging. The ubuntu-24.04 Check failure was
+  two GCC-only warnings under `-Werror` in the new tests
+  (`-Wsign-conversion`, `-Wrange-loop-construct`); AppleClang and MSVC do not
+  emit them. Evidence: unit tests pass under AppleClang, GCC 13 and GCC 14 on
+  the dev Mac; each fix was mutated back and failed its new test.
+
 ## 2026-10-12 — SPG-15b Watch-list text out of crash dumps and the undo stack (#38)
 
 - Decision / change: a small protected heap in spg-core
