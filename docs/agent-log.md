@@ -601,5 +601,10 @@ Template:
   the large-text recall limit (staff review): text taller than the overlap
   can be cut by a horizontal tile edge, and SPG-12 must add a large-glyph
   case. Evidence (dev Mac): `run.sh build` and `test` pass, 137/137, no
-  skips. Not changed: per-frame cost (one model run per tile, 8 at 1080p)
-  stays for SPG-10/12 to measure with `spg-cli bench`.
+  skips. Not changed: per-frame cost (one model run per tile, 8 at 1080p,
+  28 at 2160p) stays for SPG-10/12 to measure with `spg-cli bench`;
+  `detect()` now documents that it has no deadline or cancel check, so the
+  scheduler must fail a frame closed when the call misses the lookahead
+  deadline. The Check logs for 1ee7ab8 show `ppocr-det-en` cached on all
+  three runners before the test stage and no skipped `detect.*` case, so
+  the model-backed cases run in CI.

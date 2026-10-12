@@ -134,6 +134,12 @@ class TextDetector {
   // detector PpOcrDet) sorted top to bottom, then left to right; an empty
   // vector means no text was found. Safe to call from several threads at once.
   //
+  // Cost: one model run per tile, run one after another (tile_crops(): 2 for
+  // 960x540, 8 for 1920x1080, 28 for 3840x2160 at the defaults), with no
+  // deadline or cancel check inside. Call it on a worker thread only; the
+  // caller owns the lookahead deadline and must apply the fail-closed
+  // fallback to a frame whose call has not returned in time.
+  //
   // Throws on any failure so the caller can fail the frame closed:
   // ContractError for an invalid frame or zero-size source,
   // runtime::RuntimeError when inference fails, db::DecodeError when an output
