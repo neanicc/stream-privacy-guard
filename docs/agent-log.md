@@ -168,14 +168,17 @@ Template:
   builds `libobs` and `obs-frontend-api` from the `OBS-Studio-32.1.2-Sources`
   release against obs-deps 2025-08-23 (the version OBS 32.1.2 pins) and installs
   the Development component into `$SPG_CACHE_DIR/deps/libobs/`, cached by an
-  input marker. Every archive is in `deps/manifest.json` with SHA-256; OBS's own
+  input marker; CMake refuses a cached libobs whose marker differs from the
+  current obs-studio, obs-deps (and x86 obs-deps) hashes or builder digest, and
+  asks for `setup`. Every archive is in `deps/manifest.json` with SHA-256; OBS's own
   configure-time downloads (obs-deps, Qt, CEF) are disabled by an override
   `buildspec.cmake`, and the 32-bit helper configure OBS always runs on Windows
   gets the pinned x86 obs-deps archive placed in `<source>/.deps`. 32.1.2 rather
   than 32.2.2: 32.2 requires Xcode 26.5 and the `macos-15` runner tops out at
   26.3. OBS 32.1 enables Swift only from a plugin directory, so the macOS build
   injects `enable_language(Swift)` (`CMAKE_PROJECT_INCLUDE`) for libobs-metal.
-  `fetch_deps.py` gained `.deb` unpacking, `include` member filters, explicit
+  `fetch_deps.py` gained `.deb` unpacking, `include` member filters (recorded
+  in the unpack marker, so changing the filter unpacks again), explicit
   `{"unused": reason}` platform entries, `"unpack": false` and `--skip-group`.
 - Frame-access spike (plan question 1, recommended default kept): readback
   through `gs_texrender` plus `gs_stagesurface`, not an async filter. Display,

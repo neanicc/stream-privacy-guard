@@ -31,13 +31,50 @@ if(SPG_PLATFORM STREQUAL "linux-x64")
 elseif(SPG_PLATFORM STREQUAL "macos-arm64" OR SPG_PLATFORM STREQUAL "windows-x64")
   set(SPG_LIBOBS_PREFIX "${SPG_CACHE_DIR}/deps/libobs/${SPG_LIBOBS_VERSION}-${SPG_PLATFORM}")
   set(_spg_libobs_marker "${SPG_LIBOBS_PREFIX}/.spg-build.json")
-  string(JSON _spg_obs_sha GET "${_spg_manifest_json}" deps obs-studio platforms ${SPG_PLATFORM} sha256)
+  # Accept the cached libobs only when it was built from the inputs pinned now:
+  # the same archives as deps/manifest.json and the same builder script and OBS
+  # overrides (build_libobs.builder_digest()). Anything else needs setup.
+  set(_spg_libobs_inputs obs-studio obs-deps)
+  if(SPG_PLATFORM STREQUAL "windows-x64")
+    list(APPEND _spg_libobs_inputs obs-deps-x86)
+  endif()
+  set(_spg_libobs_stale "")
   if(EXISTS "${_spg_libobs_marker}")
     file(READ "${_spg_libobs_marker}" _spg_libobs_build)
-    string(JSON _spg_built_sha ERROR_VARIABLE _err GET "${_spg_libobs_build}" inputs obs-studio)
+    foreach(_input IN LISTS _spg_libobs_inputs)
+      string(JSON _want GET "${_spg_manifest_json}" deps ${_input} platforms ${SPG_PLATFORM} sha256)
+      string(JSON _built ERROR_VARIABLE _err GET "${_spg_libobs_build}" inputs ${_input})
+      if(NOT _built STREQUAL _want)
+        list(APPEND _spg_libobs_stale ${_input})
+      endif()
+    endforeach()
+    find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
+    set(_spg_builder "${PROJECT_SOURCE_DIR}/build-aux/build_libobs.py")
+    # Ask the builder itself so the digest has one definition.
+    string(CONCAT _spg_digest_py
+      "import importlib.util, sys\n"
+      "spec = importlib.util.spec_from_file_location('build_libobs', sys.argv[1])\n"
+      "module = importlib.util.module_from_spec(spec)\n"
+      "spec.loader.exec_module(module)\n"
+      "print(module.builder_digest())\n")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" -I -c "${_spg_digest_py}" "${_spg_builder}"
+      OUTPUT_VARIABLE _want OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _rc)
+    string(JSON _built ERROR_VARIABLE _err GET "${_spg_libobs_build}" inputs builder)
+    if(NOT _rc EQUAL 0 OR NOT _built STREQUAL _want)
+      list(APPEND _spg_libobs_stale builder)
+    endif()
+    # Reconfigure when the builder, its overrides or the installed libobs change.
+    file(GLOB _spg_overrides "${PROJECT_SOURCE_DIR}/build-aux/obs-cmake/*")
+    set_property(DIRECTORY "${PROJECT_SOURCE_DIR}" APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${_spg_builder}" ${_spg_overrides} "${_spg_libobs_marker}")
   endif()
-  if(NOT EXISTS "${_spg_libobs_marker}" OR NOT _spg_built_sha STREQUAL _spg_obs_sha)
+  if(NOT EXISTS "${_spg_libobs_marker}")
     _spg_plugin_input_missing("libobs ${SPG_LIBOBS_VERSION} built from the pinned sources")
+  elseif(_spg_libobs_stale)
+    string(JOIN ", " _spg_libobs_stale ${_spg_libobs_stale})
+    _spg_plugin_input_missing("libobs ${SPG_LIBOBS_VERSION} built from the current inputs (the cached build differs in: ${_spg_libobs_stale})")
   endif()
   spg_dep_locate(obs-deps SPG_OBS_DEPS_DIR _spg_obs_deps_version)
   if(NOT SPG_OBS_DEPS_DIR)
