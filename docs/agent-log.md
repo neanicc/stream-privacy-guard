@@ -370,6 +370,79 @@ Template:
   2-9, 3-3-4 grouping) or the scorer will count misses this validator rejects
   by design; postcodes and non-US address forms are not detected.
 
+## 2026-10-12 — SPG-03 Synthetic eval suite and scorer (#32)
+
+- Decision / change: eval tooling in Python under `eval/` (package
+  `eval/spg_eval/`). `run_eval.py` is the driver `run.sh eval` already calls:
+  it generates the suites for the mode, checks the scorer on them with three
+  reference pipelines built from ground truth (no-op must fail recall,
+  blur-everything must fail the clean-frame budget, an oracle that masks exactly
+  the visible sensitive boxes must pass), then runs the pipeline.
+  `run_pipeline()` raises until SPG-11 provides `spg-cli run`, so the CI log
+  still ends `THRESHOLDS: NOT RUN` (exit 0 in ci mode, 1 in local mode, as
+  before). `score.py` prints one line per limit and exactly one
+  `THRESHOLDS: PASS/FAIL`; `generate.py` writes a suite. Python reader for
+  ground truth and mask plans mirrors the C++ parser (schema 1, unknown and
+  duplicate fields, integer types, float32 range check then narrowing) and
+  parses `tests/fixtures/contracts/*.json`. Scoring choices the docs left open
+  are in `docs/eval.md` "Scoring rules": unpaired or duplicate frames make the
+  input unscorable (FAIL); boxes are clipped to the frame; a clean frame lists
+  no sensitive instance at all, and generators list every planted item on
+  every frame of its sequence (visibility 0 when it cannot show), so hold and
+  retro masks around a fading item are not charged to the clean budget; a
+  limit with no data fails; unknown threshold keys are errors.
+  Rendering uses Pillow 12.3.0 pinned per interpreter (cp311 to cp314) and
+  platform by SHA-256 in `eval/pydeps.json`, unpacked into
+  `$SPG_CACHE_DIR/deps/py-pillow/` with `scripts/fetch_deps.py`'s verified
+  install (no pip, nothing installed into Python); the font is Pillow's bundled
+  Aileron Regular (CC0). Faces dataset: LFW (`lfw.tgz`, figshare mirror,
+  SHA-256 055f7d9c..., the pin scikit-learn uses), recorded with its license
+  under `datasets` in `models/manifest.json` as AGENTS.md asks
+  (`fetch_models.py` ignores that key); face box = the central 114 px square of
+  each 250 px image (LFW crops are detections enlarged 2.2x), checked by eye
+  on composited frames. Synthetic PII follows the SPG-08 validator formats
+  (NANP 3-3-4 with 2-9 area code and exchange, or unspaced E.164; Luhn-valid
+  16-digit cards); decoys include dates and times. Half of planted secrets are
+  watch-list entries. Profiles: text ci 10 x 40 frames, full 30 x 90; faces
+  ci 6 x 30, full 24 x 60; 60 fps; 1080p and 720p alternate; every fourth
+  sequence is clean.
+- Evidence (automated, dev Mac, macOS 26.5 arm64): `run.sh setup`, `build`,
+  `test` pass with 54 ctest tests, including `scoring.scorer` (20 tests:
+  fixtures, strictness cases from `json_test.cpp`, sentinel never quoted,
+  union area, metric definitions, verdict rules against the real
+  `thresholds.toml`) and `scoring.generators` (15 tests: byte-identical ground
+  truth for a seed, content coverage, ground-truth consistency, reference
+  pipelines on a generated suite, face boxes land on the drawn face in a fake
+  dataset, Luhn/phone formats, look-alike decoys beyond the fuzzy limits,
+  hash-mismatch refusal). Both also pass under Python 3.11 and 3.14. Forcing
+  every instance to count as covered makes 3 scorer tests fail.
+  `run_eval.py --mode ci`: 400 frames in about 4 s, sanity checks ok, NOT RUN,
+  exit 0. `--mode local`: text 2700 frames, faces 1440 frames (LFW fetched and
+  verified), sanity checks ok, exit 1. No-op reference on the full text suite:
+  watch-list pairs 0/3999, first-frame 0/53 items, PII pairs 0/4162, 630 clean
+  frames, 4654 decoy pairs; faces 0/2207 face pairs, 360 clean frames.
+- Eval delta: none; no pipeline yet.
+- Open issues or follow-ups: SPG-11 implements `run_pipeline()` with
+  `spg-cli run`; SPG-16 supplies realtime latencies (`SuiteRun.latencies_ms`)
+  and a realtime suite, until which `--local` fails as required. One font only;
+  more fonts and styles (pinned) would make the text suite harder. LFW crops
+  can include part of a second, unlabeled face; harmless for recall, but a
+  dataset with per-face boxes (WIDER FACE) would allow tighter crops.
+- Review fixes (Greptile, staff review): `load_truth()` requires each
+  sequence's ground truth to hold exactly frames 0..n-1 for the count in
+  `suite.json`, since a ground truth and plan file shortened alike would pair
+  cleanly; the contract reader range-checks numbers before `math.isfinite`, so
+  a 400-digit integer is a contract error rather than an `OverflowError`;
+  regenerating into an existing output deletes old frame PNGs and mask plans
+  in each sequence, and `run_eval.py` clears its plans directory before the
+  pipeline runs. Docs call the scripts through `python3`. A fallback frame
+  counts as covered in the text and faces suites with no fail-closed limit
+  there; `docs/eval.md` records that the realtime suite must run in local
+  mode once SPG-11/16 land. `load_thresholds()` rejects unknown metric names
+  in every suite table, so a typo in the faces or realtime limits fails in ci
+  mode too. Follow-up for SPG-11: remove the `PipelineUnavailable` / `NOT RUN`
+  path in the PR that wires `spg-cli run`.
+
 ## 2026-10-12 — SPG-06 Text detector (#35)
 
 - Decision / change: `TextDetector` in `spg-detect` (`core/src/detect/`,
