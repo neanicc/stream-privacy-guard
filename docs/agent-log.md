@@ -196,7 +196,7 @@ Template:
   committed fixtures in `tests/fixtures/contracts/` to keep the Python side in
   step with the C++ parser.
 
-## 2026-10-12 — SPG-03 Synthetic eval suite and scorer (#PR)
+## 2026-10-12 — SPG-03 Synthetic eval suite and scorer (#32)
 
 - Decision / change: eval tooling in Python under `eval/` (package
   `eval/spg_eval/`). `run_eval.py` is the driver `run.sh eval` already calls:
