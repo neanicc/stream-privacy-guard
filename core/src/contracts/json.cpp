@@ -26,6 +26,10 @@ constexpr std::int64_t kSchemaVersion = 1;
 constexpr std::int64_t kInt64Max = std::numeric_limits<std::int64_t>::max();
 constexpr std::int64_t kInt64Min = std::numeric_limits<std::int64_t>::min();
 constexpr std::int64_t kUint32Max = std::numeric_limits<std::uint32_t>::max();
+constexpr double kFloatMax = std::numeric_limits<float>::max();
+
+constexpr std::string_view kInFloatRange = "must be within the float range";
+constexpr std::string_view kNonNegativeFloat = "must not be negative and must be within the float range";
 
 [[noreturn]] void fail(std::string_view doc, const std::string& message) {
   throw ContractError(std::string(doc) + ": " + message);
@@ -136,6 +140,19 @@ class ObjectReader {
     const Json* v = find(key);
     return v == nullptr ? fallback : number_value(*v, key);
   }
+  // Float fields are range-checked on the parsed double, before narrowing:
+  // rounding could otherwise turn an invalid value into an allowed one
+  // (1.00000001 -> 1, -1e-50 -> -0), and a double outside the float range
+  // cannot be narrowed at all.
+  [[nodiscard]] float float_number(std::string_view key, double lo, double hi,
+                                   std::string_view rule) const {
+    return narrow(number(key), key, lo, hi, rule);
+  }
+  [[nodiscard]] float float_number_or(std::string_view key, double lo, double hi,
+                                      std::string_view rule, float fallback) const {
+    const Json* v = find(key);
+    return v == nullptr ? fallback : narrow(number_value(*v, key), key, lo, hi, rule);
+  }
   [[nodiscard]] bool boolean(std::string_view key) const {
     const Json& v = require(key);
     if (!v.is_boolean()) {
@@ -194,6 +211,13 @@ class ObjectReader {
     }
     return d;
   }
+  [[nodiscard]] float narrow(double d, std::string_view key, double lo, double hi,
+                             std::string_view rule) const {
+    if (d < lo || d > hi) {
+      fail_field(key, std::string(rule));
+    }
+    return static_cast<float>(d);
+  }
 
   const Json& value_;
   std::string_view doc_;
@@ -214,8 +238,10 @@ void require_source_space(const ObjectReader& reader) {
 
 Rect read_rect(const Json& value, std::string_view doc, const std::string& path) {
   const ObjectReader r(value, doc, path, {"x", "y", "w", "h"});
-  return {static_cast<float>(r.number("x")), static_cast<float>(r.number("y")),
-          static_cast<float>(r.number("w")), static_cast<float>(r.number("h"))};
+  return {r.float_number("x", -kFloatMax, kFloatMax, kInFloatRange),
+          r.float_number("y", -kFloatMax, kFloatMax, kInFloatRange),
+          r.float_number("w", 0.0, kFloatMax, kNonNegativeFloat),
+          r.float_number("h", 0.0, kFloatMax, kNonNegativeFloat)};
 }
 
 Json write_rect(const Rect& rect) {
@@ -276,8 +302,10 @@ PolicyConfig parse_policy_config(std::string_view json) {
       r.integer_or("retro_ms", 0, kMaxLookahead.count(), config.lookahead.count())};
   config.hold =
       std::chrono::milliseconds{r.integer_or("hold_ms", 0, kMaxHold.count(), config.hold.count())};
-  config.margin_px = static_cast<float>(r.number_or("margin_px", config.margin_px));
-  config.margin_ratio = static_cast<float>(r.number_or("margin_ratio", config.margin_ratio));
+  config.margin_px =
+      r.float_number_or("margin_px", 0.0, kFloatMax, kNonNegativeFloat, config.margin_px);
+  config.margin_ratio =
+      r.float_number_or("margin_ratio", 0.0, kFloatMax, kNonNegativeFloat, config.margin_ratio);
   if (r.find("fallback") != nullptr) {
     const std::optional<FallbackMode> mode = parse_fallback_mode(r.string("fallback"));
     if (!mode) {
@@ -354,7 +382,7 @@ GroundTruthFrame parse_ground_truth_frame(std::string_view json) {
       }
     }
     inst.box = {read_rect(item.require("box"), doc, path + ".box"), Space::Source};
-    inst.visibility = static_cast<float>(item.number("visibility"));
+    inst.visibility = item.float_number("visibility", 0.0, 1.0, "must be in [0, 1]");
     frame.instances.push_back(std::move(inst));
   }
   validate(frame);  // its messages carry the same document prefix

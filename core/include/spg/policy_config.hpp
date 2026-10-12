@@ -13,7 +13,10 @@
 namespace spg {
 
 // What happens to a frame that is due for release before it was fully
-// scanned. Blurring the whole source is the default; there is no fail-open mode.
+// scanned. Blurring the whole source is the default; there is no fail-open
+// mode. HoldLastScanned re-emits the last frame that was released after a
+// complete scan, exactly as it was released (masks applied); it never emits
+// the unscanned frame or a raw, unmasked copy of an earlier one.
 enum class FallbackMode : std::uint8_t { BlurSource, HoldLastScanned, SolidFill };
 
 // JSON names: "blur_source", "hold_last_scanned", "solid_fill".
@@ -57,7 +60,8 @@ inline constexpr std::chrono::milliseconds kMaxHold{60000};
 
 // Throws ContractError naming the offending field (and the watch-list index,
 // never its text) when a value is out of range or a watch-list entry is empty
-// or only whitespace.
+// or blank: only Unicode White_Space characters and the zero-width characters
+// U+200B..U+200D, U+2060 and U+FEFF.
 void validate(const PolicyConfig& config);
 
 }  // namespace spg

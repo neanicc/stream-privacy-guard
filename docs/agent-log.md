@@ -99,6 +99,15 @@ Template:
   mappings, direct vs chained conversion, containment, outward pixel rounding,
   JSON round trips and strictness, fixtures, sentinel test). Mutation check:
   forwarding the JSON library's parse message made the sentinel test fail.
+- Review fixes: `convert` now rounds outward when narrowing to float (rounding
+  each field to nearest could drop an edge pixel column), so round trips never
+  shrink a box and the round-trip test checks that one-sided bound; JSON float
+  fields are range-checked before narrowing (`1.00000001` no longer rounds into
+  a valid visibility, `-1e-50` no longer passes as a width or margin); blank
+  watch-list detection covers Unicode whitespace and zero-width characters;
+  `hold_last_scanned` is documented as re-emitting the last released (masked)
+  frame. Zero lookahead, hold and margin stay valid; a floor is left to
+  SPG-09/10.
 - Eval delta: none; no pipeline stage exists yet (`run.sh eval` still prints
   `THRESHOLDS: NOT RUN`).
 - Open issues or follow-ups: SPG-08 owns the normalization and matching that

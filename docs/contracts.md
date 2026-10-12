@@ -45,11 +45,16 @@ and y down. A `Box` always says which space it is in.
 
 `convert(box, target, SpaceMap{readback, model_input})` in
 `core/src/frame/geometry.cpp` is the only conversion between spaces. It
-computes in double precision, does not clip (a box in letterbox padding maps
-outside the source), and throws `ContractError` for an invalid box or a
-`ModelInput` conversion without a model mapping. Property tests in
-`tests/unit/geometry_test.cpp` check round trips between every pair of spaces,
-that a direct conversion matches one through `Readback`, and that containment is
+computes in double precision and rounds outward when narrowing the result to
+`float`: the origin rounds down and the far edge (origin + length, summed in
+double) rounds up, so the result contains the double-precision image of the box and a
+converted mask never loses an edge pixel to rounding. It does not clip (a box in
+letterbox padding maps outside the source), and throws `ContractError` for an
+invalid box, a result outside the `float` range, or a `ModelInput` conversion
+without a model mapping. Property tests in `tests/unit/geometry_test.cpp` check
+that no converted edge moves inward, that round trips between every pair of
+spaces never shrink the box and grow it by at most the rounding bound, that a
+direct conversion matches one through `Readback`, and that containment is
 preserved, over 5000 seeded random mappings each.
 
 `enclosing_pixels(rect, bounds)` turns a float rect into the smallest pixel
@@ -76,7 +81,11 @@ Common rules for every document:
 - UTF-8, one JSON object per document, `"schema": 1` required.
 - Unknown fields and duplicate field names are errors. A misspelled
   `"watchlist"` must fail loudly rather than silently disable matching.
-- Integers must be JSON integers. Numbers must be finite.
+- Integers must be JSON integers. Numbers must be finite. A field stored as
+  `float` is range-checked on the parsed value before it is narrowed, so a value
+  just outside its range (`1.00000001` for a visibility, `-1e-50` for a width)
+  is an error rather than rounding into range, and a value beyond the `float`
+  range is an error.
 - Box objects are `{"x": .., "y": .., "w": .., "h": ..}` in Source pixels, and
   documents that contain boxes declare `"space": "source"`.
 - Serializers write one line with no trailing newline, so a sequence of frames
@@ -111,17 +120,20 @@ Every field except `schema` is optional and defaults to the value shown.
 | Field | Rule |
 | --- | --- |
 | `categories` | Enabled categories. Absent means all; `[]` means none. |
-| `watchlist` | Strings; an empty or whitespace-only entry is an error (reported by index). |
+| `watchlist` | Strings; an entry that is empty or blank is an error (reported by index). Blank means only Unicode White_Space characters (including U+00A0 and U+3000) and the zero-width characters U+200B..U+200D, U+2060 and U+FEFF. |
 | `fuzzy` | For an entry of n normalized characters the allowed edit distance is `min(max_edits, floor(max_edit_ratio * n))`; a partial reveal counts only with at least `min_partial_chars` characters. `max_edit_ratio` in [0, 1], `min_partial_chars` ≥ 1. |
 | `lookahead_ms` | [0, 5000]. |
 | `retro_ms` | [0, `lookahead_ms`]; defaults to `lookahead_ms` (plan section 4). |
 | `hold_ms` | [0, 60000]. |
 | `margin_px`, `margin_ratio` | Each mask edge grows by `margin_px + margin_ratio * min(width, height)` Source pixels. Not negative. |
-| `fallback` | `blur_source` (default), `hold_last_scanned` or `solid_fill`. There is no fail-open mode. |
+| `fallback` | `blur_source` (default), `hold_last_scanned` or `solid_fill`. There is no fail-open mode. `hold_last_scanned` re-emits the last frame released after a complete scan, exactly as released with its masks applied; it never emits the unscanned frame or an unmasked copy of an earlier one. |
 | `mask_style` | `blur`, `pixelate` or `solid_fill`. |
 
 The fuzzy and margin numbers are starting points; SPG-08 and SPG-09 tune them
-against the eval and update this page.
+against the eval and update this page. `0` is a valid value for `lookahead_ms`,
+`hold_ms`, `margin_px` and `margin_ratio` and turns that protection off
+(`lookahead_ms: 0` leaves no retroactive window). Whether to impose a floor is
+open for SPG-09 and SPG-10 to settle against the eval.
 
 ### Ground truth (one frame)
 

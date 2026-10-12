@@ -117,6 +117,14 @@ TEST_CASE("json: policy config parsing is strict", "[json][policy]") {
       R"({"schema": 1, "lookahead_ms": 200, "retro_ms": 300})",
       R"({"schema": 1, "hold_ms": 18446744073709551615})",
       R"({"schema": 1, "margin_px": -1})",
+      // Range checks run on the parsed double, before narrowing to float
+      // could round an invalid value into range or overflow.
+      R"({"schema": 1, "margin_px": -1e-50})",
+      R"({"schema": 1, "margin_ratio": -1e-50})",
+      R"({"schema": 1, "margin_px": 1e300})",
+      R"({"schema": 1, "margin_ratio": 1e39})",
+      R"({"schema": 1, "watchlist": ["\u00a0"]})",
+      R"({"schema": 1, "watchlist": ["\u2003\u200b\u3000"]})",
       R"({"schema": 1, "fuzzy": {"max_edit_ratio": 2}})",
       R"({"schema": 1, "fallback": "none"})",
       R"({"schema": 1, "mask_style": "glitter"})",
@@ -219,6 +227,12 @@ TEST_CASE("json: ground truth parsing is strict", "[json][ground-truth]") {
       base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":0,"w":1},"visibility":1}]})",
       base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":0,"w":1,"h":1}}]})",
       base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":0,"w":1,"h":1},"visibility":2}]})",
+      base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":0,"w":1,"h":1},"visibility":1.00000001}]})",
+      base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":0,"w":1,"h":1},"visibility":-1e-50}]})",
+      base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":0,"w":-1e-50,"h":1},"visibility":1}]})",
+      base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":0,"w":1,"h":-1e-50},"visibility":1}]})",
+      base_head + R"({"id":"a","kind":"face","box":{"x":1e300,"y":0,"w":1,"h":1},"visibility":1}]})",
+      base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":-1e39,"w":1,"h":1},"visibility":1}]})",
       base_head + R"({"id":"","kind":"face","box":{"x":0,"y":0,"w":1,"h":1},"visibility":1}]})",
       base_head + R"({"id":"a","kind":"face","box":{"x":0,"y":0,"w":1,"h":1},"visibility":1,"text":"x"}]})",
       base_head + ok_instance + "," + ok_instance + "]}",
@@ -254,6 +268,16 @@ TEST_CASE("json: mask plans round trip and parse strictly", "[json][mask]") {
   CHECK_THROWS_AS(spg::parse_mask_plan(
                       R"({"schema":1,"space":"source","timestamp_ns":0,"fallback":false,"rects":[{"box":{"x":0,"y":0,"w":1,"h":1},"style":"x"}]})"),
                   spg::ContractError);
+  CHECK_THROWS_AS(spg::parse_mask_plan(
+                      R"({"schema":1,"space":"source","timestamp_ns":0,"fallback":false,"rects":[{"box":{"x":0,"y":0,"w":-1e-50,"h":1},"style":"blur"}]})"),
+                  spg::ContractError);
+  CHECK_THROWS_AS(spg::parse_mask_plan(
+                      R"({"schema":1,"space":"source","timestamp_ns":0,"fallback":false,"rects":[{"box":{"x":0,"y":0,"w":1e39,"h":1},"style":"blur"}]})"),
+                  spg::ContractError);
+  // Boundary values that are exactly in range still parse.
+  CHECK(spg::parse_mask_plan(
+            R"({"schema":1,"space":"source","timestamp_ns":0,"fallback":false,"rects":[{"box":{"x":-0.0,"y":0,"w":0,"h":3.4028234663852886e38},"style":"blur"}]})")
+            .rects.size() == 1);
   CHECK(error_of(parse_plan, with_sentinel(R"({"schema":1,"space":"@S@"})")).find("SENTINEL") ==
         std::string::npos);
 }

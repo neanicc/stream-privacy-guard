@@ -146,6 +146,33 @@ TEST_CASE("contracts: policy config defaults follow the plan and validate", "[co
   bad = config;
   bad.watchlist.emplace_back(" \t ");
   CHECK_THROWS_AS(spg::validate(bad), spg::ContractError);
+  // Entries made only of Unicode whitespace or zero-width characters look
+  // empty in a settings field and are rejected the same way. UTF-8 bytes are
+  // spelled out so the test does not depend on the execution character set.
+  const std::vector<std::string> blanks = {
+      "\xC2\xA0",                                    // U+00A0 no-break space
+      "\xC2\x85",                                    // U+0085 next line
+      "\xE1\x9A\x80",                                // U+1680 ogham space mark
+      "\xE2\x80\x80\xE2\x80\x8A",                    // U+2000 .. U+200A
+      "\xE2\x80\xA8\xE2\x80\xA9",                    // U+2028, U+2029
+      "\xE2\x80\xAF\xE2\x81\x9F\xE3\x80\x80",        // U+202F, U+205F, U+3000
+      "\xE2\x80\x8B\xE2\x80\x8C\xE2\x80\x8D\xE2\x81\xA0",  // zero-width, U+2060
+      "\xEF\xBB\xBF",                                // U+FEFF
+      " \xC2\xA0\t\xE3\x80\x80",
+  };
+  for (std::size_t i = 0; i < blanks.size(); ++i) {
+    bad = config;
+    bad.watchlist.emplace_back(blanks[i]);
+    INFO("blank entry " << i);
+    CHECK_THROWS_AS(spg::validate(bad), spg::ContractError);
+  }
+  spg::PolicyConfig ok = config;
+  ok.watchlist = {spg::Secret("a\xC2\xA0"
+                              "b"),
+                  spg::Secret("\xE3\x80\x80\xC3\xA9"),  // U+3000 then U+00E9
+                  spg::Secret("\xE4\xB8\xAD"),          // U+4E2D
+                  spg::Secret("\xC2")};  // malformed UTF-8 is not blank; the serializer rejects it
+  CHECK_NOTHROW(spg::validate(ok));
   bad = config;
   bad.fuzzy.max_edit_ratio = 1.5;
   CHECK_THROWS_AS(spg::validate(bad), spg::ContractError);
