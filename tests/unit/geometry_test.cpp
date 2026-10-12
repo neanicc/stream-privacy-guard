@@ -157,6 +157,33 @@ TEST_CASE("geometry: round trips between every pair of spaces restore the box",
   }
 }
 
+TEST_CASE("geometry: a chain through every space never shrinks a Source box",
+          "[geometry][property]") {
+  Cases cases(0xc4a1eU);
+  for (int i = 0; i < kPropertyCases; ++i) {
+    const SpaceMap map = cases.mapping();
+    const Box original = cases.box(Space::Source, map);
+    const Box readback = spg::convert(original, Space::Readback, map);
+    const Box model = spg::convert(readback, Space::ModelInput, map);
+    const Box back = spg::convert(model, Space::Source, map);
+    REQUIRE(back.space == Space::Source);
+    // Each step rounds outward, so the chain contains the original up to
+    // double rounding, magnified by the coarsest space it passed through.
+    const double sx = std::min(units_per_source(Space::Readback, map, true),
+                               units_per_source(Space::ModelInput, map, true));
+    const double sy = std::min(units_per_source(Space::Readback, map, false),
+                               units_per_source(Space::ModelInput, map, false));
+    const double slack_x = 1e-9 * (1.0 + 1.0 / sx);
+    const double slack_y = 1e-9 * (1.0 + 1.0 / sy);
+    const double unbounded = std::numeric_limits<double>::infinity();
+    INFO("case " << i << " fit " << static_cast<int>(map.model_input->fit()));
+    REQUIRE(edges_within(original.rect.x, original.rect.width, back.rect.x, back.rect.width, slack_x,
+                         unbounded));
+    REQUIRE(edges_within(original.rect.y, original.rect.height, back.rect.y, back.rect.height,
+                         slack_y, unbounded));
+  }
+}
+
 TEST_CASE("geometry: direct conversion equals conversion through Readback",
           "[geometry][property]") {
   Cases cases(0x0c0ffeeU);

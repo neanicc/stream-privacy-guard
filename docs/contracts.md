@@ -126,7 +126,7 @@ Every field except `schema` is optional and defaults to the value shown.
 | `retro_ms` | [0, `lookahead_ms`]; defaults to `lookahead_ms` (plan section 4). |
 | `hold_ms` | [0, 60000]. |
 | `margin_px`, `margin_ratio` | Each mask edge grows by `margin_px + margin_ratio * min(width, height)` Source pixels. Not negative. |
-| `fallback` | `blur_source` (default), `hold_last_scanned` or `solid_fill`. There is no fail-open mode. `hold_last_scanned` re-emits the last frame released after a complete scan, exactly as released with its masks applied; it never emits the unscanned frame or an unmasked copy of an earlier one. |
+| `fallback` | `blur_source` (default), `hold_last_scanned` or `solid_fill`. There is no fail-open mode. `hold_last_scanned` re-emits the last frame released after a complete scan, exactly as released with its masks applied; it never emits the unscanned frame or an unmasked copy of an earlier one. When there is no such frame for the current source size and content (the first frames after the filter starts, or after the source is resized or switched), it applies `blur_source` instead; SPG-10 implements and tests this. |
 | `mask_style` | `blur`, `pixelate` or `solid_fill`. |
 
 The fuzzy and margin numbers are starting points; SPG-08 and SPG-09 tune them

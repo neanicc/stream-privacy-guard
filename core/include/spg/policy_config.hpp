@@ -16,7 +16,10 @@ namespace spg {
 // scanned. Blurring the whole source is the default; there is no fail-open
 // mode. HoldLastScanned re-emits the last frame that was released after a
 // complete scan, exactly as it was released (masks applied); it never emits
-// the unscanned frame or a raw, unmasked copy of an earlier one.
+// the unscanned frame or a raw, unmasked copy of an earlier one. When there is
+// no such frame for the current source size and content (the first frames
+// after the filter starts, or after the source is resized or switched),
+// HoldLastScanned applies BlurSource instead.
 enum class FallbackMode : std::uint8_t { BlurSource, HoldLastScanned, SolidFill };
 
 // JSON names: "blur_source", "hold_last_scanned", "solid_fill".

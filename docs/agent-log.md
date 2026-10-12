@@ -106,7 +106,8 @@ Template:
   a valid visibility, `-1e-50` no longer passes as a width or margin); blank
   watch-list detection covers Unicode whitespace and zero-width characters;
   `hold_last_scanned` is documented as re-emitting the last released (masked)
-  frame. Zero lookahead, hold and margin stay valid; a floor is left to
+  frame, falling back to `blur_source` when no such frame exists for the
+  current source size and content. Zero lookahead, hold and margin stay valid; a floor is left to
   SPG-09/10.
 - Eval delta: none; no pipeline stage exists yet (`run.sh eval` still prints
   `THRESHOLDS: NOT RUN`).
