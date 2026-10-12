@@ -90,6 +90,39 @@ class Cases {
 
 constexpr int kPropertyCases = 5000;
 
+// Units of `space` per Source pixel along one axis.
+double units_per_source(Space space, const SpaceMap& map, bool x_axis) {
+  const double rb = x_axis ? static_cast<double>(map.readback.readback().width) /
+                                 static_cast<double>(map.readback.source().width)
+                           : static_cast<double>(map.readback.readback().height) /
+                                 static_cast<double>(map.readback.source().height);
+  switch (space) {
+    case Space::Source:
+      return 1.0;
+    case Space::Readback:
+      return rb;
+    case Space::ModelInput:
+      return rb * (x_axis ? map.model_input->scale_x() : map.model_input->scale_y());
+  }
+  return 1.0;
+}
+
+// One float ulp at the larger magnitude of the span [origin, origin + length].
+double span_ulp(float origin, float length) {
+  const float m = std::max(std::abs(origin), std::abs(origin + length));
+  return static_cast<double>(std::nextafter(m, std::numeric_limits<float>::infinity()) - m);
+}
+
+// True when [b, b + bl] contains [a, a + al] up to `slack` and extends past
+// it by at most `grow` on each side.
+bool edges_within(float a, float al, float b, float bl, double slack, double grow) {
+  const double a0 = a;
+  const double a1 = a0 + static_cast<double>(al);
+  const double b0 = b;
+  const double b1 = b0 + static_cast<double>(bl);
+  return b0 <= a0 + slack && b1 >= a1 - slack && a0 - b0 <= grow && b1 - a1 <= grow;
+}
+
 }  // namespace
 
 TEST_CASE("geometry: round trips between every pair of spaces restore the box",
@@ -106,7 +139,19 @@ TEST_CASE("geometry: round trips between every pair of spaces restore the box",
         INFO("case " << i << " from " << spg::to_string(from) << " via " << spg::to_string(to));
         REQUIRE(there.space == to);
         REQUIRE(back.space == from);
-        REQUIRE(near(back.rect, original.rect, tol));
+        // convert() rounds outward, so a round trip never shrinks the box (up
+        // to double rounding) and grows each edge by at most `tol` plus the
+        // two float ulps of `there` that narrowing may add, seen from `from`.
+        const double sx = units_per_source(to, map, true) / units_per_source(from, map, true);
+        const double sy = units_per_source(to, map, false) / units_per_source(from, map, false);
+        const double slack_x = 1e-9 * (1.0 + 1.0 / sx);
+        const double slack_y = 1e-9 * (1.0 + 1.0 / sy);
+        const double grow_x = tol + 2.0 * span_ulp(there.rect.x, there.rect.width) / sx;
+        const double grow_y = tol + 2.0 * span_ulp(there.rect.y, there.rect.height) / sy;
+        REQUIRE(edges_within(original.rect.x, original.rect.width, back.rect.x, back.rect.width,
+                             slack_x, grow_x));
+        REQUIRE(edges_within(original.rect.y, original.rect.height, back.rect.y, back.rect.height,
+                             slack_y, grow_y));
       }
     }
   }
@@ -142,6 +187,81 @@ TEST_CASE("geometry: conversions preserve containment", "[geometry][property]") 
     REQUIRE(n.x + n.width <= o.x + o.width + tol);
     REQUIRE(n.y + n.height <= o.y + o.height + tol);
   }
+}
+
+// The exact image of [lo, hi] on one axis, computed in double straight from
+// the mapping accessors rather than through convert().
+struct Edges {
+  double lo;
+  double hi;
+};
+
+Edges exact_x(const Rect& r, Space from, Space to, const SpaceMap& map) {
+  const double rb = static_cast<double>(map.readback.readback().width) /
+                    static_cast<double>(map.readback.source().width);
+  const ModelInputMapping& m = *map.model_input;
+  const auto to_source = [&](double v) {
+    switch (from) {
+      case Space::Source:
+        return v;
+      case Space::Readback:
+        return v / rb;
+      case Space::ModelInput:
+        return ((v - m.pad_x()) / m.scale_x() + static_cast<double>(m.crop().x)) / rb;
+    }
+    return v;
+  };
+  const auto from_source = [&](double v) {
+    switch (to) {
+      case Space::Source:
+        return v;
+      case Space::Readback:
+        return v * rb;
+      case Space::ModelInput:
+        return (v * rb - static_cast<double>(m.crop().x)) * m.scale_x() + m.pad_x();
+    }
+    return v;
+  };
+  const double x = static_cast<double>(r.x);
+  return {from_source(to_source(x)), from_source(to_source(x + static_cast<double>(r.width)))};
+}
+
+TEST_CASE("geometry: narrowing to float never moves a converted edge inward",
+          "[geometry][property]") {
+  Cases cases(0xed6e5U);
+  for (int i = 0; i < kPropertyCases; ++i) {
+    const SpaceMap map = cases.mapping();
+    for (const Space from : kSpaces) {
+      const Box original = cases.box(from, map);
+      for (const Space to : kSpaces) {
+        if (from == to) {
+          continue;
+        }
+        const Rect r = spg::convert(original, to, map).rect;
+        const Edges want = exact_x(original.rect, from, to, map);
+        // The slack absorbs double rounding only. It is far below one float
+        // ulp at pixel magnitudes, so an edge rounded inward still fails.
+        const double slack = 1e-9;
+        INFO("case " << i << " from " << spg::to_string(from) << " to " << spg::to_string(to));
+        REQUIRE(static_cast<double>(r.x) <= want.lo + slack);
+        REQUIRE(static_cast<double>(r.x) + static_cast<double>(r.width) >= want.hi - slack);
+      }
+    }
+  }
+}
+
+TEST_CASE("geometry: a converted mask covers the edge pixel of its exact image", "[geometry]") {
+  // Readback right edge 750.0000152587890625 maps to Source 1000.0000203450...
+  // Rounding x and width to nearest float separately gives a right edge of
+  // exactly 1000 and drops column 1000.
+  const SpaceMap map{ReadbackMapping({1920U, 1080U}, {1440U, 810U}), std::nullopt};
+  const Box readback{{512.0001220703125F, 0.0F, 237.9998931884765625F, 10.0F}, Space::Readback};
+  const Box source = spg::convert(readback, Space::Source, map);
+  CHECK(static_cast<double>(source.rect.x) + static_cast<double>(source.rect.width) >
+        1000.0000203);
+  const spg::PixelRect p = spg::enclosing_pixels(source.rect, map.readback.source());
+  CHECK(p.x <= 682);
+  CHECK(p.x + p.width >= 1001);
 }
 
 TEST_CASE("geometry: enclosing_pixels covers every pixel the rect touches", "[geometry][property]") {

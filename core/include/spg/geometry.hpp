@@ -114,10 +114,14 @@ struct SpaceMap {
   std::optional<ModelInputMapping> model_input;
 };
 
-// Converts `box` into `target` space. Does not clip: a box in letterbox
-// padding maps outside the source and callers clip where they need to.
-// Throws ContractError when the box is invalid or a ModelInput conversion is
-// requested without a model input mapping.
+// Converts `box` into `target` space. Computes in double and rounds outward
+// when narrowing to float: the origin rounds down and the far edge
+// (origin + length, summed in double as enclosing_pixels does) rounds up, so
+// the result contains the double-precision image and a converted mask never
+// loses an edge pixel. Does not clip: a box in letterbox padding maps outside
+// the source and callers clip where they need to. Throws ContractError when
+// the box is invalid, the result is outside the float range, or a ModelInput
+// conversion is requested without a model input mapping.
 [[nodiscard]] Box convert(const Box& box, Space target, const SpaceMap& map);
 
 }  // namespace spg

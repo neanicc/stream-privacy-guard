@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <utility>
 
 #include "spg/error.hpp"
 
@@ -47,6 +49,34 @@ SpaceAffine affine_from_source(Space space, const SpaceMap& map) {
 
 bool has_zero_dimension(Size size) noexcept {
   return size.width == 0 || size.height == 0;
+}
+
+// Narrows one axis [lo, hi] to a float origin and length whose span contains
+// it, as enclosing_pixels() measures the span (origin + length in double).
+// Rounding each field to nearest instead can move an edge inward by an ulp,
+// which can uncover a pixel column that the exact box touches.
+std::pair<float, float> narrow_outward(double lo, double hi) {
+  constexpr double kFloatMax = std::numeric_limits<float>::max();
+  if (!(std::abs(lo) <= kFloatMax && std::abs(hi) <= kFloatMax)) {
+    throw ContractError("geometry: converted box is outside the float range");
+  }
+  constexpr float kInf = std::numeric_limits<float>::infinity();
+  float origin = static_cast<float>(lo);
+  if (static_cast<double>(origin) > lo) {
+    origin = std::nextafter(origin, -kInf);
+  }
+  const double span = std::max(hi - static_cast<double>(origin), 0.0);
+  if (span > kFloatMax) {
+    throw ContractError("geometry: converted box is outside the float range");
+  }
+  float length = static_cast<float>(span);
+  while (static_cast<double>(origin) + static_cast<double>(length) < hi) {
+    length = std::nextafter(length, kInf);
+  }
+  if (!std::isfinite(origin) || !std::isfinite(length)) {
+    throw ContractError("geometry: converted box is outside the float range");
+  }
+  return {origin, length};
 }
 
 }  // namespace
@@ -159,9 +189,9 @@ Box convert(const Box& box, Space target, const SpaceMap& map) {
   const double y = map_axis(static_cast<double>(box.rect.y), from.y, to.y);
   const double w = static_cast<double>(box.rect.width) / from.x.scale * to.x.scale;
   const double h = static_cast<double>(box.rect.height) / from.y.scale * to.y.scale;
-  return {{static_cast<float>(x), static_cast<float>(y), static_cast<float>(w),
-           static_cast<float>(h)},
-          target};
+  const auto [rx, rw] = narrow_outward(x, x + w);
+  const auto [ry, rh] = narrow_outward(y, y + h);
+  return {{rx, ry, rw, rh}, target};
 }
 
 }  // namespace spg
