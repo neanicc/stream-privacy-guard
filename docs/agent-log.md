@@ -268,6 +268,65 @@ Template:
   packaging the module and its data per OS (SPG-17); readback, ring buffer,
   blur and audio guidance (SPG-14).
 
+## 2026-10-12 — SPG-05 Face detector (#29)
+
+- Decision / change: `spg-detect` (`core/src/detect/`, lane:vision) with
+  `FaceDetector`: YuNet 2023mar through `spg::runtime::Session`. The pinned
+  model has a static 640x640 input, so the whole readback frame is letterboxed
+  top-left into it (uniform scale, black padding right and bottom, as OpenCV's
+  `FaceDetectorYN` pads) with `ModelInputMapping(..., Fit::LetterboxTopLeft)`;
+  boxes go back through `spg::convert()` only, then are clipped to the source
+  (far edge narrowed outward) and dropped when wholly in the padding.
+  `detect(frame, source)` takes the readback pixels plus the source size, so
+  `FrameView` and the contract headers are unchanged. Preprocessing
+  (`frame_image.cpp`, OpenCV private): crop must be whole pixels inside the
+  frame; area resize when downscaling, bilinear when upscaling; BGR raw 0-255
+  NCHW (OpenCV `blobFromImage` defaults); NV12/I420 decoded as BT.709 limited
+  range (OBS default), odd sizes supported. Decode and NMS (`yunet.cpp`) follow
+  OpenCV 4.x `face_detect.cpp` (score sqrt(clamp(cls) * clamp(obj)), center
+  offset and log size per stride 8/16/32, `NMSBoxes` semantics with top_k),
+  with one SPG change: a non-finite score anywhere, or a non-finite box on a
+  kept candidate, throws `DecodeError` so the frame fails closed instead of
+  silently dropping a face. Defaults: score threshold 0.6 (OpenCV's demo uses
+  0.9; lowered for recall over precision), NMS IoU 0.3, top_k 5000; SPG-12
+  tunes them on the faces suite. Landmarks are decoded by YuNet but unused.
+  Content size in the model input rounds to the nearest pixel, so a model
+  coordinate maps back within half a model pixel on the non-limiting axis
+  (under 1.5 Source px for 1080p), far below the tracker margin.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang): `scripts/ci/run.sh
+  build` and `test` pass, 78/78 ctest tests, 26 new `detect.*` cases. Unit cases
+  use synthetic tensors (decode per stride, clamping, inclusive threshold, NaN/
+  overflow fail closed, NMS threshold/top_k/ties), the mapping (four
+  source/readback/aspect combinations, clipping, padding drop, 200 fractional
+  boxes contain their exact Source image) and rendering (BGRA/NV12/I420 colors,
+  stride padding never read, odd sizes, upscaling, invalid crops). Model cases
+  (skip when YuNet is not cached) find no face in 24 empty synthetic frames and
+  find a drawn cartoon face (ellipses, no real likeness) in six scenes, on CPU
+  and the default provider (CoreML here), with the Source box centered within
+  0.15 face sizes; three faces stay three; four threads agree. A YuNet probe on
+  the drawn face scored about 0.86. Mutation check: ignoring the readback scale
+  in `detect()` failed 3 cases (every downscaled scene, both providers).
+- Eval delta: none. The detector is not wired into a pipeline yet (SPG-10/11),
+  and the eval stage was not run here (the eval driver has not landed).
+- Open issues or follow-ups: `Session::run` allocation per call is not
+  measured; leave it to `spg-cli bench` (SPG-11/16). Small faces (recall gap,
+  staff review P2): a 1080p frame is scaled by 1/3, so faces under about 30
+  Source px may be missed, and a missed face airs. SPG-12 must treat tiling or
+  a larger input as a recall item, not an option, and the 0.6 score threshold
+  is untuned until then. No recall claim is made for small or distant faces
+  before SPG-12 measures them on the faces suite. The text
+  detector (SPG-06) can reuse `render_model_input()` for its tiles.
+  `docs/contracts.md` describes `FrameView` as Source space; detectors also
+  use it for the readback copy, so lane:policy may want to say so there.
+- Review fixes (Greptile): `decode` also throws `DecodeError` when a kept
+  candidate's raw box values are not finite or its decoded width or height is
+  not positive (a -inf or underflowing log size used to decode to an empty box
+  that clipping dropped silently). `stride_outputs()` checks every run's
+  output shapes are exactly `[1, cells, 1|4]`, since the model may declare
+  dynamic output dimensions and a same-count transposed tensor would otherwise
+  be read as boxes. The test `OwnedFrame` is move-only so its view cannot
+  point into another frame's buffers.
+
 ## 2026-10-12 — SPG-03 Synthetic eval suite and scorer (#32)
 
 - Decision / change: eval tooling in Python under `eval/` (package
