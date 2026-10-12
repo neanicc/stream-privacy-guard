@@ -112,6 +112,17 @@ std::shared_ptr<const OwnedFrame> OwnedFrame::copy(const FrameView& frame) {
   return owned;
 }
 
+std::shared_ptr<const OwnedFrame> OwnedFrame::adopt(const FrameView& frame, std::shared_ptr<const void> owner) {
+  validate(frame);
+  if (owner == nullptr) {
+    throw ContractError("scan: OwnedFrame::adopt needs an owner");
+  }
+  std::shared_ptr<OwnedFrame> owned(new OwnedFrame());
+  owned->owner_ = std::move(owner);
+  owned->view_ = frame;
+  return owned;
+}
+
 ScanResult run_scan(const ScanStages& stages, const ScanJob& job, const ScanLimits& limits) noexcept {
   if (job.readback == nullptr) {
     return failed(ScanFailure::InvalidOutput);
