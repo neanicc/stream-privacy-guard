@@ -126,8 +126,11 @@ PixelRect enclosing_pixels(const Rect& rect, Size bounds) noexcept {
   if (!is_valid(rect)) {
     return {};
   }
-  const double max_x = static_cast<double>(bounds.width);
-  const double max_y = static_cast<double>(bounds.height);
+  // PixelRect is int32; clamp so a bounds dimension above INT32_MAX cannot
+  // overflow the cast below.
+  constexpr auto kInt32Max = static_cast<double>(std::numeric_limits<std::int32_t>::max());
+  const double max_x = std::min(static_cast<double>(bounds.width), kInt32Max);
+  const double max_y = std::min(static_cast<double>(bounds.height), kInt32Max);
   const double x0 = std::clamp(std::floor(static_cast<double>(rect.x)), 0.0, max_x);
   const double y0 = std::clamp(std::floor(static_cast<double>(rect.y)), 0.0, max_y);
   const double x1 =

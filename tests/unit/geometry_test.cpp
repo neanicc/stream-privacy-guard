@@ -389,5 +389,9 @@ TEST_CASE("geometry: rect helpers", "[geometry]") {
   CHECK(spg::enclosing_pixels({10.2F, 5.7F, 3.1F, 0.2F}, {100U, 100U}) == spg::PixelRect{10, 5, 4, 1});
   CHECK(spg::enclosing_pixels({-5.0F, -5.0F, 10.0F, 10.0F}, {100U, 100U}) == spg::PixelRect{0, 0, 5, 5});
   CHECK(spg::enclosing_pixels({200.0F, 0.0F, 10.0F, 10.0F}, {100U, 100U}).width == 0);
+  // Bounds above INT32_MAX clamp instead of overflowing the int32 result.
+  constexpr std::int32_t kMax = std::numeric_limits<std::int32_t>::max();
+  CHECK(spg::enclosing_pixels({0.0F, 0.0F, 3e9F, 1.0F}, {4'000'000'000U, 1U}) ==
+        spg::PixelRect{0, 0, kMax, 1});
   CHECK(spg::to_string(Space::ModelInput) == "model_input");
 }
