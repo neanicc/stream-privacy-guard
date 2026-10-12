@@ -8,6 +8,7 @@
 #include <functional>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -1179,8 +1180,9 @@ TEST_CASE("a failed cycle whose boxes cannot be applied fails closed every frame
 
 // Greptile on PR #58: an allocation failure while run_scan() collects the
 // boxes a stage returned (the face insert, the policy's per-region flags,
-// appending regions) used to return only what was collected so far, so the
-// scheduler held less than the cycle saw.
+// appending every region after a text stage failed, keeping the valid
+// siblings of malformed output) used to return only what was collected so
+// far, so the scheduler held less than the cycle saw.
 TEST_CASE("a cycle that cannot keep every box its stages returned says so", "[schedule]") {
   const Rect face{10, 10, 20, 20};
   const Rect r1{0, 50, 60, 10};
@@ -1191,7 +1193,13 @@ TEST_CASE("a cycle that cannot keep every box its stages returned says so", "[sc
   // r1 reads "fine", r2 reads "SECRET" (sensitive to ScriptedPolicy).
   const auto recognizer = std::make_shared<spg_test::ScriptedRecognizer>(
       [](const Detection& d) { return std::string(d.box.rect.y == 50.0F ? "fine" : "SECRET"); });
-  const spg::ScanStages stages{faces_always(face), regions, recognizer, std::make_shared<spg_test::ScriptedPolicy>()};
+  struct ThrowingRecognizer final : spg::TextRecognizer {
+    std::vector<spg::Secret> recognize(const spg::FrameView&, Size,
+                                       std::span<const Detection>) const override {
+      throw std::runtime_error("InferenceFailed");
+    }
+  };
+  const auto policy = std::make_shared<spg_test::ScriptedPolicy>();
   Sim sim(small_config());
   sim.push(1000, true);
   std::optional<spg::ScanJob> job = sim.la.take_job();
@@ -1205,53 +1213,74 @@ TEST_CASE("a cycle that cannot keep every box its stages returned says so", "[sc
     return out;
   };
 
-  // One clean cycle first, so one-time setup (the secure heap behind Secret)
-  // is done and the sweep sees only the allocations of a cycle.
-  REQUIRE(spg::run_scan(stages, *job, all).complete);
-  // Fail each allocation the cycle makes in turn, until one runs clean.
-  std::uint64_t n = 0;
-  int lost = 0;
-  for (;; ++n) {
-    REQUIRE(n < 10000);
-    spg::ScanResult r;
-    bool fired = false;
-    {
-      const spg_test::FailAllocations fail(n);
-      r = spg::run_scan(stages, *job, all);
-      fired = fail.fired();
-    }
-    INFO("allocation " << n);
-    if (!fired) {
-      CHECK(r.complete);
-      CHECK_FALSE(r.detections_lost);
-      CHECK(rects(r) == std::vector<Rect>{face, r2});
-      break;
-    }
-    CHECK_FALSE(r.complete);
-    switch (r.failure) {
-      case spg::ScanFailure::FaceDetector:  // the stage itself failed
-        CHECK_FALSE(r.detections_lost);
-        CHECK(r.detections.empty());
-        break;
-      case spg::ScanFailure::TextDetector:
-        CHECK_FALSE(r.detections_lost);
-        CHECK(rects(r) == std::vector<Rect>{face});
-        break;
-      case spg::ScanFailure::Recognizer:
-      case spg::ScanFailure::Policy:
-        CHECK_FALSE(r.detections_lost);
-        CHECK(rects(r) == std::vector<Rect>{face, r1, r2});
-        break;
-      default:
-        // Every stage output here is valid: an InvalidOutput result is an
-        // allocation failure while collecting, and must say boxes were lost.
+  // The boxes a result keeps, by its failure (None: complete), when no box
+  // was lost. A failure missing here is a test failure.
+  using Kept = std::map<spg::ScanFailure, std::vector<Rect>>;
+  // Fails each allocation of one cycle in turn, until one runs as the
+  // unfailed cycle does; returns how many of them lost boxes.
+  const auto sweep = [&](const spg::ScanStages& stages, const Kept& kept) {
+    // One unfailed cycle first, so one-time setup (the secure heap behind
+    // Secret) is done and the sweep sees only the allocations of a cycle.
+    const spg::ScanResult unfailed = spg::run_scan(stages, *job, all);
+    int lost = 0;
+    for (std::uint64_t n = 0;; ++n) {
+      REQUIRE(n < 10000);
+      spg::ScanResult r;
+      bool fired = false;
+      {
+        const spg_test::FailAllocations fail(n);
+        r = spg::run_scan(stages, *job, all);
+        fired = fail.fired();
+      }
+      INFO("allocation " << n);
+      if (!fired) {
+        CHECK(r.complete == unfailed.complete);
+        CHECK(r.failure == unfailed.failure);
+      }
+      if (r.detections_lost) {
+        // Collecting failed: never complete, always InvalidOutput.
+        CHECK(fired);
+        CHECK_FALSE(r.complete);
         CHECK(r.failure == spg::ScanFailure::InvalidOutput);
-        CHECK(r.detections_lost);
         ++lost;
-        break;
+        continue;
+      }
+      CHECK(r.complete == (r.failure == spg::ScanFailure::None));
+      const auto it = kept.find(r.failure);
+      REQUIRE(it != kept.end());
+      CHECK(rects(r) == it->second);
+      if (!fired) {
+        return lost;
+      }
     }
+  };
+
+  SECTION("a complete cycle: the face insert, the policy flags, the region append") {
+    const Kept kept{{spg::ScanFailure::None, {face, r2}},
+                    {spg::ScanFailure::FaceDetector, {}},
+                    {spg::ScanFailure::TextDetector, {face}},
+                    {spg::ScanFailure::Recognizer, {face, r1, r2}},
+                    {spg::ScanFailure::Policy, {face, r1, r2}}};
+    CHECK(sweep(spg::ScanStages{faces_always(face), regions, recognizer, policy}, kept) >= 3);
   }
-  CHECK(lost > 0);
+  SECTION("the recognizer throws: appending every region") {
+    const Kept kept{{spg::ScanFailure::FaceDetector, {}},
+                    {spg::ScanFailure::TextDetector, {face}},
+                    {spg::ScanFailure::Recognizer, {face, r1, r2}}};
+    const spg::ScanStages stages{faces_always(face), regions, std::make_shared<ThrowingRecognizer>(), policy};
+    CHECK(sweep(stages, kept) >= 2);
+  }
+  SECTION("malformed faces: keeping their valid siblings") {
+    Detection nan_box = face_at(1, 1, 5, 5);
+    nan_box.box.rect.x = std::nanf("");
+    Detection wrong_space = face_at(1, 1, 5, 5);
+    wrong_space.box.space = spg::Space::Readback;
+    const auto faces = std::make_shared<spg_test::ScriptedDetector>([=](Timestamp, Size) {
+      return std::vector<Detection>{nan_box, face_at(face.x, face.y, face.width, face.height), wrong_space};
+    });
+    const Kept kept{{spg::ScanFailure::FaceDetector, {}}, {spg::ScanFailure::InvalidOutput, {face}}};
+    CHECK(sweep(spg::ScanStages{faces, regions, recognizer, policy}, kept) >= 1);
+  }
 }
 
 TEST_CASE("a cycle that lost boxes it found fails closed every frame they could mask", "[schedule]") {

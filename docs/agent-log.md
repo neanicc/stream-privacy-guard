@@ -1380,8 +1380,10 @@ Template:
   now marks that case and `complete()` fails closed the boxes' whole window
   (`ApplyFailed`, `ts - retro` to `ts + hold`). Tests: a sweep that fails
   each allocation of one cycle in turn (`tests/unit/fail_alloc.cpp` replaces
-  `operator new` for `spg-unit-tests`) and a `complete()` case; both fail
-  with the fix removed.
+  `operator new` for `spg-unit-tests`) over three cycles (complete; the
+  recognizer throws, so every region is appended; malformed faces, so their
+  valid siblings are kept), reaching every collection site, and a
+  `complete()` case; all fail with the fix removed.
 - CI follow-up: the ubuntu-24.04 job failed the property test at seed 1444
   (frame 67 released clean, "no complete cycle covers it"). libstdc++ and
   libc++ implement `uniform_int_distribution`, `bernoulli_distribution` and

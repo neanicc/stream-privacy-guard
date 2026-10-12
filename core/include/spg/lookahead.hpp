@@ -213,9 +213,10 @@ class Lookahead {
 
   [[nodiscard]] const FrameRecord* find_frame(Timestamp t) const noexcept;
   void apply(const ScanJob& job, const ScanResult& result);
-  // A result that cannot be applied (complete, or partial with detections):
-  // fails closed every frame it could have masked (buffered from ts - retro on, pushed up to ts + hold,
-  // and the frame HoldLastScanned would re-emit).
+  // A result that cannot be applied (complete, or partial with detections)
+  // or that lost detections: fails closed every frame it could have masked
+  // (buffered from ts - retro on, pushed up to ts + hold, and the frame
+  // HoldLastScanned would re-emit).
   void fail_closed(const ScanJob& job) noexcept;
   void add_retro(FrameRecord& frame, const Rect& rect) const;
   // The release gate (docs/scheduler.md, "Release rule"), the only place that
