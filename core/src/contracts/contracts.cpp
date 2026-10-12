@@ -1,7 +1,9 @@
 // Names and validation for the contract types in core/include/spg/.
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -64,6 +66,22 @@ void require_source_box(const Box& box, const std::string& what) {
   if (box.space != Space::Source) {
     throw ContractError(what + ": box must be in Source space");
   }
+}
+
+std::string ms_range(std::chrono::milliseconds lo, std::chrono::milliseconds hi) {
+  return "must be in [" + std::to_string(lo.count()) + ", " + std::to_string(hi.count()) + "]";
+}
+
+std::string number_range(double lo, double hi) {
+  std::array<char, 64> text{};
+  (void)std::snprintf(text.data(), text.size(), "must be in [%g, %g]", lo, hi);
+  return text.data();
+}
+
+// False for NaN and infinities as well as values outside [lo, hi].
+bool in_range(float value, double lo, double hi) noexcept {
+  const auto v = static_cast<double>(value);
+  return v >= lo && v <= hi;
 }
 
 }  // namespace
@@ -153,17 +171,20 @@ void validate(const MaskPlan& plan) {
 }
 
 void validate(const PolicyConfig& config) {
-  using std::chrono::milliseconds;
-  if (config.lookahead < milliseconds{0} || config.lookahead > kMaxLookahead) {
-    throw ContractError("policy config: lookahead_ms must be in [0, " +
-                        std::to_string(kMaxLookahead.count()) + "]");
+  if (config.categories.empty()) {
+    // An empty set would turn every detector off while the filter still looks
+    // active. To stop detecting, the user disables or removes the filter.
+    throw ContractError("policy config: categories must enable at least one category");
   }
-  if (config.retro < milliseconds{0} || config.retro > config.lookahead) {
-    throw ContractError("policy config: retro_ms must be in [0, lookahead_ms]");
+  if (config.lookahead < kMinLookahead || config.lookahead > kMaxLookahead) {
+    throw ContractError("policy config: lookahead_ms " + ms_range(kMinLookahead, kMaxLookahead));
   }
-  if (config.hold < milliseconds{0} || config.hold > kMaxHold) {
-    throw ContractError("policy config: hold_ms must be in [0, " + std::to_string(kMaxHold.count()) +
-                        "]");
+  if (config.retro < kMinRetro || config.retro > config.lookahead) {
+    throw ContractError("policy config: retro_ms must be in [" + std::to_string(kMinRetro.count()) +
+                        ", lookahead_ms]");
+  }
+  if (config.hold < kMinHold || config.hold > kMaxHold) {
+    throw ContractError("policy config: hold_ms " + ms_range(kMinHold, kMaxHold));
   }
   if (!std::isfinite(config.fuzzy.max_edit_ratio) || config.fuzzy.max_edit_ratio < 0.0 ||
       config.fuzzy.max_edit_ratio > 1.0) {
@@ -172,11 +193,12 @@ void validate(const PolicyConfig& config) {
   if (config.fuzzy.min_partial_chars == 0) {
     throw ContractError("policy config: fuzzy.min_partial_chars must be at least 1");
   }
-  if (!std::isfinite(config.margin_px) || config.margin_px < 0.0F) {
-    throw ContractError("policy config: margin_px must be finite and not negative");
+  if (!in_range(config.margin_px, kMinMarginPx, kMaxMarginPx)) {
+    throw ContractError("policy config: margin_px " + number_range(kMinMarginPx, kMaxMarginPx));
   }
-  if (!std::isfinite(config.margin_ratio) || config.margin_ratio < 0.0F) {
-    throw ContractError("policy config: margin_ratio must be finite and not negative");
+  if (!in_range(config.margin_ratio, kMinMarginRatio, kMaxMarginRatio)) {
+    throw ContractError("policy config: margin_ratio " +
+                        number_range(kMinMarginRatio, kMaxMarginRatio));
   }
   for (std::size_t i = 0; i < config.watchlist.size(); ++i) {
     if (is_blank(config.watchlist[i].reveal())) {

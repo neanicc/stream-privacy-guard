@@ -181,4 +181,8 @@ TEST_CASE("policy: engine rejects configs it cannot enforce", "[policy][engine]"
   config.watchlist.pop_back();
   config.fuzzy.min_partial_chars = 0;
   CHECK_THROWS_AS(spg::PolicyEngine(config), spg::ContractError);
+  // An engine with no enabled category would report every text as safe.
+  config.fuzzy = {};
+  config.categories = spg::CategorySet{};
+  CHECK_THROWS_AS(spg::PolicyEngine(config), spg::ContractError);
 }

@@ -15,7 +15,7 @@ and this page together. A breaking JSON change bumps `schema`.
 | --- | --- | --- |
 | `time.hpp` | `Timestamp`, `Duration` | Monotonic nanoseconds since an arbitrary epoch (the unit OBS uses). |
 | `time.hpp` | `Clock`, `SteadyClock`, `ManualClock` | Injected time source. Core code takes a `Clock&` and never reads a global clock; tests use `ManualClock`. |
-| `frame.hpp` | `FrameView` | Non-owning frame in Source space: up to three plane pointers and strides, width, height, `PixelFormat` (`BGRA`, `NV12`, `I420`), timestamp. `validate()` rejects zero sizes, missing planes and short strides. |
+| `frame.hpp` | `FrameView` | Non-owning frame: up to three plane pointers and strides, width, height, `PixelFormat` (`BGRA`, `NV12`, `I420`), timestamp. It carries no space tag; detectors get the readback copy (see [Frames handed to detectors](#frames-handed-to-detectors)). `validate()` rejects zero sizes, missing planes and short strides. |
 | `geometry.hpp` | `Rect`, `Box`, `Space` | Float rectangle (`x`, `y`, `width`, `height`) and a box that carries its `Space`: `Source`, `Readback` or `ModelInput`. |
 | `category.hpp` | `Category`, `CategorySet` | `Face`, `Watchlist`, `PiiEmail`, `PiiPhone`, `PiiCard`, `PiiIp`, `PiiAddress`, `PiiToken`. One enum names enabled categories, verdict reasons and ground-truth kinds. |
 | `detection.hpp` | `Detection` | Box in Source space, kind (`Face`, `TextRegion`), score in [0, 1], detector id. |
@@ -57,6 +57,18 @@ that no converted edge moves inward, that round trips between every pair of
 spaces never shrink the box and grow it by at most the rounding bound, that a
 direct conversion matches one through `Readback`, and that containment is
 preserved, over 5000 seeded random mappings each.
+
+### Frames handed to detectors
+
+A `FrameView` carries no `Space` tag and no source size. Full-resolution frames
+stay in the lookahead buffer; detectors receive the **readback copy**, so the
+view holds `Readback` pixels and `frame.size()` is the readback size, not the
+source size. The source size is passed separately, as in
+`FaceDetector::detect(const FrameView& frame, Size source)` (SPG-05): the
+detector builds `ReadbackMapping(source, frame.size())` from the two and
+returns Source-space detections. A caller with an unscaled frame passes
+`source == frame.size()`. New detectors take the same two arguments rather
+than assuming the view is in Source space.
 
 `enclosing_pixels(rect, bounds)` turns a float rect into the smallest pixel
 rect that contains it, clipped to the frame. It rounds outward so that turning a
@@ -100,6 +112,11 @@ Common rules for every document:
 ### Policy config
 
 Every field except `schema` is optional and defaults to the value shown.
+Values that would switch a protection off (no enabled category, or a
+lookahead, retroactive window, hold or margin below its floor) are rejected.
+A `ContractError` from the parser or `validate()` means there is no valid
+policy, and the caller must fail closed by applying `blur_source` to the
+whole source.
 
 ```json
 {
@@ -120,22 +137,39 @@ Every field except `schema` is optional and defaults to the value shown.
 
 | Field | Rule |
 | --- | --- |
-| `categories` | Enabled categories. Absent means all; `[]` means none. |
+| `categories` | Enabled categories; must name at least one. Absent means all. An empty list is rejected (SPG-08b), because it would leave every detector off while the filter looks active. |
 | `watchlist` | Strings; an entry that is empty or blank is an error (reported by index). Blank means only Unicode White_Space characters (including U+00A0 and U+3000) and the zero-width characters U+200B..U+200D, U+2060 and U+FEFF. |
 | `fuzzy` | For an entry of n normalized characters the allowed edit distance is `min(max_edits, floor(max_edit_ratio * n))`; a partial reveal counts only with at least `min_partial_chars` characters. `max_edit_ratio` in [0, 1], `min_partial_chars` ≥ 1. |
-| `lookahead_ms` | [0, 5000]. |
-| `retro_ms` | [0, `lookahead_ms`]; defaults to `lookahead_ms` (plan section 4). |
-| `hold_ms` | [0, 60000]. |
-| `margin_px`, `margin_ratio` | Each mask edge grows by `margin_px + margin_ratio * min(width, height)` Source pixels. Not negative. |
+| `lookahead_ms` | [100, 5000]. |
+| `retro_ms` | [100, `lookahead_ms`]; defaults to `lookahead_ms` (plan section 4). A frame should count as scanned only through a detection cycle on a frame at most `retro_ms` after it; otherwise a secret seen by that cycle is masked from `t - retro_ms` on and earlier frames that showed it are released. SPG-10 enforces this. |
+| `hold_ms` | [400, 60000]. |
+| `margin_px`, `margin_ratio` | Each mask edge grows by `margin_px + margin_ratio * min(width, height)` Source pixels. `margin_px` in [2, 256], `margin_ratio` in [0.125, 4]. |
 | `fallback` | `blur_source` (default), `hold_last_scanned` or `solid_fill`. There is no fail-open mode. `hold_last_scanned` re-emits the last frame released after a complete scan, exactly as released with its masks applied; it never emits the unscanned frame or an unmasked copy of an earlier one. When there is no such frame for the current source size and content (the first frames after the filter starts, or after the source is resized or switched), it applies `blur_source` instead; SPG-10 implements and tests this. |
 | `mask_style` | `blur`, `pixelate` or `solid_fill`. |
 
 The fuzzy and margin numbers are starting points. SPG-08 implemented the matcher
 that reads `fuzzy` ([policy.md](policy.md)) and kept these values; SPG-12 and
-SPG-09 tune them against the eval and update this page. `0` is a valid value for `lookahead_ms`,
-`hold_ms`, `margin_px` and `margin_ratio` and turns that protection off
-(`lookahead_ms: 0` leaves no retroactive window). Whether to impose a floor is
-open for SPG-09 and SPG-10 to settle against the eval.
+SPG-09 tune them against the eval and update this page, within these limits.
+
+Limits (SPG-08b; constants in `spg/policy_config.hpp`, decision in
+[agent-log.md](agent-log.md)). Zero used to be valid for `lookahead_ms`,
+`hold_ms` and both margins and switched that protection off. Each now has a
+floor below the plan default, so tuning can tighten a value but not remove it.
+
+| Limit | Value | Why |
+| --- | --- | --- |
+| `lookahead_ms` floor | 100 | Three frames at 30 fps, six at 60: below it there is no buffer to mask retroactively. A scan slower than the lookahead fails closed, so a short lookahead costs over-blur, not leaks. Matches the SPG-13 settings slider minimum. |
+| `retro_ms` floor | 100 | The same window: `retro_ms: 0` would detect a secret and never mask the frames before the detecting one. |
+| `hold_ms` floor | 400 | One detection cycle at the realtime p95 latency limit (`p95_detection_latency_ms_max = 400` in `eval/thresholds.toml`), so a mask stays on between two confirmations at the slowest accepted cadence. |
+| `margin_px` floor, cap | 2, 256 | Floor: half the default of 4, covering antialiased edge pixels and box error. Cap: rejects a typo such as `4000` for `4.0`. |
+| `margin_ratio` floor, cap | 0.125, 4 | Floor: half the default 0.25. Cap: a mask edge grows by at most four times the box's short side. |
+
+Every bound is exact in binary. The parser checks the parsed double before
+narrowing, so `1.9999999999` for `margin_px` is an error even though it
+rounds to `2.0F`. [`policy_config_floors.json`](../tests/fixtures/contracts/policy_config_floors.json)
+and [`policy_config_caps.json`](../tests/fixtures/contracts/policy_config_caps.json)
+sit on the bounds; [`policy_config_rejected.tsv`](../tests/fixtures/contracts/policy_config_rejected.tsv)
+lists configs every reader must reject, each with the field its error must name.
 
 ### Ground truth (one frame)
 

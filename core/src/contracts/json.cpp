@@ -3,8 +3,10 @@
 // exception text is never forwarded because it can quote the input.
 #include "spg/json.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -249,6 +251,12 @@ Json write_rect(const Rect& rect) {
   return Json{{"x", rect.x}, {"y", rect.y}, {"w", rect.width}, {"h", rect.height}};
 }
 
+std::string range_rule(double lo, double hi) {
+  std::array<char, 64> text{};
+  (void)std::snprintf(text.data(), text.size(), "must be in [%g, %g]", lo, hi);
+  return text.data();
+}
+
 std::string item_path(std::string_view key, std::size_t index) {
   return std::string(key) + "[" + std::to_string(index) + "]";
 }
@@ -295,17 +303,20 @@ PolicyConfig parse_policy_config(std::string_view json) {
     config.fuzzy.min_partial_chars = static_cast<std::uint32_t>(
         f.integer_or("min_partial_chars", 1, kUint32Max, config.fuzzy.min_partial_chars));
   }
-  config.lookahead = std::chrono::milliseconds{
-      r.integer_or("lookahead_ms", 0, kMaxLookahead.count(), config.lookahead.count())};
+  // Floors and caps: spg/policy_config.hpp. validate() below also rejects
+  // an empty "categories" and a retro_ms above lookahead_ms.
+  config.lookahead = std::chrono::milliseconds{r.integer_or(
+      "lookahead_ms", kMinLookahead.count(), kMaxLookahead.count(), config.lookahead.count())};
   // The retroactive window defaults to the whole lookahead (plan section 4).
-  config.retro = std::chrono::milliseconds{
-      r.integer_or("retro_ms", 0, kMaxLookahead.count(), config.lookahead.count())};
-  config.hold =
-      std::chrono::milliseconds{r.integer_or("hold_ms", 0, kMaxHold.count(), config.hold.count())};
-  config.margin_px =
-      r.float_number_or("margin_px", 0.0, kFloatMax, kNonNegativeFloat, config.margin_px);
+  config.retro = std::chrono::milliseconds{r.integer_or(
+      "retro_ms", kMinRetro.count(), kMaxLookahead.count(), config.lookahead.count())};
+  config.hold = std::chrono::milliseconds{
+      r.integer_or("hold_ms", kMinHold.count(), kMaxHold.count(), config.hold.count())};
+  config.margin_px = r.float_number_or("margin_px", kMinMarginPx, kMaxMarginPx,
+                                       range_rule(kMinMarginPx, kMaxMarginPx), config.margin_px);
   config.margin_ratio =
-      r.float_number_or("margin_ratio", 0.0, kFloatMax, kNonNegativeFloat, config.margin_ratio);
+      r.float_number_or("margin_ratio", kMinMarginRatio, kMaxMarginRatio,
+                        range_rule(kMinMarginRatio, kMaxMarginRatio), config.margin_ratio);
   if (r.find("fallback") != nullptr) {
     const std::optional<FallbackMode> mode = parse_fallback_mode(r.string("fallback"));
     if (!mode) {

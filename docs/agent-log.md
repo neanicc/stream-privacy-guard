@@ -369,3 +369,33 @@ Template:
   SPG-03's generator should emit NANP-valid phones (area code and exchange
   2-9, 3-3-4 grouping) or the scorer will count misses this validator rejects
   by design; postcodes and non-US address forms are not detected.
+
+## 2026-10-12 — SPG-08b Reject fail-open policy configs (#28)
+
+- Decision / change: `validate(PolicyConfig)` and `parse_policy_config` now
+  reject a config that would switch a protection off, so a caller must fail
+  closed (blur the source) instead of running unprotected. `"categories": []`
+  is an error with no opt-in (the plan defines none; stopping detection means
+  disabling the filter). Floors, all below the plan defaults so tuning can
+  tighten but not remove a protection: `lookahead_ms` >= 100 (3 frames at
+  30 fps, the SPG-13 slider minimum; a scan slower than the lookahead already
+  fails closed, so a short lookahead costs over-blur, not leaks); `retro_ms`
+  >= 100 (0 would detect without masking earlier frames); `hold_ms` >= 400
+  (one detection cycle at the realtime p95 latency limit of 400 ms in
+  `eval/thresholds.toml`); `margin_px` in [2, 256] and `margin_ratio` in
+  [0.125, 4] (floors are half the defaults 4 and 0.25; caps reject typos such
+  as 4000 for 4.0). Bounds are exact in binary and checked on the parsed
+  double before narrowing. Constants live in `spg/policy_config.hpp`.
+  `docs/contracts.md` documents the limits and that detectors take the
+  readback `FrameView` with the source size passed separately.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21):
+  `scripts/ci/run.sh build` and `test` pass, 108 ctest tests. New fixtures
+  `policy_config_floors.json`, `policy_config_caps.json` (accepted) and
+  `policy_config_rejected.tsv` (20 cases, each error must name its field);
+  struct-level `validate()` cases include NaN and infinite margins.
+- Eval delta: none; no pipeline stage reads these fields yet.
+- Open issues or follow-ups: SPG-10 must count a frame as scanned only through
+  a cycle on a frame at most `retro_ms` after it. The plugin must clamp to
+  these constants: SPG-15 (#37) clamps hold to [250, 10000] ms, so a hold
+  below 400 ms would be rejected and fail closed until its minimum is raised
+  to `kMinHold`; its lookahead minimum of 100 ms already matches.

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "lookahead_ms": 5000,
+  "retro_ms": 5000,
+  "hold_ms": 60000,
+  "margin_px": 256,
+  "margin_ratio": 4
+}
