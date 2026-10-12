@@ -1462,7 +1462,8 @@ Template:
   Mutation: dropping the models generation from the publish check (so the
   loader's hand-over is skipped) failed `plugin.loads`. Dev Mac (Apple M4,
   macOS 26.5.2): models loaded in the module in 260-293 ms on CoreML (warm
-  file cache); `scripts/ci/run.sh build` and `test` 299/299 passed.
+  file cache); `scripts/ci/run.sh build` and `test` 305/305 passed with
+  `main` at `8d409b5` merged.
 - Eval delta: not run. The core pipeline is unchanged (plugin-only change),
   `eval/run_eval.py` is not on `main` yet (PR #49), and the agent sandbox
   refuses the eval stage.
