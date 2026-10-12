@@ -21,11 +21,11 @@
 #include <thread>
 #include <vector>
 
-#include <cstdlib>
 #include <system_error>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "alloc_fault.hpp"
 #include "pipeline/frame_ring.hpp"
 #include "pipeline/host.hpp"
 #include "pipeline/mask_levels.hpp"
@@ -35,28 +35,6 @@
 #include "schedule_fakes.hpp"
 #include "spg/lookahead.hpp"
 #include "spg/scan.hpp"
-
-// Allocations of at least this many bytes throw std::bad_alloc while a test
-// sets it; nothing else changes about operator new.
-namespace {
-std::atomic<std::size_t> g_fail_alloc_from{SIZE_MAX};
-}  // namespace
-
-void* operator new(std::size_t size) {
-  if (size >= g_fail_alloc_from.load(std::memory_order_relaxed)) {
-    throw std::bad_alloc();
-  }
-  if (void* p = std::malloc(size == 0 ? 1 : size)) {
-    return p;
-  }
-  throw std::bad_alloc();
-}
-void operator delete(void* p) noexcept {
-  std::free(p);
-}
-void operator delete(void* p, std::size_t /*size*/) noexcept {
-  std::free(p);
-}
 
 namespace {
 
@@ -939,9 +917,9 @@ TEST_CASE("a release whose masks cannot be copied leaks no slot", "[plugin][pipe
   const spg::MaskRect one = r.plan.rects.front();
   r.plan.rects.assign(20'000, one);
   rig.scheduler->queue.push_back(std::move(r));
-  g_fail_alloc_from.store(sizeof(spg::MaskRect) * 10'000);
+  spg_test::fail_allocations_from(sizeof(spg::MaskRect) * 10'000);
   CHECK_THROWS_AS(rig.tick(1020), std::bad_alloc);
-  g_fail_alloc_from.store(SIZE_MAX);
+  spg_test::allow_allocations();
   // The released frame's slot went back to the ring; frames 2 and 3 are held.
   CHECK(rig.pipeline.ring().held() == 2);
   rig.scheduler->queue.push_back(clean_release(rig.scheduler->pushed[1]));

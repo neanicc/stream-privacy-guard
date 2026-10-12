@@ -82,7 +82,7 @@ spg_target_defaults(obs-spg-settings-tests)
 catch_discover_tests(obs-spg-settings-tests TEST_PREFIX "plugin.settings." DISCOVERY_MODE PRE_TEST)
 
 # Render pipeline with a fake GPU and a synchronous scheduler (SPG-14).
-add_executable(obs-spg-pipeline-tests tests/pipeline_test.cpp)
+add_executable(obs-spg-pipeline-tests tests/pipeline_test.cpp tests/alloc_fault.cpp)
 target_link_libraries(obs-spg-pipeline-tests PRIVATE obs-spg-pipeline Catch2::Catch2WithMain)
 target_include_directories(obs-spg-pipeline-tests PRIVATE "${PROJECT_SOURCE_DIR}/tests/unit")
 spg_target_defaults(obs-spg-pipeline-tests)
