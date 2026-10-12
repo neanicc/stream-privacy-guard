@@ -20,7 +20,11 @@ add_library(spg-core
   src/contracts/contracts.cpp
   src/contracts/json.cpp
   src/frame/frame_view.cpp
-  src/frame/geometry.cpp)
+  src/frame/geometry.cpp
+  src/policy/engine.cpp
+  src/policy/normalize.cpp
+  src/policy/pii.cpp
+  src/policy/watchlist.cpp)
 add_library(spg::core ALIAS spg-core)
 target_include_directories(spg-core PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>")
