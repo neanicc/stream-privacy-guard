@@ -129,9 +129,13 @@ struct SchedulerStats {
 //   * Hold: plan rects include Tracker::masks(t), so a detection stays masked
 //     for the hold; a resize or a late cycle only adds coverage, and a box
 //     from before a resize keeps its scaled margin.
-//   * A complete cycle whose result cannot be fully applied (an allocation
-//     or tracker failure, or a result from before more resizes than the size
-//     history holds) fails closed every frame it could have masked: buffered
+//   * Partial cycles: the detections of an incomplete result (found by the
+//     stages that finished before a failure) are held and masked
+//     retroactively like a complete cycle's, but the cycle covers no frame.
+//   * A cycle whose detections cannot be fully applied (an allocation
+//     or tracker failure, a result from before more resizes than the size
+//     history holds, or a scan that lost some of the boxes it found) fails
+//     closed every frame it could have masked: buffered
 //     frames from ts - retro on, frames pushed up to ts + hold, and the frame
 //     HoldLastScanned would show again.
 //   * Frames are released once each, in push order, never before
@@ -169,8 +173,11 @@ class Lookahead {
   // frames fail closed unless another cycle covers them.
   [[nodiscard]] std::optional<ScanJob> take_job() noexcept;
 
-  // Applies a finished job. An incomplete result covers nothing; a complete
-  // one that cannot be applied fails closed what it could have masked.
+  // Applies a finished job. An incomplete result covers nothing, but its
+  // detections are held and masked retroactively; a complete result, or an
+  // incomplete one with detections, that cannot be applied fails closed what
+  // it could have masked, as does one whose detections were lost
+  // (ScanResult::detections_lost).
   // Throws ContractError for a job that was not taken or was already
   // completed.
   void complete(const ScanJob& job, const ScanResult& result);
@@ -206,9 +213,10 @@ class Lookahead {
 
   [[nodiscard]] const FrameRecord* find_frame(Timestamp t) const noexcept;
   void apply(const ScanJob& job, const ScanResult& result);
-  // A complete result that cannot be applied: fails closed every frame it
-  // could have masked (buffered from ts - retro on, pushed up to ts + hold,
-  // and the frame HoldLastScanned would re-emit).
+  // A result that cannot be applied (complete, or partial with detections)
+  // or that lost detections: fails closed every frame it could have masked
+  // (buffered from ts - retro on, pushed up to ts + hold, and the frame
+  // HoldLastScanned would re-emit).
   void fail_closed(const ScanJob& job) noexcept;
   void add_retro(FrameRecord& frame, const Rect& rect) const;
   // The release gate (docs/scheduler.md, "Release rule"), the only place that
