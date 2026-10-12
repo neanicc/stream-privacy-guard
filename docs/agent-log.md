@@ -69,6 +69,86 @@ Template:
   later; OBS plugin builds may need the OpenCV libraries checked
   for position-independent code on Linux (SPG-13).
 
+## 2026-10-12 — SPG-04 Model manifest and runtime (#24)
+
+- Decision / change: `models/manifest.json` pins three ONNX models by URL,
+  size, SHA-256 and license: YuNet `face_detection_yunet_2023mar` (MIT,
+  Hugging Face `opencv/face_detection_yunet` at a commit), and PP-OCR English
+  mobile detection `en_PP-OCRv3_det_mobile` and recognition
+  `en_PP-OCRv4_rec_mobile` (Apache-2.0, RapidOCR v3.9.2 ONNX conversions on
+  ModelScope; the hashes equal RapidOCR's own `default_models.yaml`). This is
+  plan question 6's default; SPG-06/07/12 may swap variants (for example
+  PP-OCRv5) through the manifest. The recognizer embeds its character
+  dictionary in metadata key `character`, so no separate dictionary file is
+  pinned. `scripts/fetch_models.py` reuses `fetch_deps.py`'s download, hashing
+  and per-item OS lock, verifies size and SHA-256 on a temporary file before
+  moving it to `$SPG_CACHE_DIR/models/<name>/<version>/<file>`, deletes a
+  cached file that no longer matches, and has `--verify` (no download).
+  `run.sh setup` already called it, so CI fetches the models (about 10 MB)
+  into the cached `~/.cache/spg`.
+- Decision / change: `spg::runtime` (`core/src/runtime/`, target
+  `spg-runtime`) wraps ONNX Runtime behind a header with no ORT types.
+  `Session::open` tries providers in order (default: CoreML on macOS,
+  DirectML then CUDA on Windows, CUDA on Linux), skips ones the loaded build
+  lacks, treats a provider as working only after warmup runs succeed, then
+  falls back to CPU unless `cpu_fallback` is off. Failures are `RuntimeError`
+  with codes (`ModelNotFound`, `ModelLoadFailed`, `ProviderUnavailable`,
+  `InvalidInput`, `InferenceFailed`) and messages naming the model path,
+  provider attempts, tensor names and shapes, never tensor values. Dynamic
+  inputs need explicit warmup shapes (no guessed sizes). `run()` is const and
+  safe to call from several threads. CoreML uses MLProgram, compute units ALL
+  and `RequireStaticInputShapes=1`: without the last option the
+  dynamic-shape PP-OCR models spent 3.4 s (det) and 4.4 s (rec) compiling
+  for CoreML, logged an "unbounded dimension" error per layer and ran slower
+  than CPU (single runs: det 40.7 ms vs 23.6 ms, rec 22.0 ms vs 6.5 ms).
+- Decision / change (Windows GPU): keep the pinned CPU package on Windows in
+  this PR. DirectML is the vendor-neutral choice the plan names first, but
+  Microsoft's DirectML ONNX Runtime builds stop at 1.24.4 (NuGet
+  `Microsoft.ML.OnnxRuntime.DirectML`), so it would mean a second ORT version
+  on Windows or a move to Windows ML execution-provider plugins. ORT 1.30.0
+  does ship `win-x64-gpu_cuda12/13` zips, but they need NVIDIA GPUs plus a
+  user-installed CUDA and cuDNN. Neither can be validated on GPU-less CI
+  runners. The API already names `DirectMl` and `Cuda` (appended through
+  ORT's generic `"DML"` registration and `AppendExecutionProvider_CUDA`), so
+  packaging is a manifest and CMake change; proposed as a follow-up.
+- Evidence (automated, dev Mac: Apple M4, macOS 26.5.2, AppleClang 21):
+  `fetch_models.py` downloaded all three models and matched size and SHA-256;
+  second run reported all cached; `--verify` passed. `run.sh setup`,
+  `build`, `test`: 24/24 ctest tests pass, including 11 `runtime.*` cases
+  (tiny Mul models generated at build time by
+  `tests/integration/make_runtime_fixtures.py`, no binaries in Git) and
+  `scripts.fetch_models` (10 offline tests: hash and size mismatch refused
+  and nothing installed, corrupt cache replaced, unsafe names rejected,
+  manifest valid). A fresh build against a cache without models reports the
+  pinned-model case as Skipped; `-DSPG_WITH_DEPS=OFF` builds and passes
+  11 tests. Measurement on the M4 (scratch harness over this wrapper, 50
+  runs, constant 0.5 inputs, 3 warmup runs; not a `bench` result):
+  YuNet 640x640 CoreML median 2.79 ms (open+warmup 258 ms) vs CPU 4.62 ms;
+  det 640x640 CoreML-registered 24.4 ms vs CPU 23.6 ms; rec 48x320 5.5 ms vs
+  5.1 ms. With static-shape enforcement CoreML takes no PP-OCR nodes, so
+  those two run on CPU either way.
+- Review fixes: `warmup()` now checks every warmup shape against the model
+  (rank, fixed dimensions, positive dimensions, overflow-safe element count)
+  with the same helper as `run()` before allocating any buffer, so a wrong or
+  huge shape is `InvalidInput` instead of a multi-GB allocation; opening a
+  session with a moved-from `Environment`, or calling any member of a
+  moved-from `Session`, is `InvalidInput`, not a null dereference (so the
+  `Session` accessors are no longer `noexcept`). The default-provider tests
+  now check the recorded attempts
+  (earlier providers failed with a reason, the selected one is last) so a
+  listed GPU provider that fails on a machine is not a false failure; macOS
+  still requires CoreML. Dev Mac: 25/25 ctest tests, 12 `runtime.*` cases.
+- Eval delta: none (no pipeline yet; `run.sh eval` still prints
+  `THRESHOLDS: NOT RUN`).
+- Open issues or follow-ups: package a Windows GPU provider (DirectML via
+  1.24.4 or Windows ML, or CUDA) with a Windows GPU test machine; give the
+  PP-OCR detector fixed tile shapes (or ORT free-dimension overrides) so
+  CoreML can accelerate it (SPG-06/SPG-16); `Session::provider()` names the
+  registered provider, and ORT may still place unsupported nodes on CPU;
+  `run()` allocates its input values and copies every output per call, so
+  SPG-05/06 should measure that in `bench` and decide whether to add a
+  caller-owned-output (or `Ort::IoBinding`) overload.
+
 ## 2026-10-12 — SPG-02 Core contracts and geometry (#23)
 
 - Decision / change: plan section 5 types as headers in `core/include/spg/`

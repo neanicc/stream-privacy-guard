@@ -54,3 +54,35 @@ set_tests_properties(cli.rejects-no-arguments PROPERTIES WILL_FAIL TRUE)
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
 add_test(NAME scripts.fetch_deps
   COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_deps.py")
+
+# Model fetch script ---------------------------------------------------------------
+add_test(NAME scripts.fetch_models
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_models.py")
+
+# ONNX Runtime session wrapper ------------------------------------------------------
+if(SPG_WITH_DEPS)
+  # Tiny ONNX models generated at build time (no weights in Git) plus a listing
+  # of the pinned models in $SPG_CACHE_DIR, which the test skips when absent.
+  set(_spg_runtime_fixtures "${CMAKE_CURRENT_BINARY_DIR}/fixtures/runtime")
+  set(_spg_runtime_fixture_script "${CMAKE_CURRENT_SOURCE_DIR}/integration/make_runtime_fixtures.py")
+  add_custom_command(
+    OUTPUT "${_spg_runtime_fixtures}/scale_static.onnx" "${_spg_runtime_fixtures}/scale_dynamic.onnx"
+           "${_spg_runtime_fixtures}/not_a_model.onnx" "${_spg_runtime_fixtures}/models.txt"
+    COMMAND Python3::Interpreter -I "${_spg_runtime_fixture_script}"
+            --out "${_spg_runtime_fixtures}"
+            --manifest "${PROJECT_SOURCE_DIR}/models/manifest.json"
+            --cache "${SPG_CACHE_DIR}"
+    DEPENDS "${_spg_runtime_fixture_script}" "${PROJECT_SOURCE_DIR}/models/manifest.json"
+    COMMENT "Generating ONNX Runtime test fixtures"
+    VERBATIM)
+  add_custom_target(spg-runtime-fixtures
+    DEPENDS "${_spg_runtime_fixtures}/scale_static.onnx" "${_spg_runtime_fixtures}/models.txt")
+
+  add_executable(spg-runtime-tests integration/runtime_session_test.cpp)
+  add_dependencies(spg-runtime-tests spg-runtime-fixtures)
+  target_link_libraries(spg-runtime-tests PRIVATE spg::runtime Catch2::Catch2WithMain)
+  target_compile_definitions(spg-runtime-tests PRIVATE SPG_RUNTIME_FIXTURES="${_spg_runtime_fixtures}")
+  spg_target_defaults(spg-runtime-tests)
+  spg_copy_runtime_dlls(spg-runtime-tests)
+  catch_discover_tests(spg-runtime-tests TEST_PREFIX "runtime." DISCOVERY_MODE PRE_TEST)
+endif()
