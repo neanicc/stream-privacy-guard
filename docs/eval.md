@@ -69,6 +69,8 @@ These settle what the metric definitions leave open. The scorer is
 - Every key in a `[suite.*]` table other than `required_in`, `resolution` and
   `fps` must be `<metric>_min` or `<metric>_max` for a metric the scorer
   computes; anything else is an error, so a typo cannot silently drop a limit.
+  The check runs when the thresholds load, for every suite, including suites
+  the current mode skips.
 - Output lines and `report.*` hold metric values and counts only, never the
   text of a planted item.
 

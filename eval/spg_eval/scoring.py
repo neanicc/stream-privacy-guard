@@ -14,7 +14,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .contracts import Box, GroundTruthFrame, MaskPlan
+from .contracts import CATEGORIES, Box, GroundTruthFrame, MaskPlan
 
 # Keys in a [suite.*] table that are settings rather than metric limits.
 SUITE_SETTINGS = ("required_in", "resolution", "fps")
@@ -158,6 +158,12 @@ def suite_metrics(run: SuiteRun, tau: float) -> dict[str, Metric]:
     return metrics
 
 
+def known_metrics() -> set[str]:
+    """Every metric suite_metrics() can report, including the per-kind PII recalls."""
+    return set(suite_metrics(SuiteRun("", []), 1.0)) | {f"{k}_pair_recall" for k in CATEGORIES
+                                                         if k.startswith("pii:")}
+
+
 def load_thresholds(path: Path) -> dict:
     with open(path, "rb") as handle:
         data = tomllib.load(handle)
@@ -169,6 +175,7 @@ def load_thresholds(path: Path) -> dict:
     suites = data.get("suite")
     if not isinstance(suites, dict) or not suites:
         raise ScoreError(f"{path}: no [suite.*] tables")
+    metrics = known_metrics()
     for name, spec in suites.items():
         required = spec.get("required_in")
         if not isinstance(required, list) or any(m not in MODES for m in required):
@@ -178,6 +185,10 @@ def load_thresholds(path: Path) -> dict:
                 continue
             if not key.endswith(("_min", "_max")) or not isinstance(limit, (int, float)) or isinstance(limit, bool):
                 raise ScoreError(f"{path}: suite.{name}.{key} is not a numeric <metric>_min/_max limit")
+            # Checked here, not when the suite is scored, so a typo in a table
+            # that this mode skips still fails at once.
+            if key[:-4] not in metrics:
+                raise ScoreError(f"{path}: suite.{name}.{key}: unknown metric {key[:-4]!r}")
     return data
 
 

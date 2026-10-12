@@ -438,4 +438,7 @@ Template:
   pipeline runs. Docs call the scripts through `python3`. A fallback frame
   counts as covered in the text and faces suites with no fail-closed limit
   there; `docs/eval.md` records that the realtime suite must run in local
-  mode once SPG-11/16 land.
+  mode once SPG-11/16 land. `load_thresholds()` rejects unknown metric names
+  in every suite table, so a typo in the faces or realtime limits fails in ci
+  mode too. Follow-up for SPG-11: remove the `PipelineUnavailable` / `NOT RUN`
+  path in the PR that wires `spg-cli run`.

@@ -242,7 +242,10 @@ class VerdictTests(unittest.TestCase):
             for body in ('schema = 1\ncoverage_tau = 0.9\n[suite.text]\nrequired_in = ["ci"]\nwatchlist_recal_min = 1\n',
                          'schema = 1\ncoverage_tau = 0.9\n[suite.text]\nrequired_in = ["ci"]\nwatchlist_pair_recall = 1\n',
                          'schema = 1\ncoverage_tau = 1.5\n[suite.text]\nrequired_in = ["ci"]\n',
-                         'schema = 2\ncoverage_tau = 0.9\n[suite.text]\nrequired_in = ["ci"]\n'):
+                         'schema = 2\ncoverage_tau = 0.9\n[suite.text]\nrequired_in = ["ci"]\n',
+                         # A typo in a suite that ci mode skips must fail too, not wait for a local run.
+                         'schema = 1\ncoverage_tau = 0.9\n[suite.text]\nrequired_in = ["ci"]\n'
+                         '[suite.faces]\nrequired_in = ["local"]\nface_pair_recal_min = 0.9\n'):
                 path.write_text(body, encoding="utf-8")
                 with self.subTest(body=body), self.assertRaises(scoring.ScoreError):
                     scoring.evaluate(scoring.load_thresholds(path), {"text": self.run_for("noop")}, "ci")
