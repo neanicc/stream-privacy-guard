@@ -1,0 +1,39 @@
+Stream Privacy Guard (obs-spg) third-party notices
+==================================================
+
+obs-spg is free software under the GNU General Public License, version 2
+(obs-spg-LICENSE.txt), because it links against libobs. It is built with the
+components below. The full license texts are in the folders next to this file.
+Versions are pinned in deps/manifest.json and core/CMakeLists.txt of the
+source repository: https://github.com/neanicc/stream-privacy-guard
+
+ONNX Runtime 1.30.0 (Microsoft)
+  License: MIT. onnxruntime/LICENSE.txt
+  Notices for the components ONNX Runtime includes: onnxruntime/ThirdPartyNotices.txt
+  Ships as a separate library beside the module (onnxruntime.dll,
+  libonnxruntime.so.1, or Contents/Frameworks/libonnxruntime.1.dylib in the
+  macOS bundle) when the module uses it.
+  https://github.com/microsoft/onnxruntime
+
+OpenCV 4.9.0 (core, imgproc; minimal static build by the occ-ai OBS plugin project)
+  License: Apache License 2.0. opencv/LICENSE.txt
+  Licenses of the third-party code OpenCV bundles: opencv/3rdparty/
+  Linked statically into the module when the module uses it.
+  https://github.com/opencv/opencv
+  https://github.com/occ-ai/obs-backgroundremoval-dep-opencv
+
+nlohmann/json 3.12.0 (Niels Lohmann)
+  License: MIT. nlohmann-json/LICENSE.txt
+  Header-only; compiled into the module.
+  https://github.com/nlohmann/json
+
+Not included in this package
+  libobs and OBS Studio (GPL-2.0-or-later): provided by your OBS installation.
+  Microsoft Visual C++ 2015-2022 Redistributable (Windows: msvcp140.dll,
+  vcruntime140.dll, concrt140.dll): a system component that OBS Studio
+  requires to start; not redistributed with this plugin.
+  Catch2 (BSL-1.0): used only by the test suite.
+  Detection models (YuNet, MIT; PP-OCR via RapidOCR, Apache-2.0): fetched
+  separately by scripts/fetch_models.py into your user cache. A package built
+  with --with-models carries them in models/ with their licenses in
+  licenses/models/.
