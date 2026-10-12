@@ -23,7 +23,9 @@
 //   * A settings change starts a new scheduler; frames buffered by the old one
 //     still air with the old one's masks, and frames of the new one within the
 //     old hold of the switch are covered whole, since their held masks were in
-//     the old tracker.
+//     the old tracker. Once a newer generation has aired a frame, an older
+//     one's frames never air again (the picture never jumps back), and at
+//     most kMaxGenerations schedulers are live.
 //   * Schedulers are never destroyed here (their destructors wait for
 //     workers); they go to the `retire` callback.
 
@@ -60,6 +62,11 @@ class FrameScheduler {
   virtual void release_due(std::vector<ReleasedFrame>& out) = 0;
   virtual void mark_discontinuity() = 0;
   [[nodiscard]] virtual SchedulerStats stats() const = 0;
+
+ private:
+  friend class Reaper;
+  // The reaper's queue link, so retiring a scheduler never allocates.
+  std::unique_ptr<FrameScheduler> reaper_next_;
 };
 
 // spg::Scheduler (worker threads) behind FrameScheduler.
@@ -174,8 +181,10 @@ struct PipelineCounters {
   std::uint64_t released = 0;
   std::uint64_t readbacks = 0;         // readbacks handed to a scheduler
   std::uint64_t capture_failures = 0;  // frames kept without a texture
-  // Plans drawn, by Cover (Cover::None: clean). A plan repeated for a tick
-  // with no release is not counted again.
+  // Output frames drawn, by the Cover of the plan each tick ends with
+  // (Cover::None: clean). Frames released and replaced within the same tick
+  // never aired and are not counted; a plan repeated for a tick with no
+  // release is not counted again.
   std::array<std::uint64_t, kCoverCount> shown{};
 };
 
@@ -222,6 +231,11 @@ class Pipeline {
   // have changed unseen, so no earlier scan or re-emit stands in for it.
   static constexpr Duration kMaxTickGap = std::chrono::milliseconds{200};
   static constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
+  // Live scheduler generations: the current one and one still draining. A
+  // further settings change retires the draining one unless it is on screen
+  // (its frames then never air; the output is covered until the new one
+  // releases), so repeated changes cannot pile up worker threads or slots.
+  static constexpr std::size_t kMaxGenerations = 2;
 
  private:
   // A pushed frame as the pipeline recorded it; a release that does not
@@ -266,6 +280,8 @@ class Pipeline {
   void set_display(DrawPlan& next);
   void forget_last_clean() noexcept;
   void retire_drained();
+  void drop_buffered(Generation& gen) noexcept;
+  void count_display() noexcept;
   void retire(std::unique_ptr<FrameScheduler> scheduler) noexcept;
   void trim_idle() noexcept;
 
@@ -286,6 +302,10 @@ class Pipeline {
   std::uint64_t next_serial_ = 1;
   std::uint64_t live_serial_ = 0;  // serial of this tick's capture
   bool target_empty_ = false;
+  // The generation of the newest released frame put on screen; releases of
+  // older generations are dropped unseen.
+  std::uint64_t aired_generation_ = 0;
+  bool display_set_ = false;  // set_display() ran during this tick
   std::vector<ReleasedFrame> released_;
   PipelineCounters counters_;
   std::function<void()> adopt_fault_;

@@ -61,7 +61,10 @@ class ObsFrameGpu final : public FrameGpu {
   gs_texrender_t* readback_ = nullptr;
   std::array<gs_stagesurf_t*, 2> surfaces_{};
   std::array<Size, 2> surface_sizes_{};
-  std::vector<gs_texrender_t*> levels_;  // levels_[k - 1] holds level k
+  // levels_[k - 1] holds level k. Fixed size (top_level() of any 32-bit size
+  // is at most 32), so composing a frame never allocates and cannot throw
+  // while a texrender and a blend state are open.
+  std::array<gs_texrender_t*, 32> levels_{};
   gs_texrender_t* output_ = nullptr;
   gs_effect_t* effect_ = nullptr;
   bool effect_failed_ = false;

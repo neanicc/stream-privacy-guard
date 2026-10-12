@@ -83,6 +83,14 @@ and is drawn as opaque black when released.
   within the old hold of the switch are covered whole (`SettingsChanged`),
   because their held detections were in the old tracker. A debug overlay
   toggle does not restart the scheduler.
+- Once the new scheduler has aired a frame, the old one's remaining frames
+  never air and it is retired: with a shorter new lookahead they are older
+  than what is on screen, and the picture would jump back.
+- At most two schedulers are live (`Pipeline::kMaxGenerations`). Another
+  change while one is still draining retires the draining one unless it is
+  the one on screen; its frames never air and the output is covered
+  (`Stalled`) until the new one releases. Rapid slider changes cannot pile up
+  worker threads or ring slots.
 
 ## One consistent snapshot per frame
 
@@ -102,6 +110,8 @@ solid fill when there is nothing trustworthy to blur) and is unit-tested:
 | Frame times jump by more than 200 ms (filter disabled, source not rendered) or go backwards | Discontinuity: no earlier scan or re-emit stands in for the new content; the HoldLastScanned anchor is dropped |
 | 0x0 target | Nothing is drawn; held masks and buffered frames are kept; a discontinuity is marked when frames return |
 | A GPU call throws | Caught: the frame has no texture and is covered; no ring slot leaks |
+| Copying a released frame's masks fails (allocation) | The frame is solid; the slot it held goes back to the ring |
+| Composing the output fails | The output texrender and blend state are closed first, then the output is solid. Mask levels are a fixed array, so composing allocates nothing |
 | First frames | Covered whole until the scheduler releases a frame (`Starting`), or for good while no policy is set (`NoDetection`) |
 
 ## Threads and unload
@@ -109,7 +119,13 @@ solid fill when there is nothing trustworthy to blur) and is unit-tested:
 The render thread never takes the filter's settings lock; it takes a hand-off
 lock only to swap in a new scheduler. Schedulers are never destroyed on the
 render, video or UI thread: retired ones go to a reaper thread, whose
-destructor calls wait for their workers. The plugin builds schedulers with a
+destructor calls wait for their workers. Queueing one allocates nothing (the
+queue is linked through the schedulers); if the reaper thread cannot be
+started, the scheduler stays queued until a later retire starts it or unload
+destroys it. The render thread does take each scheduler's own lock in `push`
+and `release_due`, which a worker also holds while it applies a result
+(never while a stage runs); the cost is measured in the SPG-14 agent-log
+entry, and SPG-16 owns the p99 budget. The plugin builds schedulers with a
 one-hour `shutdown_timeout`, so a destructor joins its workers instead of
 detaching them, and `obs_module_unload` joins the reaper. When it returns, no
 scheduler thread is left running code from the module. A stage stuck for good
@@ -119,7 +135,9 @@ would hold OBS shutdown; detection stages have no unbounded wait today.
 
 - A covered frame is obvious on screen: the whole source is blurred or black.
 - The properties show how many frames aired with only their masks and how
-  many were covered whole, and the last reason. OBS's log gets one line when
+  many were covered whole (one count per output frame drawn; frames released
+  together after a pause, and skipped, are not counted), and the last
+  reason. OBS's log gets one line when
   the reason changes (at most one every 10 s), with the reason name only.
 - **Debug overlay** (off by default, and it airs too): green outlines on mask
   rects, and for a covered frame a square in the top-left corner coloured by

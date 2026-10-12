@@ -21,6 +21,9 @@
 #include <thread>
 #include <vector>
 
+#include <cstdlib>
+#include <system_error>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include "pipeline/frame_ring.hpp"
@@ -32,6 +35,28 @@
 #include "schedule_fakes.hpp"
 #include "spg/lookahead.hpp"
 #include "spg/scan.hpp"
+
+// Allocations of at least this many bytes throw std::bad_alloc while a test
+// sets it; nothing else changes about operator new.
+namespace {
+std::atomic<std::size_t> g_fail_alloc_from{SIZE_MAX};
+}  // namespace
+
+void* operator new(std::size_t size) {
+  if (size >= g_fail_alloc_from.load(std::memory_order_relaxed)) {
+    throw std::bad_alloc();
+  }
+  if (void* p = std::malloc(size == 0 ? 1 : size)) {
+    return p;
+  }
+  throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept {
+  std::free(p);
+}
+void operator delete(void* p, std::size_t /*size*/) noexcept {
+  std::free(p);
+}
 
 namespace {
 
@@ -652,7 +677,8 @@ class ScriptedScheduler final : public spg::plugin::FrameScheduler {
     return next_id;
   }
   void release_due(std::vector<spg::ReleasedFrame>& out) override {
-    out.insert(out.end(), queue.begin(), queue.end());
+    // Moved, not copied: a test can fail one allocation in the pipeline.
+    out.insert(out.end(), std::make_move_iterator(queue.begin()), std::make_move_iterator(queue.end()));
     queue.clear();
   }
   void mark_discontinuity() override { ++discontinuities; }
@@ -691,6 +717,17 @@ struct ScriptedRig {
   Pipeline pipeline{gpu, 16, [this](std::unique_ptr<spg::plugin::FrameScheduler> s) { retired.push_back(std::move(s)); }};
   ScriptedScheduler* scheduler = nullptr;
 };
+
+// Adopts a new ScriptedScheduler generation at `ms`.
+ScriptedScheduler* adopt_scripted(Pipeline& pipeline, std::int64_t ms) {
+  auto owned = std::make_unique<ScriptedScheduler>();
+  ScriptedScheduler* out = owned.get();
+  spg::plugin::PipelineSpec spec;
+  spec.scheduler = std::move(owned);
+  spec.fallback = FallbackMode::HoldLastScanned;
+  pipeline.adopt(spec, at_ms(ms));
+  return out;
+}
 
 }  // namespace
 
@@ -811,6 +848,104 @@ TEST_CASE("a GPU call that throws covers the frame and leaks nothing", "[plugin]
   const DrawPlan& next = rig.tick(1020);
   CHECK(next.kind == DrawKind::Solid);
   CHECK(next.cover == Cover::NoTexture);
+}
+
+TEST_CASE("an older generation never airs once a newer one has", "[plugin][pipeline][drift]") {
+  ScriptedRig rig;
+  rig.tick(1000);
+  rig.tick(1010);
+  ScriptedScheduler* old = rig.scheduler;
+  // The new settings have a shorter lookahead: the new generation's first
+  // frame comes due on the same tick as the old one's first.
+  ScriptedScheduler* fresh = adopt_scripted(rig.pipeline, 1015);
+  rig.tick(1020);
+  old->queue.push_back(clean_release(old->pushed[0]));
+  fresh->queue.push_back(clean_release(fresh->pushed[0]));
+  const DrawPlan aired = rig.tick(1030);
+  REQUIRE(aired.kind == DrawKind::Masked);
+  // A skipped render leaves the new generation nothing due on the next tick
+  // while the old one's next (older) frame comes due: it must not air.
+  old->queue.push_back(clean_release(old->pushed[1]));
+  const DrawPlan& next = rig.tick(1040);
+  CHECK(next.kind == DrawKind::Masked);
+  CHECK(next.slot == aired.slot);
+  CHECK(next.serial == aired.serial);
+  // The old generation is retired at once, its buffered frame's slot freed.
+  CHECK(rig.pipeline.generations() == 1);
+  REQUIRE(rig.retired.size() == 1);
+  CHECK(rig.retired[0].get() == old);
+}
+
+TEST_CASE("repeated settings changes keep at most two generations live", "[plugin][pipeline][drift]") {
+  SECTION("nothing aired yet: the newest two are kept") {
+    ScriptedRig rig;
+    rig.tick(1000);  // every generation buffers a frame and none drains
+    for (std::int64_t i = 0; i < 5; ++i) {
+      adopt_scripted(rig.pipeline, 1005 + 10 * i);
+      CHECK(rig.pipeline.generations() <= Pipeline::kMaxGenerations);
+      rig.tick(1010 + 10 * i);
+      CHECK(rig.pipeline.generations() <= Pipeline::kMaxGenerations);
+    }
+    CHECK(rig.retired.size() == 4);
+    // Held slots: the two live generations' buffered frames (one is on screen).
+    CHECK(rig.pipeline.ring().held() == 2);
+  }
+  SECTION("the generation on screen is kept, the one between is retired") {
+    ScriptedRig rig;
+    rig.tick(1000);
+    rig.tick(1010);
+    ScriptedScheduler* first = rig.scheduler;
+    first->queue.push_back(clean_release(first->pushed[0]));
+    REQUIRE(rig.tick(1020).kind == DrawKind::Masked);
+    ScriptedScheduler* second = adopt_scripted(rig.pipeline, 1025);
+    rig.tick(1030);
+    adopt_scripted(rig.pipeline, 1035);
+    CHECK(rig.pipeline.generations() == 2);
+    REQUIRE(rig.retired.size() == 1);
+    CHECK(rig.retired[0].get() == second);
+    // The first generation still airs its buffered frames.
+    first->queue.push_back(clean_release(first->pushed[1]));
+    const DrawPlan& plan = rig.tick(1040);
+    CHECK(plan.kind == DrawKind::Masked);
+    CHECK(plan.cover == Cover::None);
+  }
+}
+
+TEST_CASE("frames released and replaced within one tick are not counted as aired", "[plugin][pipeline]") {
+  ScriptedRig rig;
+  rig.tick(1000);
+  rig.tick(1010);
+  rig.tick(1020);
+  const auto& shown = rig.pipeline.counters().shown;
+  CHECK(shown[static_cast<std::size_t>(Cover::Starting)] == 3);
+  // Rendering paused: three frames come due on one tick; one output frame airs.
+  for (const ScriptedScheduler::Pushed& p : rig.scheduler->pushed) {
+    rig.scheduler->queue.push_back(clean_release(p));
+  }
+  REQUIRE(rig.tick(1030).kind == DrawKind::Masked);
+  CHECK(shown[static_cast<std::size_t>(Cover::None)] == 1);
+  CHECK(rig.pipeline.counters().released == 3);
+  // A tick that only repeats the plan is not counted.
+  rig.tick(1040);
+  CHECK(shown[static_cast<std::size_t>(Cover::None)] == 1);
+}
+
+TEST_CASE("a release whose masks cannot be copied leaks no slot", "[plugin][pipeline][drift]") {
+  ScriptedRig rig;
+  rig.tick(1000);
+  rig.tick(1010);
+  REQUIRE(rig.pipeline.ring().held() == 2);  // two buffered frames, one on screen
+  spg::ReleasedFrame r = clean_release(rig.scheduler->pushed[0]);
+  const spg::MaskRect one = r.plan.rects.front();
+  r.plan.rects.assign(20'000, one);
+  rig.scheduler->queue.push_back(std::move(r));
+  g_fail_alloc_from.store(sizeof(spg::MaskRect) * 10'000);
+  CHECK_THROWS_AS(rig.tick(1020), std::bad_alloc);
+  g_fail_alloc_from.store(SIZE_MAX);
+  // The released frame's slot went back to the ring; frames 2 and 3 are held.
+  CHECK(rig.pipeline.ring().held() == 2);
+  rig.scheduler->queue.push_back(clean_release(rig.scheduler->pushed[1]));
+  CHECK(rig.tick(1030).kind == DrawKind::Masked);
 }
 
 // --- The hand-off between the settings side and the render thread.
@@ -1100,6 +1235,48 @@ TEST_CASE("the reaper destroys schedulers off the calling thread and joins on sh
   // After shutdown, a retired scheduler is destroyed on the caller.
   reaper.retire(std::make_unique<Probe>(&where[2]));
   CHECK(where[2] == std::this_thread::get_id());
+}
+
+TEST_CASE("the reaper keeps a scheduler queued when its thread cannot start", "[plugin][pipeline]") {
+  struct Probe final : spg::plugin::FrameScheduler {
+    explicit Probe(std::thread::id* where) : where_(where) {}
+    ~Probe() override { *where_ = std::this_thread::get_id(); }
+    [[nodiscard]] bool wants_scan(Timestamp) const override { return false; }
+    spg::FrameId push(Timestamp, Size, std::shared_ptr<const spg::OwnedFrame>) override { return 0; }
+    void release_due(std::vector<spg::ReleasedFrame>&) override {}
+    void mark_discontinuity() override {}
+    [[nodiscard]] spg::SchedulerStats stats() const override { return {}; }
+    std::thread::id* where_;
+  };
+  SECTION("the next retire starts it") {
+    std::array<std::thread::id, 2> where{};
+    spg::plugin::Reaper reaper;
+    int failures = 1;
+    reaper.set_start_fault([&failures] {
+      if (failures-- > 0) {
+        throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+      }
+    });
+    reaper.retire(std::make_unique<Probe>(&where[0]));
+    CHECK(where[0] == std::thread::id{});  // not destroyed on the caller
+    CHECK(reaper.pending() == 1);
+    reaper.retire(std::make_unique<Probe>(&where[1]));
+    reaper.shutdown();
+    CHECK(reaper.pending() == 0);
+    CHECK(where[0] != std::thread::id{});
+    CHECK(where[0] != std::this_thread::get_id());
+    CHECK(where[1] == where[0]);
+  }
+  SECTION("shutdown destroys what never left") {
+    std::thread::id where{};
+    spg::plugin::Reaper reaper;
+    reaper.set_start_fault([] { throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again)); });
+    reaper.retire(std::make_unique<Probe>(&where));
+    CHECK(where == std::thread::id{});
+    reaper.shutdown();
+    CHECK(where == std::this_thread::get_id());
+    CHECK(reaper.pending() == 0);
+  }
 }
 
 // Not run by ctest ([.] hides it): render-thread cost of the scheduler calls

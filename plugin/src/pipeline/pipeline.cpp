@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <utility>
 
 namespace spg::plugin {
@@ -42,6 +43,20 @@ void reset(DrawPlan& plan) noexcept {
 bool drawable_rect(const MaskRect& rect) noexcept {
   return rect.box.space == Space::Source && is_valid(rect.box.rect);
 }
+
+// Drops one hold on a ring slot at scope exit, also when an exception leaves
+// the scope, so a hold taken over from the buffer is never lost.
+class SlotHold {
+ public:
+  SlotHold(FrameRing& ring, std::size_t slot) noexcept : ring_(ring), slot_(slot) {}
+  ~SlotHold() { ring_.release(slot_); }  // ignores Pipeline::kNoSlot
+  SlotHold(const SlotHold&) = delete;
+  SlotHold& operator=(const SlotHold&) = delete;
+
+ private:
+  FrameRing& ring_;
+  std::size_t slot_;
+};
 
 }  // namespace
 
@@ -91,8 +106,8 @@ void Pipeline::retire(std::unique_ptr<FrameScheduler> scheduler) noexcept {
     retire_(std::move(scheduler));
   } catch (...) {
     // The callback could not take it; `scheduler` (if still held) is
-    // destroyed here, which waits for its workers. Only on a failed
-    // allocation.
+    // destroyed here, which waits for its workers. The plugin's callback
+    // (Reaper::retire) never throws and never allocates.
   }
 }
 
@@ -143,6 +158,7 @@ const DrawPlan& Pipeline::tick(Timestamp t, Size source) {
   }
   last_tick_ = t;
   ++counters_.ticks;
+  display_set_ = false;
   trim_idle();
   Generation& current = gens_.back();
 
@@ -169,6 +185,7 @@ const DrawPlan& Pipeline::tick(Timestamp t, Size source) {
     set_display(next_);
     last_release_.reset();
     retire_drained();
+    count_display();
     return display_;
   }
   if (target_empty_) {
@@ -215,6 +232,15 @@ const DrawPlan& Pipeline::tick(Timestamp t, Size source) {
       // so covered) on a later tick.
     }
     for (const ReleasedFrame& frame : released_) {
+      if (gen.id < aired_generation_) {
+        // A newer generation has aired: this older content never airs again
+        // (the picture would jump back by the difference in lookahead).
+        ++counters_.released;
+        release_buffered(gen, frame.id);
+        continue;
+      }
+      // Of several frames released in one tick only the last is drawn; the
+      // earlier ones are skipped, never aired (their plans are replaced).
       show_released(gen, frame);
       released = true;
     }
@@ -234,6 +260,7 @@ const DrawPlan& Pipeline::tick(Timestamp t, Size source) {
     ring_.release(*slot);  // the display holds it if it shows it
   }
   retire_drained();
+  count_display();
   return display_;
 }
 
@@ -323,6 +350,9 @@ void Pipeline::show_released(Generation& gen, const ReleasedFrame& frame) {
   const std::optional<Buffered> entry = take_buffered(gen, frame.id);
   const std::size_t slot = entry ? entry->slot : kNoSlot;
   const std::uint64_t serial = entry ? entry->serial : 0;
+  // The buffer's hold, dropped once the display has retained the slot (or
+  // when copying the masks below throws).
+  const SlotHold buffer_hold(ring_, slot);
   reset(next_);
   next_.frame = frame.source;
   // The release must describe the frame the pipeline buffered under that id;
@@ -390,9 +420,7 @@ void Pipeline::show_released(Generation& gen, const ReleasedFrame& frame) {
     next_.cover = Cover::NoTexture;
   }
   set_display(next_);
-  if (slot != kNoSlot) {
-    ring_.release(slot);  // the buffer's hold
-  }
+  aired_generation_ = std::max(aired_generation_, gen.id);
 }
 
 void Pipeline::cover_whole(DrawPlan& next, std::size_t slot, std::uint64_t serial, Size size,
@@ -440,9 +468,16 @@ void Pipeline::set_display(DrawPlan& next) {
       display_.reemit = false;
     }
   }
-  if (display_.kind != DrawKind::Nothing) {
+  display_set_ = true;
+}
+
+void Pipeline::count_display() noexcept {
+  // Once per tick, for the plan the tick ends with: plans replaced within the
+  // tick never aired.
+  if (display_set_ && display_.kind != DrawKind::Nothing) {
     ++counters_.shown[static_cast<std::size_t>(display_.cover)];
   }
+  display_set_ = false;
 }
 
 void Pipeline::forget_last_clean() noexcept {
@@ -453,11 +488,30 @@ void Pipeline::forget_last_clean() noexcept {
 }
 
 void Pipeline::retire_drained() {
-  // Every generation but the current one leaves once its frames have aired.
-  while (gens_.size() > 1 && gens_.front().buffered.empty()) {
-    retire(std::move(gens_.front().scheduler));
-    gens_.pop_front();
+  // Every generation but the current one leaves once its frames have aired,
+  // once a newer generation has aired (its frames never will), or while more
+  // than kMaxGenerations are live and it is not the one on screen.
+  std::size_t live = gens_.size();
+  auto it = gens_.begin();
+  while (live > 1 && it != std::prev(gens_.end())) {
+    const bool behind = it->id < aired_generation_;
+    const bool excess = live > kMaxGenerations && it->id != aired_generation_;
+    if (it->buffered.empty() || behind || excess) {
+      drop_buffered(*it);
+      retire(std::move(it->scheduler));
+      it = gens_.erase(it);
+      --live;
+    } else {
+      ++it;
+    }
   }
+}
+
+void Pipeline::drop_buffered(Generation& gen) noexcept {
+  for (const Buffered& entry : gen.buffered) {
+    ring_.release(entry.slot);  // ignores kNoSlot
+  }
+  gen.buffered.clear();
 }
 
 void Pipeline::trim_idle() noexcept {

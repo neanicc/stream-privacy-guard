@@ -1185,3 +1185,27 @@ Template:
   draw exactly the planned kind; 10 mutations (one per rule, plus losing the
   spec on a failed adopt) each failed a test; the threaded hand-off race
   case passed 20 repeated runs.
+- Review fixes (Greptile threads on `ceea871`, after merging `main` at
+  `cc5da96`): (1) after a settings change that shortens the lookahead, an
+  old generation's frame could air after a newer one's (a skipped render
+  left the new generation nothing due), so the picture jumped back; now,
+  once a newer generation has aired, older releases are dropped and that
+  generation is retired. (2) Live generations are capped at two (current
+  plus one draining, keeping the one on screen), so rapid settings changes
+  cannot pile up workers or ring slots. (3) The aired counters count the
+  plan each tick ends with, not every frame released in a tick. (4) A
+  released frame's slot is held by a scope guard, so a failed mask copy no
+  longer leaks it. (5) The reaper queue is linked through the schedulers
+  (no allocation) and a failed thread start leaves the scheduler queued
+  instead of destroying it on the render thread. (6) The GPU mask levels
+  are a fixed array and `draw` closes its texrender and blend state if
+  composing throws (`render()` is `noexcept`, so a throw used to terminate
+  OBS). Declined: making `push`/`release_due` lock-free. They take the
+  scheduler's lock for bookkeeping, and a worker holds it only to apply a
+  result, never during inference. This is the SPG-10 contract in
+  `scheduler.md`; its cost is measured above, and SPG-16 owns the p99.
+  Evidence: 5 new `plugin.pipeline.*` cases (287/287 ctest tests pass on
+  the dev Mac); 5 mutations, one per fix (1) to (5), each failed a test.
+  The drop and the retire of older generations back each other up, so (1)
+  reverts both. The GPU change needs a graphics context and is
+  covered only by the live check.

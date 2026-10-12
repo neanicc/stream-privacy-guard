@@ -261,8 +261,8 @@ void ObsFrameGpu::fill(float x, float y, float width, float height, std::uint32_
 }
 
 gs_texture_t* ObsFrameGpu::build_chain(gs_texture_t* base, Size frame, std::uint32_t level) {
-  if (levels_.size() < level) {
-    levels_.resize(level, nullptr);
+  if (level > levels_.size()) {
+    return nullptr;  // cannot happen for a 32-bit size (top_level() <= 32)
   }
   gs_texture_t* below = base;
   for (std::uint32_t k = 1; k <= level && below != nullptr; ++k) {
@@ -366,13 +366,19 @@ void ObsFrameGpu::draw(const DrawPlan& plan, Size output, bool overlay) {
   // sharp copy; then draw the result like any filter output.
   gs_blend_state_push();
   gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-  const bool begun = begin_target(output_, output);
-  if (begun) {
-    compose(plan, kind, output, overlay);
+  bool composed_ok = false;
+  if (begin_target(output_, output)) {
+    try {
+      compose(plan, kind, output, overlay);
+      composed_ok = true;
+    } catch (...) {
+      // Nothing in compose() allocates today; if it ever throws, the target
+      // and blend state are still closed below and the output is solid.
+    }
     gs_texrender_end(output_);
   }
   gs_blend_state_pop();
-  gs_texture_t* composed = begun ? gs_texrender_get_texture(output_) : nullptr;
+  gs_texture_t* composed = composed_ok ? gs_texrender_get_texture(output_) : nullptr;
   if (composed == nullptr) {
     draw_solid(output);
     return;
