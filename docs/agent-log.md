@@ -1650,7 +1650,11 @@ Template:
   check, and a library loaded only by another shipped one counts as used.
   Windows ONNX Runtime 1.30.0 imports `SETUPAPI.dll`, now allow-listed as
   an OS DLL. Checked against the pinned ONNX Runtime binaries of all three
-  OSes: no problems.
+  OSes: no problems. `scripts.package_tool` now has 25 cases, including ONNX
+  Runtime imported but not shipped (Linux and Windows fixtures, and a whole
+  `check()` on PE files), the guard against the install's link walk missing
+  it. CI on `bb191c5`: the package check passed on all three OSes with ONNX
+  Runtime beside the module.
 - Open issues or follow-ups: no live OBS install from a package has been
   done; the live check should install from the CI artifact rather than the
   build tree.

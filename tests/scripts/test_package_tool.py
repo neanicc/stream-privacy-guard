@@ -102,6 +102,18 @@ class DependencyTest(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("onnxruntime.dll", problems[0])
 
+    def test_onnx_runtime_imported_but_not_shipped_fails(self):
+        # The guard against SpgInstall.cmake's link walk missing ONNX Runtime:
+        # the module imports it and the package does not carry it.
+        linux = Imports(["libobs.so.0", "libc.so.6", "libonnxruntime.so.1"], ["$ORIGIN"])
+        self.assertEqual(problems_for("linux-x64", linux, []),
+                         ["imports libonnxruntime.so.1, which the package does not ship "
+                          "and OBS or the OS does not provide"])
+        windows = Imports(["obs.dll", "KERNEL32.dll", "onnxruntime.dll"])
+        self.assertEqual(problems_for("windows-x64", windows, []),
+                         ["imports onnxruntime.dll, which the package does not ship "
+                          "and OBS or the OS does not provide"])
+
     def test_unknown_library_fails(self):
         problems = problems_for("windows-x64", Imports(["obs.dll", "opencv_world490.dll"]), [])
         self.assertEqual(len(problems), 1)
@@ -258,6 +270,10 @@ class LayoutTest(unittest.TestCase):
         write(layout.module, make_pe(["obs.dll", "onnxruntime.dll", "CONCRT140.dll"], []))
         ort = write(layout.lib_dir / "onnxruntime.dll", make_pe(["KERNEL32.dll", "SETUPAPI.dll"], []))
         self.assertEqual(package_tool.check(layout, self.manifest, False), [])
+        ort.unlink()
+        self.assertEqual(package_tool.check(layout, self.manifest, False),
+                         ["imports onnxruntime.dll, which the package does not ship "
+                          "and OBS or the OS does not provide"])
         write(ort, make_pe(["KERNEL32.dll", "onnxruntime_providers_shared.dll"], []))
         problems = package_tool.check(layout, self.manifest, False)
         self.assertEqual(len(problems), 1, problems)
