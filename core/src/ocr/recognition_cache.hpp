@@ -24,15 +24,25 @@
 // per-entry bound is not cached. A full cache only makes misses: every miss
 // is read again, nothing is skipped.
 //
-// The cache holds recognized text (Secret) and crop pixels in memory only and
-// is not synchronized: one worker owns it.
+// The cache holds recognized text and crop pixels in memory only and is not
+// synchronized: one worker owns it. Text is stored only as Secret (protected
+// memory, zeroed when released). Crop pixels are a picture of on-screen text,
+// so a Fingerprint zeroes its pixels before it frees them, and the cache
+// zeroes each one it holds when the entry expires, is replaced, erased or
+// evicted, when a store refuses it, and when the cache is destroyed
+// (SPG-15d). The pixels stay in ordinary memory: up to max_bytes of
+// SecureHeap regions would use up the locked-memory limit and, on Windows,
+// the 512 crash-dump exclusions that keep watch-list text out of dumps
+// (docs/policy.md, "Recognized text in memory").
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ocr/text_recognizer.hpp"
@@ -60,11 +70,30 @@ struct RecognitionCacheConfig {
 // (negative max_age, or a zero capacity or byte bound).
 void validate(const RecognitionCacheConfig& config);
 
-// What a region looked like when it was read: its whole readback crop.
+// What a region looked like when it was read: its whole readback crop. The
+// pixels show on-screen text, so a Fingerprint zeroes the bytes it owns (its
+// unused capacity included) before it releases them: when destroyed, when
+// assigned over and on wipe(). A moved-from Fingerprint is empty.
 struct Fingerprint {
   Size crop;  // readback crop size in pixels; zero when outside the frame
   std::vector<std::uint8_t> pixels;  // packed BGR, crop.width * crop.height * 3
-  friend bool operator==(const Fingerprint&, const Fingerprint&) = default;
+
+  Fingerprint() noexcept = default;
+  Fingerprint(Size crop_size, std::vector<std::uint8_t> bgr) noexcept : crop(crop_size), pixels(std::move(bgr)) {}
+  Fingerprint(const Fingerprint& other) = default;
+  Fingerprint(Fingerprint&& other) noexcept
+      : crop(std::exchange(other.crop, Size{})), pixels(std::move(other.pixels)) {}
+  Fingerprint& operator=(const Fingerprint& other);
+  Fingerprint& operator=(Fingerprint&& other) noexcept;
+  ~Fingerprint();
+
+  // Zeroes every pixel byte, then empties the fingerprint (the zeroed memory
+  // stays allocated for reuse until it is destroyed).
+  void wipe() noexcept;
+
+  friend bool operator==(const Fingerprint& a, const Fingerprint& b) noexcept {
+    return a.crop == b.crop && a.pixels == b.pixels;
+  }
 };
 
 // The fingerprint of a Source-space region of `frame` (Readback pixels of a
@@ -79,6 +108,13 @@ struct Fingerprint {
 class RecognitionCache {
  public:
   explicit RecognitionCache(const RecognitionCacheConfig& config = {});
+  // Wipes every fingerprint it still holds.
+  ~RecognitionCache();
+  // One worker owns a cache; it is never copied or moved.
+  RecognitionCache(const RecognitionCache&) = delete;
+  RecognitionCache& operator=(const RecognitionCache&) = delete;
+  RecognitionCache(RecognitionCache&&) = delete;
+  RecognitionCache& operator=(RecognitionCache&&) = delete;
 
   // The text read for `track`, when it was read no more than max_age before
   // `now` (and not after it) from exactly the content `print` holds; nothing
@@ -98,6 +134,12 @@ class RecognitionCache {
   [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
   [[nodiscard]] const RecognitionCacheConfig& config() const noexcept { return config_; }
 
+  // Test hook: called with a fingerprint's pixel bytes right after the cache
+  // wiped them and before they are freed. Must not touch this cache. An
+  // exception it throws is swallowed, so cleanup always finishes.
+  using WipeObserver = std::function<void(const std::uint8_t* pixels, std::size_t bytes)>;
+  void set_wipe_observer(WipeObserver observer) { observer_ = std::move(observer); }
+
  private:
   struct Entry {
     Fingerprint print;
@@ -107,11 +149,14 @@ class RecognitionCache {
   };
   [[nodiscard]] bool expired(const Entry& entry, Timestamp now) const;
   void drop(std::unordered_map<TrackId, Entry>::iterator it);
+  // Wipes pixels the cache owned and tells the observer.
+  void release(Fingerprint& print) noexcept;
 
   RecognitionCacheConfig config_;
   std::unordered_map<TrackId, Entry> entries_;
   std::list<TrackId> lru_;  // most recently used first
   std::size_t bytes_ = 0;
+  WipeObserver observer_;
 };
 
 // A text region and the track it belongs to.
@@ -131,7 +176,9 @@ struct CacheStats {
 // batched recognize() call, and the cache is updated only after it succeeds.
 // Returns one TextHit per region, in order (verdict empty, for the policy).
 // Throws like TextRecognizer::recognize(); the cache is unchanged then, so the
-// frame fails closed and the next cycle reads the regions again.
+// frame fails closed and the next cycle reads the regions again. Fingerprints
+// taken here that the cache does not keep are wiped before the call returns
+// or throws.
 [[nodiscard]] std::vector<TextHit> recognize_tracks(const TextRecognizer& recognizer, RecognitionCache& cache,
                                                     const FrameView& frame, Size source,
                                                     std::span<const TrackedRegion> regions,

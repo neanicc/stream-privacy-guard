@@ -86,6 +86,8 @@ copies `evaluate()` makes of recognized text and the PII digit views use the
 same heap through `SecureAllocator`. What each OS covers, and the copies that
 remain outside it (short-string buffers on the stack, OBS and Qt copies of the
 typed entry), are in [settings.md](settings.md#watch-list-text-in-memory).
+Recognized text is covered from decoding to the verdict; see
+[Recognized text in memory](#recognized-text-in-memory).
 
 `evaluate()` costs O(entries × entry length × text length) per call, with up to
 three passes per entry, and has no length cap of its own. It is meant for a
@@ -108,3 +110,66 @@ example at `vm.max_map_count`). `mlock` and dump exclusion are best effort;
 mapping is not. The caller must catch it and treat the frame as not scanned,
 so the configured fallback applies (default: blur the whole source). An
 exception from the policy stage must never let an unscanned frame through.
+
+## Recognized text in memory
+
+OCR output can hold the very secrets the filter hides, so since SPG-15d it
+gets the same protection as watch-list entries (`SecureHeap`: kept out of
+crash dumps where the OS allows, locked in RAM where it can, zeroed on
+release) from the moment it is decoded until the verdict:
+
+| Copy | Where |
+| --- | --- |
+| Text of one read job, as CTC decoding appends it | `ocr::SecureText`, a `std::vector<char, SecureAllocator<char>>`: every byte is in the heap block (a vector has no short-string buffer). A decode error zeroes what it appended |
+| A region's views joined by spaces and newlines | `ocr::SecureText` |
+| `Recognition::text`, `CtcResult::text`, the recognition cache's entries, `TextHit::text`, what `spg::TextRecognizer::recognize()` returns to `run_scan()` | `Secret` |
+| The model's output probabilities (`runtime::Tensor::data`; the most probable class per step spells the text) | Ordinary memory, zeroed once the batch is decoded or fails |
+| Folded, matching and reversed forms in `PolicyEngine::evaluate()` | `SecureU32String` |
+| Recognition cache fingerprints (crop pixels) | Ordinary memory, zeroed before release: `Fingerprint` zeroes its pixels when destroyed or assigned over, and the cache zeroes each one when the entry is replaced, erased, expires, is evicted or refused, and when the cache is destroyed |
+
+The scan path adds no copy: `run_scan()` (`core/src/schedule/scan.cpp`) gets
+a `std::vector<Secret>` from the recognizer stage, compares each one's size
+with `max_text_bytes` and passes it to the policy by reference;
+`recognize_tracks()` moves each `Secret` into its `TextHit`. Neither logs nor
+keeps text. The tests prove it with the heap's wipe observer: a decode buffer
+is a block of the process heap and is all zero when released, a `recognize()`
+call leaves exactly one live block per region (its `Secret`) after zeroing at
+least two per region (job buffer and joined buffer), and every way a
+fingerprint leaves the cache passes through a wipe the cache's own observer
+sees as all zero. `tests/integration/text_recognizer_test.cpp` still reads a
+synthetic sentinel through the cache and the policy while capturing the
+standard streams, and checks no output or error holds any of it.
+
+What is not covered:
+
+- **ONNX Runtime's buffers.** The model writes its output into ONNX
+  Runtime's own memory (its CPU arena) before `Session::run()` copies it
+  out. That memory is not ours to zero or exclude.
+- **Pixels.** The readback frame (`OwnedFrame`, and OBS's own copies), the
+  crop images and float input tensor the recognizer builds, the detector's
+  tensors and OpenCV temporaries are ordinary memory, freed without zeroing.
+  They are pictures of the text, not text; the frame is the largest copy and
+  lives in OBS and the lookahead buffer either way. Only cache fingerprints,
+  which outlive a cycle by up to `max_age`, are zeroed.
+- **Fingerprints are not in `SecureHeap`.** The cache holds up to 64 MiB of
+  them, and most crops are over the heap's 16 KiB size classes, so each would
+  be a region of its own: that would use up `RLIMIT_MEMLOCK` (often 8 MiB on
+  Linux), so later watch-list regions could not be locked, and on Windows the
+  512 Windows Error Reporting exclusions per process, so later watch-list
+  regions could not be kept out of dumps.
+  Residual risk: a fingerprint is a picture of on-screen text, possibly a
+  watch-listed string, and while it is cached (up to `max_age`, default
+  1 s) it can appear in a crash dump or swap. The transient crops
+  `fingerprint()` and the recognizer's read jobs render (including buffers
+  a growing vector frees) are not zeroed at all. "Wiped, dump-excluded
+  memory" in SPG-15d holds for recognized text, not for the pixels that
+  show it. A bounded pixel arena in `SecureHeap` or a shorter default
+  `max_age` would narrow this; neither is part of SPG-15d.
+- **Very short text in the policy.** `evaluate()`'s `SecureU32String`
+  temporaries keep up to 3 or 4 code points (by standard library) inside the
+  string object, which is on the stack (see
+  [settings.md](settings.md#what-is-not-covered), "Short strings"). A
+  recognized line that short sits there while it is matched.
+- The platform limits of `SecureHeap` itself (macOS has no dump exclusion,
+  hibernation files, debuggers) are in
+  [settings.md](settings.md#platform-limits).
