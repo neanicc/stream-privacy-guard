@@ -29,7 +29,8 @@ add_library(obs-spg-pipeline STATIC
   src/pipeline/mask_levels.cpp
   src/pipeline/pipeline.cpp
   src/pipeline/readback_pool.cpp
-  src/pipeline/reaper.cpp)
+  src/pipeline/reaper.cpp
+  src/pipeline/ring_budget.cpp)
 target_include_directories(obs-spg-pipeline PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(obs-spg-pipeline PUBLIC spg::core)
 spg_target_defaults(obs-spg-pipeline)
@@ -82,7 +83,7 @@ spg_target_defaults(obs-spg-settings-tests)
 catch_discover_tests(obs-spg-settings-tests TEST_PREFIX "plugin.settings." DISCOVERY_MODE PRE_TEST)
 
 # Render pipeline with a fake GPU and a synchronous scheduler (SPG-14).
-add_executable(obs-spg-pipeline-tests tests/pipeline_test.cpp tests/alloc_fault.cpp)
+add_executable(obs-spg-pipeline-tests tests/pipeline_test.cpp tests/ring_budget_test.cpp tests/alloc_fault.cpp)
 target_link_libraries(obs-spg-pipeline-tests PRIVATE obs-spg-pipeline Catch2::Catch2WithMain)
 target_include_directories(obs-spg-pipeline-tests PRIVATE "${PROJECT_SOURCE_DIR}/tests/unit")
 spg_target_defaults(obs-spg-pipeline-tests)

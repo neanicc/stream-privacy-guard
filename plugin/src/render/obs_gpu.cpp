@@ -12,6 +12,10 @@ namespace spg::plugin {
 
 namespace {
 
+// Every texrender here, the ring slots included (the VRAM budget counts them
+// at this format's size).
+constexpr gs_color_format kTextureFormat = GS_BGRA;
+
 constexpr const char* kSmooth = "Smooth";
 constexpr const char* kBlocks = "Blocks";
 
@@ -65,7 +69,7 @@ bool begin_target(gs_texrender_t* texrender, Size size) {
 
 gs_texrender_t* ensure(gs_texrender_t*& texrender) {
   if (texrender == nullptr) {
-    texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+    texrender = gs_texrender_create(kTextureFormat, GS_ZS_NONE);
   }
   return texrender;
 }
@@ -204,6 +208,10 @@ void ObsFrameGpu::unmap(std::size_t surface) {
   if (surface < surfaces_.size() && surfaces_[surface] != nullptr) {
     gs_stagesurface_unmap(surfaces_[surface]);
   }
+}
+
+std::uint32_t ObsFrameGpu::bits_per_pixel() const noexcept {
+  return gs_get_format_bpp(kTextureFormat);
 }
 
 void ObsFrameGpu::free_slot(std::size_t slot) {

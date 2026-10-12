@@ -44,6 +44,16 @@ ScanStages make_stages(const PolicyConfig& /*policy*/) {
 
 constexpr std::uint64_t kLogInterval = 10'000'000'000ULL;  // ns
 
+// One output frame at the canvas frame rate; zero while video is not set up
+// (the budget fit then leaves the lookahead as configured).
+Duration video_frame_interval() noexcept {
+  obs_video_info ovi{};
+  if (!obs_get_video_info(&ovi) || ovi.fps_num == 0 || ovi.fps_den == 0) {
+    return {};
+  }
+  return Duration{1'000'000'000LL * ovi.fps_den / ovi.fps_num};
+}
+
 }  // namespace
 
 const char* cover_name(Cover cover) noexcept {
@@ -86,31 +96,11 @@ FilterRender::~FilterRender() {
   gpu_.destroy();
 }
 
-void FilterRender::publish(const std::optional<PolicyConfig>& policy, FallbackMode fallback) noexcept {
+void FilterRender::publish(const std::optional<PolicyConfig>& policy, FallbackMode fallback,
+                           long long vram_budget_mb) noexcept {
   try {
     const std::lock_guard lock(publish_mutex_);
-    if (have_published_ && !publish_failed_ && published_ == policy && published_fallback_ == fallback) {
-      return;  // the same policy (a debug overlay toggle, an unrelated update)
-    }
-    // Until this publish succeeds, nothing may keep running the old policy.
-    publish_failed_ = true;
-    auto spec = std::make_unique<PipelineSpec>();
-    spec->fallback = policy ? policy->fallback : fallback;
-    if (policy) {
-      SchedulerConfig config = SchedulerConfig::from_policy(*policy);
-      // Clamped again where consumed (settings are clamped when read).
-      config.lookahead = std::chrono::milliseconds(clamp_lookahead_ms(policy->lookahead.count()));
-      config.retro = std::min<Duration>(config.retro, config.lookahead);
-      config.tracker.hold = std::chrono::milliseconds(clamp_hold_ms(policy->hold.count()));
-      config.shutdown_timeout = kWorkerJoinTimeout;
-      spec->hold = config.tracker.hold;
-      spec->scheduler = std::make_unique<ThreadedScheduler>(obs_clock(), std::move(config), make_stages(*policy));
-    }
-    published_ = policy;
-    published_fallback_ = fallback;
-    have_published_ = true;
-    host_.offer(std::move(spec));
-    publish_failed_ = false;
+    publish_locked(policy, fallback, static_cast<std::uint64_t>(clamp_vram_budget_mb(vram_budget_mb)) * kBytesPerMiB);
   } catch (...) {
     // No scheduler for these settings: cover everything until one is built.
     host_.fail();
@@ -118,11 +108,99 @@ void FilterRender::publish(const std::optional<PolicyConfig>& policy, FallbackMo
   }
 }
 
-void FilterRender::render() noexcept {
+void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback,
+                                  std::uint64_t budget_bytes) {
+  Size source = source_size();
+  if (source.width == 0 || source.height == 0) {
+    source = budget_notice_.fit().frame;  // hidden for now: keep the last fit's size
+  }
+  const Duration requested =
+      policy ? Duration{std::chrono::milliseconds(clamp_lookahead_ms(policy->lookahead.count()))} : Duration{};
+  const LookaheadFit fit = fit_lookahead(requested, budget_bytes, source,
+                                         texture_bytes(source, gpu_.bits_per_pixel()), video_frame_interval());
+  if (have_published_ && !publish_failed_ && published_ == policy && published_fallback_ == fallback &&
+      published_budget_ == budget_bytes && published_lookahead_ == fit.lookahead) {
+    // The same generation (a debug overlay toggle, an unrelated update, a
+    // resize that fits the same lookahead): only the status is refreshed.
+    static_cast<void>(budget_notice_.update(fit));
+    return;
+  }
+  // Until this publish succeeds, nothing may keep running the old policy.
+  publish_failed_ = true;
+  auto spec = std::make_unique<PipelineSpec>();
+  spec->fallback = policy ? policy->fallback : fallback;
+  spec->ring_budget_bytes = budget_bytes;
+  if (policy) {
+    SchedulerConfig config = SchedulerConfig::from_policy(*policy);
+    // Clamped again where consumed (settings are clamped when read), then
+    // shortened to what the ring can hold within the VRAM budget.
+    config.lookahead = fit.lookahead;
+    config.retro = std::min<Duration>(config.retro, config.lookahead);
+    config.tracker.hold = std::chrono::milliseconds(clamp_hold_ms(policy->hold.count()));
+    config.shutdown_timeout = kWorkerJoinTimeout;
+    spec->hold = config.tracker.hold;
+    spec->scheduler = std::make_unique<ThreadedScheduler>(obs_clock(), std::move(config), make_stages(*policy));
+  }
+  if (&policy != &published_) {
+    published_ = policy;
+  }
+  published_fallback_ = fallback;
+  published_budget_ = budget_bytes;
+  published_lookahead_ = fit.lookahead;
+  have_published_ = true;
+  host_.offer(std::move(spec));
+  publish_failed_ = false;
+  if (budget_notice_.update(fit)) {
+    // One line per change: shortened, shortened to another value, restored.
+    try {
+      log(fit.shortened ? LOG_WARNING : LOG_INFO, "%s", describe(fit).c_str());
+    } catch (...) {
+      // Allocation failure: the generation is already handed over; the
+      // properties still show the warning.
+    }
+  }
+}
+
+void FilterRender::tick() noexcept {
+  const Size source = source_size();
+  const Duration interval = video_frame_interval();
+  if (source.width == 0 || source.height == 0 || (source == ticked_source_ && interval == ticked_interval_)) {
+    return;  // nothing new to fit (a hidden source keeps its fit)
+  }
+  try {
+    const std::unique_lock lock(publish_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+      return;  // a publish is running and fits the budget itself; check next tick
+    }
+    ticked_source_ = source;
+    ticked_interval_ = interval;
+    if (have_published_ && !publish_failed_) {
+      publish_locked(published_, published_fallback_, published_budget_);
+    }
+  } catch (...) {
+    host_.fail();
+    log(LOG_WARNING, "could not start detection for these settings: covering the whole source");
+  }
+}
+
+RenderStatus FilterRender::status() const noexcept {
+  RenderStatus status = host_.status();
+  try {
+    const std::lock_guard lock(publish_mutex_);
+    status.fit = budget_notice_.fit();
+  } catch (...) {
+    // The lock failed: the status shows no budget warning this time.
+  }
+  return status;
+}
+
+Size FilterRender::source_size() const noexcept {
   obs_source_t* target = obs_filter_get_target(filter_);
-  const Size source = target != nullptr
-                          ? Size{obs_source_get_base_width(target), obs_source_get_base_height(target)}
-                          : Size{};
+  return target != nullptr ? Size{obs_source_get_base_width(target), obs_source_get_base_height(target)} : Size{};
+}
+
+void FilterRender::render() noexcept {
+  const Size source = source_size();
   // One plan per frame time, from one state; Solid when anything failed.
   const Timestamp t = timestamp_from_ns(static_cast<std::int64_t>(obs_get_video_frame_time()));
   const DrawPlan& plan = host_.frame(t, source);
