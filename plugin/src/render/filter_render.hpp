@@ -7,8 +7,11 @@
 // Threads: publish() runs wherever the settings change (the video thread for
 // `update`, the UI thread for the watch-list buttons) and builds the new
 // scheduler there; tick() runs on the video thread before rendering and
-// rebuilds it when the VRAM budget needs another lookahead; render() runs on
-// the graphics thread; status() may run on any thread.
+// rebuilds it when the VRAM budget needs another lookahead; when the module's
+// detection models finish loading, the model loader thread rebuilds it the
+// same way (SPG-14b). Models are only ever loaded on the loader thread: a
+// rebuild takes them ready-made from the ModelHub. render() runs on the
+// graphics thread; status() may run on any thread.
 
 #include <atomic>
 #include <chrono>
@@ -37,17 +40,22 @@ inline constexpr std::chrono::hours kWorkerJoinTimeout{1};
 
 class FilterRender {
  public:
+  // Starts loading the module's detection models if nothing has yet, and
+  // rebuilds the scheduler when they are ready.
   explicit FilterRender(obs_source_t* filter);
-  // Frees GPU resources; the host then retires the schedulers to the reaper.
+  // Stops listening for the models, frees GPU resources; the host then
+  // retires the schedulers to the reaper.
   ~FilterRender();
   FilterRender(const FilterRender&) = delete;
   FilterRender& operator=(const FilterRender&) = delete;
 
-  // Hands the render thread a scheduler for `policy` (none: every frame is
-  // covered whole with `fallback`), with the lookahead shortened to fit
-  // `vram_budget_mb` at the source's current size (ring_budget.hpp). Skips
-  // the rebuild when nothing changed. On any failure every frame is covered
-  // with a solid fill until a later publish succeeds.
+  // Hands the render thread a scheduler for `policy` with the module's
+  // detection models, with the lookahead shortened to fit `vram_budget_mb` at
+  // the source's current size (ring_budget.hpp). No policy, or no models
+  // (still loading, missing or failed): no scheduler, and every frame is
+  // covered whole with the fallback. Skips the rebuild when nothing changed.
+  // On any failure every frame is covered with a solid fill until a later
+  // publish succeeds.
   void publish(const std::optional<PolicyConfig>& policy, FallbackMode fallback, long long vram_budget_mb) noexcept;
   // The filter's video_tick: after a resize or a frame rate change, rebuilds
   // the scheduler (a new generation) if the lookahead that fits the budget
@@ -65,6 +73,9 @@ class FilterRender {
   void log_transition(const DrawPlan& plan) noexcept;
   // Caller holds publish_mutex_.
   void publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback, std::uint64_t budget_bytes);
+  // The model loader thread: rebuild the published settings with the models,
+  // then ask OBS to refresh a properties view open on this filter.
+  void models_changed() noexcept;
   // The source size and frame interval the budget is fitted to, now.
   [[nodiscard]] Size source_size() const noexcept;
 
@@ -83,6 +94,8 @@ class FilterRender {
   // run), not a settings change: tick() retries it.
   bool refit_failed_ = false;
   BudgetNotice budget_notice_;
+  std::uint64_t published_models_ = 0;  // ModelHub generation the scheduler was built with
+  std::uint64_t models_listener_ = 0;
 
   // Video thread only (tick()).
   RefitSchedule refits_;

@@ -5,9 +5,13 @@
 // storage errors, and that watch-list text never reaches the log or the saved
 // scene collection data (SPG-15), and that typing into the masked field the
 // way the OBS properties view does never leaves it in an undo snapshot
-// (SPG-15b). All entries are synthetic.
+// (SPG-15b). Then check that the module loads the pinned detection models
+// with the ONNX Runtime it ships and builds its scheduler with them, or, with
+// no models, reports them missing once and keeps covering every frame
+// (SPG-14b). All entries are synthetic.
 //
 //   obs-spg-load-test <module binary> <module data directory> <config directory>
+//                     models-present|models-absent
 
 #include <obs.h>
 
@@ -15,6 +19,8 @@
 #include "spg-filter.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -507,6 +513,101 @@ void check_unreplaceable_file(const fs::path &watchlist_dir) {
   obs_source_release(source);
 }
 
+obs_text_info_type models_info_type(obs_source_t *source, bool &shown) {
+  obs_properties_t *props = obs_source_properties(source);
+  obs_property_t *models = obs_properties_get(props, plugin::kModelsKey);
+  shown = models != nullptr;
+  const obs_text_info_type type = shown ? obs_property_text_info_type(models) : OBS_TEXT_INFO_WARNING;
+  obs_properties_destroy(props);
+  return type;
+}
+
+std::size_t count_lines(std::string_view log, std::string_view needle) {
+  std::size_t count = 0;
+  for (std::size_t at = log.find(needle); at != std::string_view::npos; at = log.find(needle, at + 1)) {
+    ++count;
+  }
+  return count;
+}
+
+std::string captured() {
+  const std::lock_guard lock{log_mutex};
+  return captured_log;
+}
+
+// update_properties signals on the first filter: what makes OBS rebuild a
+// properties view that is already open on it.
+std::atomic<int> early_refreshes{0};
+
+void count_refresh(void * /*data*/, calldata_t * /*params*/) {
+  early_refreshes.fetch_add(1);
+}
+
+// The models load on the module's loader thread once a filter exists; the
+// properties show "loading" (a warning) until then. Ready is a normal info
+// line, missing models an error. Creating more filters loads nothing again.
+// `early` is the first filter created: it published while the models were
+// still loading, so only the loader's hand-over can give it a scheduler.
+void check_models(bool present, obs_source_t *early) {
+  obs_source_t *source = obs_source_create(plugin::kFilterId, "spg-models", nullptr, nullptr);
+  check(source != nullptr, "filter source for the model checks is created");
+  if (source == nullptr) {
+    return;
+  }
+  bool shown = false;
+  obs_text_info_type type = OBS_TEXT_INFO_WARNING;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes{5};
+  while (std::chrono::steady_clock::now() < deadline) {
+    type = models_info_type(source, shown);
+    if (shown && type != OBS_TEXT_INFO_WARNING) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  }
+  check(shown, "the properties show the detection model status");
+  obs_source_t *second = obs_source_create(plugin::kFilterId, "spg-models-2", nullptr, nullptr);
+  if (present) {
+    check(type == OBS_TEXT_INFO_NORMAL, "the pinned models load in the module (properties: ready)");
+    // The loader thread rebuilds each filter's scheduler with the models just
+    // after it publishes the status, and a filter created afterwards builds
+    // one with them straight away.
+    const auto handed_over = std::chrono::steady_clock::now() + std::chrono::minutes{1};
+    while (captured().find("[obs-spg] 'spg-early': scanning with the detection models") == std::string::npos &&
+           std::chrono::steady_clock::now() < handed_over) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    const std::string log = captured();
+    check(count_lines(log, "[obs-spg] detection models loaded in ") == 1, "the models load once and log one line");
+    check(log.find("[obs-spg] 'spg-early': scanning with the detection models") != std::string::npos,
+          "a filter created before the models were ready rebuilds its scheduler with them");
+    check(log.find("[obs-spg] 'spg-models-2': scanning with the detection models") != std::string::npos,
+          "a filter created once they are ready builds its scheduler with them");
+    // A properties view opened while loading said "loading": the hand-over
+    // asks OBS to rebuild it (the frontend reloads on update_properties),
+    // just after the rebuild logged above.
+    const auto refreshed = std::chrono::steady_clock::now() + std::chrono::minutes{1};
+    while (early_refreshes.load() == 0 && std::chrono::steady_clock::now() < refreshed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    check(early_refreshes.load() == 1, "the hand-over asks OBS once to refresh the first filter's properties");
+  } else {
+    check(type == OBS_TEXT_INFO_ERROR, "missing models are an error in the properties");
+    const std::string log = captured();
+    check(count_lines(log, "[obs-spg] detection models missing, covering every frame whole: yunet: ") == 1,
+          "missing models log exactly one line naming the model");
+    check(log.find("scanning with the detection models") == std::string::npos,
+          "without models no filter builds a scheduler");
+  }
+  bool second_shown = false;
+  check(second != nullptr && models_info_type(second, second_shown) == type && second_shown,
+        "a later filter shows the same model status at once");
+  bool early_shown = false;
+  check(early != nullptr && models_info_type(early, early_shown) == type && early_shown,
+        "the first filter shows the same model status");
+  obs_source_release(second);
+  obs_source_release(source);
+}
+
 void run_filter_checks(obs_module_t *module) {
   char *dir = obs_module_get_config_path(module, plugin::kWatchlistDirName);
   const fs::path watchlist_dir = plugin::path_from_utf8(dir);
@@ -530,10 +631,13 @@ void run_filter_checks(obs_module_t *module) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    std::fprintf(stderr, "usage: %s <module binary> <module data directory> <config directory>\n", argv[0]);
+  if (argc != 5 || (std::string_view{argv[4]} != "models-present" && std::string_view{argv[4]} != "models-absent")) {
+    std::fprintf(stderr,
+                 "usage: %s <module binary> <module data directory> <config directory> models-present|models-absent\n",
+                 argv[0]);
     return 2;
   }
+  const bool models_present = std::string_view{argv[4]} == "models-present";
   const fs::path config_dir = plugin::path_from_utf8(argv[3]);
   std::error_code ec;
   fs::remove_all(config_dir, ec);
@@ -608,7 +712,21 @@ int main(int argc, char **argv) {
       obs_properties_destroy(props);
     }
 
+    // Created first, so it starts the model loader and publishes before the
+    // models are ready.
+    obs_source_t *early = obs_source_create(plugin::kFilterId, "spg-early", nullptr, nullptr);
+    // Loading the pinned models takes hundreds of milliseconds, so this is
+    // connected long before the hand-over (models-present checks it).
+    signal_handler_t *early_signals = early != nullptr ? obs_source_get_signal_handler(early) : nullptr;
+    if (early_signals != nullptr) {
+      signal_handler_connect(early_signals, "update_properties", count_refresh, nullptr);
+    }
     run_filter_checks(module);
+    check_models(models_present, early);
+    if (early_signals != nullptr) {
+      signal_handler_disconnect(early_signals, "update_properties", count_refresh, nullptr);
+    }
+    obs_source_release(early);
   }
 
   // obs_shutdown joins the destroy-task thread, so every filter's destroy and

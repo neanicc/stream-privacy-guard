@@ -3,6 +3,7 @@
 
 #include <obs-module.h>
 
+#include "model_loading.hpp"
 #include "pipeline/reaper.hpp"
 #include "plugin-support.hpp"
 #include "spg-filter.hpp"
@@ -25,8 +26,10 @@ MODULE_EXPORT const char *obs_module_description(void) {
 bool obs_module_load(void) {
   obs_register_source(&spg::plugin::filter_info());
   const std::string_view core_version = spg::version();
-  spg::plugin::log(LOG_INFO, "loaded version %s (spg-core %.*s); detection not built yet, filter fails closed",
-                   spg::plugin::kPluginVersion, static_cast<int>(core_version.size()), core_version.data());
+  // Detection models load when the first filter is created, on their own
+  // thread (model_loading.hpp), so a module that is never used costs nothing.
+  spg::plugin::log(LOG_INFO, "loaded version %s (spg-core %.*s)", spg::plugin::kPluginVersion,
+                   static_cast<int>(core_version.size()), core_version.data());
   // Where watch-list text is kept out of crash dumps (docs/settings.md).
   spg::plugin::log(LOG_INFO, "watch-list memory: crash-dump exclusion: %s",
                    spg::native_secure_platform().dump_exclusion_method());
@@ -34,8 +37,12 @@ bool obs_module_load(void) {
 }
 
 void obs_module_unload(void) {
+  // The model loader runs code from this module: wait for it. Stages still
+  // in schedulers keep the models (and ONNX Runtime's environment) alive.
+  spg::plugin::module_models().shutdown();
   // Scheduler workers run code from this module: wait until every retired
-  // scheduler has joined its workers before the module can be unmapped.
+  // scheduler has joined its workers before the module can be unmapped. The
+  // last scheduler destroyed releases the models.
   spg::plugin::module_reaper().shutdown();
   spg::plugin::log(LOG_INFO, "unloaded");
 }

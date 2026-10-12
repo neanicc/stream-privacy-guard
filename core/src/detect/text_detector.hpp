@@ -121,6 +121,10 @@ class TextDetector {
   [[nodiscard]] static TextDetector open(runtime::Environment& env, const std::filesystem::path& model,
                                          const TextDetectorConfig& config = {},
                                          runtime::SessionOptions options = {});
+  // The same from bytes already read and checked (runtime::ModelBytes).
+  [[nodiscard]] static TextDetector open(runtime::Environment& env, const runtime::ModelBytes& model,
+                                         const TextDetectorConfig& config = {},
+                                         runtime::SessionOptions options = {});
 
   // Takes an open session. Throws TextDetectorError unless it has one float32
   // input [N, 3, H, W] and one float32 output [N, 1, H, W] whose dimensions

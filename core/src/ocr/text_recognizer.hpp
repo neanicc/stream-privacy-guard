@@ -117,6 +117,10 @@ class TextRecognizer {
   [[nodiscard]] static TextRecognizer open(runtime::Environment& env, const std::filesystem::path& model,
                                            const TextRecognizerConfig& config = {},
                                            runtime::SessionOptions options = {});
+  // The same from bytes already read and checked (runtime::ModelBytes).
+  [[nodiscard]] static TextRecognizer open(runtime::Environment& env, const runtime::ModelBytes& model,
+                                           const TextRecognizerConfig& config = {},
+                                           runtime::SessionOptions options = {});
 
   // Takes an open session. Throws TextRecognizerError unless the model has
   // one float32 input (shape undeclared, or [N, 3, H, W] with dynamic or

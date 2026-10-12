@@ -28,11 +28,15 @@ time, pinned by URL and SHA-256 in `tests/CMakeLists.txt`, so the first
 configure needs network access.
 
 Plugin coverage differs by OS. `plugin.loads` (headless libobs: module load,
-filter registration, locale, defaults, property types) runs on macOS and
-Windows only; on Linux the Ubuntu `libobs.so` needs system FFmpeg, PulseAudio
+filter registration, locale, defaults, property types, and the detection models
+loaded through the ONNX Runtime copied next to the module) and
+`plugin.loads.no_models` (an empty cache: the models are reported missing and
+no scheduler is built) run on macOS and Windows only; on Linux the Ubuntu `libobs.so` needs system FFmpeg, PulseAudio
 and Wayland libraries the pins do not provide, so the Linux job proves the
 module builds, links and exports its entry points (`plugin.exports`) and
-nothing more (#27). No job renders through the filter: the fail-closed fill in
+nothing more (#27). `plugin.models.*` (model pins, SHA-256, the loader thread,
+and the stages run on a synthetic frame with the pinned models) runs on every
+OS. No job renders through the filter: the fail-closed fill in
 `video_render` is checked only by live OBS ([live check](live-check.md)).
 
 Dependencies, models and the ccache cache (`~/.cache/spg/ccache`) are cached in

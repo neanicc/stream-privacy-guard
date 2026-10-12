@@ -3,6 +3,7 @@
 #include <graphics/vec4.h>
 #include <obs-module.h>
 
+#include "model_loading.hpp"
 #include "plugin-support.hpp"
 #include "render/filter_render.hpp"
 #include "settings/watchlist_store.hpp"
@@ -644,6 +645,42 @@ void add_watchlist_group(obs_properties_t *props, FilterState *state) {
   obs_properties_add_group(props, "watchlist_group", text("SPG.Watchlist"), OBS_GROUP_NORMAL, group);
 }
 
+// Whether the detection models are loaded (module-wide). Fixed texts plus the
+// manifest name of a model at fault; paths and errors go to the log.
+void add_models_status(obs_properties_t *props) {
+  const ModelHub::Snapshot models = module_models().snapshot();
+  const char *key = nullptr;
+  obs_text_info_type type = OBS_TEXT_INFO_ERROR;
+  switch (models.report.status) {
+    case ModelStatus::Idle:
+    case ModelStatus::Loading:
+      key = "SPG.Models.Loading";
+      type = OBS_TEXT_INFO_WARNING;
+      break;
+    case ModelStatus::Ready:
+      key = "SPG.Models.Ready";
+      type = OBS_TEXT_INFO_NORMAL;
+      break;
+    case ModelStatus::Missing:
+      key = "SPG.Models.Missing";
+      break;
+    case ModelStatus::Corrupt:
+      key = "SPG.Models.Corrupt";
+      break;
+    case ModelStatus::Failed:
+      key = "SPG.Models.Failed";
+      break;
+  }
+  if (key == nullptr) {
+    return;
+  }
+  std::string line = text(key);
+  if (!models.report.model.empty()) {
+    line += " (" + models.report.model + ")";
+  }
+  add_info(props, kModelsKey, line.c_str(), type);
+}
+
 // What has aired so far: counts and a fixed reason name, never frame content.
 void add_render_status(obs_properties_t *props, const FilterState &state) {
   if (state.render == nullptr) {
@@ -694,6 +731,7 @@ obs_properties_t *filter_get_properties(void *data) {
       add_info(props, kIssueKey, text("SPG.Issue.InvalidConfig"), OBS_TEXT_INFO_ERROR);
     }
     try {
+      add_models_status(props);
       add_render_status(props, *state);
     } catch (...) {
       // Allocation failure: no status line.
