@@ -609,7 +609,7 @@ Template:
   three runners before the test stage and no skipped `detect.*` case, so
   the model-backed cases run in CI.
 
-## 2026-10-12 — SPG-10 Scheduler, lookahead and fail-closed (#11)
+## 2026-10-12 — SPG-10 Scheduler, lookahead and fail-closed (#40)
 
 - Decision / change: `spg::Lookahead` (single-threaded ring buffer, bounded
   scan queue, cadence, coverage, retroactive masks, release and fallback),
