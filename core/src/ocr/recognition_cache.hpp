@@ -17,12 +17,19 @@
 // with the same brightness, a resize of the source or of the box, a track id
 // reused for other content), is a miss. Misses cost model runs, never recall.
 //
-// The cache holds recognized text (Secret) and crop pixels in memory only,
-// bounded by `capacity` entries and `max_bytes` of pixels, and is not
-// synchronized: one worker owns it.
+// Bounds: at most one entry per track (a store replaces it), at most
+// `capacity` tracks, at most `max_entry_bytes` of pixels per entry and
+// `max_bytes` over all entries. A store first drops every entry past max_age,
+// then the least recently used entries until the bounds hold. A crop over a
+// per-entry bound is not cached. A full cache only makes misses: every miss
+// is read again, nothing is skipped.
+//
+// The cache holds recognized text (Secret) and crop pixels in memory only and
+// is not synchronized: one worker owns it.
 
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -40,14 +47,17 @@ struct RecognitionCacheConfig {
   // A cached text is reused for at most this long (frame time) after it was
   // read, however still the region looks.
   Duration max_age = std::chrono::milliseconds{1000};
-  // Tracks kept; the oldest read is dropped first beyond this.
+  // Tracks kept (one entry each); the least recently used goes first.
   std::size_t capacity = 1024;
-  // Crop pixels kept over all entries; the oldest read is dropped first
-  // beyond this. A crop larger than the budget is not cached.
+  // Crop pixels kept for one entry; a larger crop is not cached (a 1920 x 700
+  // readback crop is about 4 MiB).
+  std::size_t max_entry_bytes = std::size_t{4} << 20;
+  // Crop pixels kept over all entries; the least recently used goes first.
   std::size_t max_bytes = std::size_t{64} << 20;
 };
 
-// Throws ContractError naming the field when a value is out of range.
+// Throws ContractError naming the field when a value is out of range
+// (negative max_age, or a zero capacity or byte bound).
 void validate(const RecognitionCacheConfig& config);
 
 // What a region looked like when it was read: its whole readback crop.
@@ -72,9 +82,12 @@ class RecognitionCache {
 
   // The text read for `track`, when it was read no more than max_age before
   // `now` (and not after it) from exactly the content `print` holds; nothing
-  // otherwise.
-  [[nodiscard]] std::optional<Recognition> find(TrackId track, const Fingerprint& print, Timestamp now) const;
-  // Records what was read for `track` at frame time `now`.
+  // otherwise. A hit makes the entry the most recently used.
+  [[nodiscard]] std::optional<Recognition> find(TrackId track, const Fingerprint& print, Timestamp now);
+  // Records what was read for `track` at frame time `now`, replacing the
+  // track's entry. Drops expired entries, then least recently used ones until
+  // the bounds hold. A crop that is empty or over a byte bound is not stored
+  // (the track's old entry is still dropped).
   void store(TrackId track, Fingerprint print, Recognition recognition, Timestamp now);
   // Forgets a track (it ended).
   void erase(TrackId track);
@@ -90,11 +103,14 @@ class RecognitionCache {
     Fingerprint print;
     Recognition recognition;
     Timestamp read_at{};
+    std::list<TrackId>::iterator use;  // position in lru_
   };
-  void drop_oldest();
+  [[nodiscard]] bool expired(const Entry& entry, Timestamp now) const;
+  void drop(std::unordered_map<TrackId, Entry>::iterator it);
 
   RecognitionCacheConfig config_;
   std::unordered_map<TrackId, Entry> entries_;
+  std::list<TrackId> lru_;  // most recently used first
   std::size_t bytes_ = 0;
 };
 

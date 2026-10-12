@@ -734,11 +734,19 @@ Template:
   those pixels, so a hit returns what a new read would. Any other change is a
   miss: one pixel, a colour change, a resized box or source, or a track id
   reused for other content. Same pixels moved with their box (scrolling) hit.
-  A store replaces the track's old entry even when the new crop is not cached
-  (empty, or over the 64 MiB pixel budget); `capacity` and `max_bytes` evict
-  the oldest read. `recognize_tracks()` sends all misses to one `recognize()`
-  call and stores results only after it succeeds, so a failed frame leaves
-  the cache unchanged. One owner, not synchronized.
+  Bounds (second review, resource exhaustion): one entry per track, at most
+  `capacity` 1024 tracks, `max_entry_bytes` 4 MiB per entry and `max_bytes`
+  64 MiB in all. A store drops the track's old entry, then every expired
+  entry, then least recently used entries (a hit counts as a use) until the
+  new one fits; a crop that is empty or over a byte bound is not stored. A
+  full cache only causes misses, which are read again. `recognize_tracks()`
+  sends all misses to one `recognize()` call and stores results only after it
+  succeeds, so a failed frame leaves the cache unchanged. One owner, not
+  synchronized. Tests: 20000 seeded operations over 200 track ids keep
+  size, bytes and per-entry size within bounds and every hit fresh and
+  current; six tracks through a two-entry cache all come back equal to an
+  uncached read. Mutations: removing the capacity bound failed both; no
+  expiry on store or no LRU touch on a hit each failed its own section.
 - Security review fix (before review): the first version compared a luma
   thumbnail (six square cells across the short side, each within 6 levels)
   and allowed a 10% size change. A background review flagged it as a
@@ -756,8 +764,8 @@ Template:
   streams, then fails two broken fixture recognizers on the same frame:
   nothing is printed and no error holds any fragment of it.
 - Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang):
-  `scripts/ci/run.sh build` (plugin included) and `test` pass, 195/195 after
-  merging main at 87ed3f5, 30 new `ocr.*` cases, no skips. Model cases: six made-up
+  `scripts/ci/run.sh build` (plugin included) and `test` pass, 197/197 after
+  merging main at 87ed3f5, 32 new `ocr.*` cases, no skips. Model cases: six made-up
   strings on three panel styles, cap heights 10, 14 and 22 readback px,
   readback scale 1 and 1/2, BGRA/NV12/I420, each read within two edits
   (Hershey's 'a' reads as 'o' at cap height 8 to 10); merged lines; chunked

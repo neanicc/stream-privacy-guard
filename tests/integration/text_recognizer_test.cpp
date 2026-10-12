@@ -601,6 +601,40 @@ TEST_CASE("Batching does not change what is read", "[ocr][fixture]") {
   }
 }
 
+TEST_CASE("A full cache falls back to reading every track again", "[ocr][fixture][cache]") {
+  // Six tracks and room for two: every call still returns a text for every
+  // track, equal to an uncached read, and at most two of them come from the
+  // cache. A full cache costs model runs, never a skipped region.
+  const TextRecognizer reader = open_fixture("rec_softmax.onnx");
+  const Scene scene = panel({900, 420}, {60, 60, 60}, {220, 230, 240}, kTexts, 12.0);
+  OwnedFrame frame = spg::test::to_frame(scene.canvas, PixelFormat::BGRA);
+  const std::vector<spg::Detection> regions = regions_of(scene, {900, 420});
+  const std::vector<Recognition> fresh = reader.recognize(frame.view, {900, 420}, regions);
+  std::vector<ocr::TrackedRegion> tracks;
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+    tracks.push_back({i, regions[i]});
+  }
+  ocr::RecognitionCacheConfig config;
+  config.capacity = 2;
+  ocr::RecognitionCache cache(config);
+  for (int call = 0; call < 4; ++call) {
+    frame.view.timestamp = at_ms(10 * call);
+    ocr::CacheStats stats;
+    const std::vector<spg::TextHit> hits = ocr::recognize_tracks(reader, cache, frame.view, {900, 420}, tracks,
+                                                                 &stats);
+    INFO("call " << call);
+    REQUIRE(hits.size() == regions.size());
+    CHECK(stats.hits + stats.misses == regions.size());
+    CHECK(stats.hits <= 2);
+    CHECK(stats.misses >= regions.size() - 2);
+    CHECK(cache.size() <= 2);
+    for (std::size_t i = 0; i < hits.size(); ++i) {
+      CHECK_FALSE(hits[i].text.empty());
+      CHECK(hits[i].text == fresh[i].text);
+    }
+  }
+}
+
 TEST_CASE("Malformed recognizer output fails the frame closed", "[ocr][fixture]") {
   const Scene scene = panel({400, 100}, {240, 240, 240}, {30, 30, 30}, {"zorbly"}, 14.0);
   const OwnedFrame frame = spg::test::to_frame(scene.canvas, PixelFormat::BGRA);

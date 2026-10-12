@@ -1,6 +1,7 @@
 #include "ocr/recognition_cache.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <utility>
 
 #include "detect/frame_image.hpp"
@@ -14,6 +15,12 @@ void validate(const RecognitionCacheConfig& config) {
   }
   if (config.capacity < 1) {
     throw ContractError("recognition cache: capacity must be at least 1");
+  }
+  if (config.max_entry_bytes < 1) {
+    throw ContractError("recognition cache: max_entry_bytes must be at least 1");
+  }
+  if (config.max_bytes < 1) {
+    throw ContractError("recognition cache: max_bytes must be at least 1");
   }
 }
 
@@ -39,55 +46,58 @@ RecognitionCache::RecognitionCache(const RecognitionCacheConfig& config) : confi
   validate(config_);
 }
 
-std::optional<Recognition> RecognitionCache::find(TrackId track, const Fingerprint& print, Timestamp now) const {
+bool RecognitionCache::expired(const Entry& entry, Timestamp now) const {
+  return now < entry.read_at || now - entry.read_at > config_.max_age;
+}
+
+void RecognitionCache::drop(std::unordered_map<TrackId, Entry>::iterator it) {
+  bytes_ -= it->second.print.pixels.size();
+  lru_.erase(it->second.use);
+  entries_.erase(it);
+}
+
+std::optional<Recognition> RecognitionCache::find(TrackId track, const Fingerprint& print, Timestamp now) {
   const auto it = entries_.find(track);
   if (it == entries_.end()) {
     return std::nullopt;
   }
-  const Entry& entry = it->second;
-  if (now < entry.read_at || now - entry.read_at > config_.max_age || !same_content(print, entry.print)) {
+  Entry& entry = it->second;
+  if (expired(entry, now) || !same_content(print, entry.print)) {
     return std::nullopt;
   }
+  lru_.splice(lru_.begin(), lru_, entry.use);
   return entry.recognition;
 }
 
 void RecognitionCache::store(TrackId track, Fingerprint print, Recognition recognition, Timestamp now) {
   erase(track);  // the old entry is never kept, even when the new one is not cached
-  if (print.pixels.empty() || print.pixels.size() > config_.max_bytes) {
+  prune(now);
+  const std::size_t size = print.pixels.size();
+  if (size == 0 || size > config_.max_entry_bytes || size > config_.max_bytes) {
     return;
   }
-  bytes_ += print.pixels.size();
-  entries_.emplace(track, Entry{std::move(print), std::move(recognition), now});
-  while (entries_.size() > config_.capacity || bytes_ > config_.max_bytes) {
-    drop_oldest();
+  while (!entries_.empty() && (entries_.size() >= config_.capacity || bytes_ + size > config_.max_bytes)) {
+    drop(entries_.find(lru_.back()));
   }
-}
-
-void RecognitionCache::drop_oldest() {
-  const auto oldest = std::min_element(entries_.begin(), entries_.end(), [](const auto& a, const auto& b) {
-    return a.second.read_at < b.second.read_at;
-  });
-  bytes_ -= oldest->second.print.pixels.size();
-  entries_.erase(oldest);
+  lru_.push_front(track);
+  bytes_ += size;
+  entries_.emplace(track, Entry{std::move(print), std::move(recognition), now, lru_.begin()});
 }
 
 void RecognitionCache::erase(TrackId track) {
   const auto it = entries_.find(track);
   if (it != entries_.end()) {
-    bytes_ -= it->second.print.pixels.size();
-    entries_.erase(it);
+    drop(it);
   }
 }
 
 void RecognitionCache::prune(Timestamp now) {
   for (auto it = entries_.begin(); it != entries_.end();) {
-    const Timestamp read_at = it->second.read_at;
-    if (now < read_at || now - read_at > config_.max_age) {
-      bytes_ -= it->second.print.pixels.size();
-      it = entries_.erase(it);
-    } else {
-      ++it;
+    const auto next = std::next(it);
+    if (expired(it->second, now)) {
+      drop(it);
     }
+    it = next;
   }
 }
 

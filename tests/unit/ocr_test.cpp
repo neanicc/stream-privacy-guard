@@ -6,11 +6,13 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -530,16 +532,30 @@ TEST_CASE("RecognitionCache: hits only for the same track, pixels and age", "[oc
   CHECK(cache.size() == 0);
   CHECK(cache.bytes() == 0);
 
-  SECTION("capacity drops the oldest read") {
+  SECTION("capacity drops the least recently used track") {
     config.capacity = 2;
     ocr::RecognitionCache tiny(config);
     tiny.store(1, print, reading("1"), at_ms(10));
-    tiny.store(2, print, reading("2"), at_ms(5));
-    tiny.store(3, print, reading("3"), at_ms(20));
+    tiny.store(2, print, reading("2"), at_ms(20));
+    CHECK(tiny.find(1, print, at_ms(25)));  // 1 is now the most recently used
+    tiny.store(3, print, reading("3"), at_ms(30));
     CHECK(tiny.size() == 2);
-    CHECK_FALSE(tiny.find(2, print, at_ms(20)));
-    CHECK(tiny.find(1, print, at_ms(20)));
-    CHECK(tiny.find(3, print, at_ms(20)));
+    CHECK_FALSE(tiny.find(2, print, at_ms(30)));
+    CHECK(tiny.find(1, print, at_ms(30)));
+    CHECK(tiny.find(3, print, at_ms(30)));
+  }
+  SECTION("a store drops expired entries first") {
+    cache.store(1, print, reading("1"), at_ms(2000));
+    cache.store(2, print, reading("2"), at_ms(3500));  // 1 is past max_age
+    CHECK(cache.size() == 1);
+    CHECK(cache.bytes() == print.pixels.size());
+  }
+  SECTION("a crop over the per-entry bound is not cached") {
+    config.max_entry_bytes = print.pixels.size() - 1;
+    ocr::RecognitionCache tiny(config);
+    tiny.store(1, print, reading("1"), at_ms(10));
+    CHECK(tiny.size() == 0);
+    CHECK_FALSE(tiny.find(1, print, at_ms(10)));
   }
   SECTION("the byte budget drops the oldest read") {
     config.max_bytes = 2 * print.pixels.size();
@@ -573,5 +589,50 @@ TEST_CASE("RecognitionCache: hits only for the same track, pixels and age", "[oc
     bad = {};
     bad.capacity = 0;
     CHECK_THROWS_AS(ocr::RecognitionCache(bad), spg::ContractError);
+    bad = {};
+    bad.max_entry_bytes = 0;
+    CHECK_THROWS_AS(ocr::RecognitionCache(bad), spg::ContractError);
+    bad = {};
+    bad.max_bytes = 0;
+    CHECK_THROWS_AS(ocr::RecognitionCache(bad), spg::ContractError);
   }
+}
+
+TEST_CASE("RecognitionCache stays within its bounds under churn", "[ocr][cache]") {
+  // Many tracks, crops of many sizes, repeated ids, hits and time jumps: after
+  // every operation the cache holds at most `capacity` tracks, at most
+  // `max_bytes` of pixels (exactly the sum of its entries), and no entry over
+  // `max_entry_bytes`; every hit is the latest store for that track and fresh.
+  ocr::RecognitionCacheConfig config;
+  config.capacity = 40;
+  config.max_entry_bytes = 3 * 120 * 30;
+  config.max_bytes = 3 * 120 * 30 * 10;
+  ocr::RecognitionCache cache(config);
+  std::mt19937 rng(5);
+  std::vector<ocr::Fingerprint> prints;
+  for (std::uint32_t w = 10; w <= 150; w += 20) {
+    for (std::uint32_t h = 10; h <= 40; h += 15) {
+      prints.push_back({{w, h}, std::vector<std::uint8_t>(3 * static_cast<std::size_t>(w) * h,
+                                                          static_cast<std::uint8_t>(w + h))});
+    }
+  }
+  std::vector<std::optional<std::pair<std::size_t, std::int64_t>>> latest(200);  // print index, time
+  std::int64_t now = 0;
+  for (int step = 0; step < 20000; ++step) {
+    now += std::uniform_int_distribution<std::int64_t>(0, 30)(rng);
+    const auto track = std::uniform_int_distribution<std::size_t>(0, latest.size() - 1)(rng);
+    const auto p = std::uniform_int_distribution<std::size_t>(0, prints.size() - 1)(rng);
+    if (std::uniform_int_distribution<int>(0, 2)(rng) == 0) {
+      cache.store(track, prints[p], reading("t"), at_ms(now));
+      latest[track] = std::pair{p, now};
+    } else if (cache.find(track, prints[p], at_ms(now))) {
+      REQUIRE(latest[track]);
+      CHECK(latest[track]->first == p);
+      CHECK(now - latest[track]->second <= 1000);
+      CHECK(prints[p].pixels.size() <= config.max_entry_bytes);
+    }
+    REQUIRE(cache.size() <= config.capacity);
+    REQUIRE(cache.bytes() <= config.max_bytes);
+  }
+  CHECK(cache.size() > 0);
 }
