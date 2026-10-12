@@ -52,6 +52,9 @@ TEST_CASE("pii: phone numbers follow NANP or E.164", "[policy][pii]") {
   CHECK(found(Category::PiiPhone, "1-800-555-0199"));
   CHECK(found(Category::PiiPhone, "+44 20 7946 0958"));
   CHECK(found(Category::PiiPhone, "+1 (212) 555-0123"));
+  CHECK(found(Category::PiiPhone, "+ 44 20 7946 0958"));                // OCR space after '+'
+  CHECK(found(Category::PiiPhone, "+(44) 20 7946 0958"));
+  CHECK(found(Category::PiiPhone, "+ (44) 20 7946 0958"));
   CHECK(found(Category::PiiPhone, "212 555 O123"));                     // OCR O for 0
   CHECK(found(Category::PiiPhone, "ids 4821 then 212-555-0123 646-555-0199"));
   CHECK_FALSE(found(Category::PiiPhone, "(012) 555-0123"));             // area code starts 0
@@ -80,6 +83,8 @@ TEST_CASE("pii: IPv4 and IPv6 addresses", "[policy][pii]") {
   CHECK(found(Category::PiiIp, "198.51.100.7."));
   CHECK(found(Category::PiiIp, "2001:db8:0:0:0:0:2:1"));
   CHECK(found(Category::PiiIp, "ip:2001:db8::2:1"));
+  CHECK(found(Category::PiiIp, "IPv6:2001:db8:0:0:0:0:2:1"));  // label's 6 is hex
+  CHECK(found(Category::PiiIp, "addr:2001:db8:0:0:0:0:2:1"));
   CHECK(found(Category::PiiIp, "fe80::1ff:fe23:4567:890a"));
   CHECK(found(Category::PiiIp, "::ffff:192.0.2.128"));
   CHECK_FALSE(found(Category::PiiIp, "256.1.1.1"));
@@ -111,10 +116,18 @@ TEST_CASE("pii: credential and stream key formats", "[policy][pii]") {
   CHECK(found(Category::PiiToken, "xoxb-0000-SYNTHETIC"));
   CHECK(found(Category::PiiToken, "sk-ant-SYNTHETIC0123456789abc"));
   CHECK(found(Category::PiiToken, "-----BEGIN OPENSSH PRIVATE KEY-----"));
+  // A JWT whose header ({"alg":"HS256"}) and payload ({"sub":"zq"}) are each
+  // shorter than the single-run rule; with and without the signature.
+  CHECK(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ6cSJ9.SYNTHETICsig"));
+  CHECK(found(Category::PiiToken, "token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ6cSJ9."));
+  CHECK(found(Category::PiiToken, "eyJ0eXAiOiJKV1QifQ.e30.SYNTHETIC"));  // {"typ":"JWT"}, {}
   CHECK_FALSE(found(Category::PiiToken, "ghp_short"));
   CHECK_FALSE(found(Category::PiiToken, "task-SYNTHETIC0123456789abc"));
   CHECK_FALSE(found(Category::PiiToken, "eurasiaSYNTHETIC012345"));
   CHECK_FALSE(found(Category::PiiToken, "let's begin; keep your private key safe"));
+  CHECK_FALSE(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9 then a space"));  // header alone
+  CHECK_FALSE(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9.ab"));            // payload too short
+  CHECK_FALSE(found(Category::PiiToken, "Eyjafjallajokull.is"));                 // too short for a header
 }
 
 TEST_CASE("pii: only enabled categories are reported", "[policy][pii]") {

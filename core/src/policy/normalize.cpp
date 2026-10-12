@@ -23,6 +23,22 @@ constexpr FoldEntry kFoldTable[] = {
 #include "fold_table.inc"
 };
 
+struct CodeRange {
+  char32_t first;
+  char32_t last;
+};
+
+// Non-ASCII punctuation, symbols and separators of every script.
+constexpr CodeRange kSeparatorTable[] = {
+#include "separator_table.inc"
+};
+
+bool in_separator_table(char32_t cp) noexcept {
+  const auto* it = std::upper_bound(std::begin(kSeparatorTable), std::end(kSeparatorTable), cp,
+                                    [](char32_t value, const CodeRange& r) { return value < r.first; });
+  return it != std::begin(kSeparatorTable) && cp <= std::prev(it)->last;
+}
+
 const FoldEntry* find_fold(char32_t cp) noexcept {
   const auto* it = std::upper_bound(std::begin(kFoldTable), std::end(kFoldTable), cp,
                                     [](char32_t value, const FoldEntry& e) { return value < e.first; });
@@ -106,7 +122,8 @@ bool is_separator(char32_t c) noexcept {
     return !((c >= U'a' && c <= U'z') || (c >= U'0' && c <= U'9'));
   }
   return renders_blank(c) || is_control(c) || (c >= 0xA1 && c <= 0xBF) || c == 0xD7 || c == 0xF7 ||
-         (c >= 0x2000 && c <= 0x206F) || (c >= 0x3000 && c <= 0x303F) || c == 0xFFFD;
+         (c >= 0x2000 && c <= 0x206F) || (c >= 0x3000 && c <= 0x303F) || c == 0xFFFD ||
+         in_separator_table(c);
 }
 
 std::u32string matching_form(std::u32string_view folded) {

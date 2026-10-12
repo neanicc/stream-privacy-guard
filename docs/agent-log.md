@@ -349,6 +349,11 @@ Template:
   digits after normalization makes the engine throw (by index) rather than be
   silently ignored. (6) `LogSink` (a `std::function`) is injected rather than a
   global logger. Placeholder fuzzy defaults (2, 0.2, 6) kept per the issue.
+  (7) Review fixes, all recall misses: punctuation and symbols of every
+  script (Unicode P, S, Z, generated `separator_table.inc`) separate words,
+  so "vex" + Arabic comma matches a short entry; `+ 44` and `+ (44)` reach
+  the E.164 rule; a hex-ending label (`ipv6:`) no longer hides an IPv6
+  address; a JWT with a short header and payload is a token.
 - Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21):
   `scripts/ci/run.sh setup`, `build` (warnings as errors) and `test` pass, 72
   ctest tests; the new `[policy]` cases cover normalization, matching,

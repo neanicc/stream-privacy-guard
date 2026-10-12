@@ -30,7 +30,10 @@ Every check first folds the text:
 
 Entries and text are compared in **matching form**: the folded text with OCR
 confusions merged (`0`→`o`; `1`, `i`, `|`→`l`; `5`→`s`; `8`→`b`) and every run
-of punctuation or whitespace turned into one space. `normalize_for_matching()`
+of punctuation, symbols or whitespace turned into one space. Outside ASCII,
+punctuation and symbols are the Unicode general categories P, S and Z of any
+script (`separator_table.inc`, generated with the fold table), so an Arabic
+comma or a CJK bracket ends a word just as `,` does. `normalize_for_matching()`
 returns this form. An entry whose matching form is empty (punctuation only) is
 rejected when the engine is built, since it could never match.
 
@@ -57,12 +60,12 @@ expected, `o` reads as `0` and `l`, `i`, `|` as `1` next to a real digit.
 
 | Reason | Rule |
 | --- | --- |
-| `PII_PHONE` | Digit groups joined by at most three of ` -.()+`. Every window of whole consecutive groups is tried. NANP: 10 digits (or 11 after a leading `1`) with area code and exchange starting 2-9, and group breaks only after the `1`, the area code or the exchange (so a date and time is not a phone). E.164: `+` then 8 to 15 digits, not starting with 0. |
+| `PII_PHONE` | Digit groups joined by at most three of ` -.()+`. Every window of whole consecutive groups is tried. NANP: 10 digits (or 11 after a leading `1`) with area code and exchange starting 2-9, and group breaks only after the `1`, the area code or the exchange (so a date and time is not a phone). E.164: `+` (up to three spaces or `(` may sit between it and the first digit, as in `+ (44)`) then 8 to 15 digits, not starting with 0. |
 | `PII_CARD` | A window of the same digit groups holding 13 to 19 digits that passes the Luhn check. No issuer prefix check. |
 | `PII_EMAIL` | `local@domain.tld`, allowing one OCR space on each side of `@`; the domain needs a dot, no empty label and a final label of at least two non-digits. |
-| `PII_IP` | IPv4: four consecutive dot-separated octets (0-255). IPv6: eight hex groups, or at least two groups around a single `::`, optionally ending in an IPv4 tail. |
+| `PII_IP` | IPv4: four consecutive dot-separated octets (0-255). IPv6: eight hex groups, or at least two groups around a single `::`, optionally ending in an IPv4 tail. A label glued to the address (`ipv6:`, whose `6` is a hex digit) is tried without its first group. |
 | `PII_ADDRESS` | A house number (1-6 digits, optional letter), one to four words with a letter, then a street suffix from the list in `pii.cpp` (`street`, `st`, `avenue`, `rd`, `ln`, ...); or `po box N` / `p o box N`. No postcode rules. |
-| `PII_TOKEN` | A known prefix at a word start followed by enough `[a-z0-9_-]` characters: Twitch stream keys (`live_`) and `oauth:` tokens, GitHub (`ghp_`, `github_pat_`, ...), GitLab, Slack (`xox?-`), Stripe, `sk-` keys, AWS key ids (`akia`, `asia`), Google API keys (`aiza`), npm, Hugging Face, JWTs (`eyj`). Also a PEM `-----BEGIN ... PRIVATE KEY` header. |
+| `PII_TOKEN` | A known prefix at a word start followed by enough `[a-z0-9_-]` characters: Twitch stream keys (`live_`) and `oauth:` tokens, GitHub (`ghp_`, `github_pat_`, ...), GitLab, Slack (`xox?-`), Stripe, `sk-` keys, AWS key ids (`akia`, `asia`), Google API keys (`aiza`), npm, Hugging Face, JWTs (`eyj`). A JWT whose parts are each shorter also counts: a header of at least 18 characters starting `eyj`, a dot, and a payload of at least 3. Also a PEM `-----BEGIN ... PRIVATE KEY` header. |
 
 ## Secrecy
 
@@ -73,3 +76,15 @@ reason codes only; `ContractError` messages name the entry index.
 construction, matching, PII scanning, `describe()` and three config errors
 while capturing the sink and `std::cout`/`std::cerr`/`std::clog`, and asserts
 that no captured text contains any fragment of the entry, raw or normalized.
+
+`Secret` is a type-level guard (no stream operator, no implicit conversion), not
+protected memory: it does not lock or zero its storage. The compiled matching
+forms (`std::u32string`, private to the engine) and the folded copies
+`evaluate()` makes of recognized text are held the same way, so they are as
+exposed as the `PolicyConfig` itself in a full-memory dump. Keeping watch-list
+text out of crash dumps (AGENTS.md) therefore needs a process-level measure in
+the plugin; the engine does not provide one.
+
+`evaluate()` costs O(entries × entry length × text length) per call, with up to
+three passes per entry, and has no length cap of its own. It is meant for a
+worker thread; the OCR stage that calls it should bound the text it passes in.

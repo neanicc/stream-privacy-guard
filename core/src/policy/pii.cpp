@@ -80,6 +80,20 @@ bool nanp(Text s, const std::vector<std::size_t>& cuts) noexcept {
   });
 }
 
+// True when the digit group at `begin` follows a '+', allowing up to three
+// spaces or opening parentheses between them: "+44", "+ 44", "+(44)", "+ (44)".
+bool after_plus(Text d, std::size_t begin) noexcept {
+  for (std::size_t k = begin; k > 0 && begin - k <= 3; --k) {
+    if (d[k - 1] == U'+') {
+      return true;
+    }
+    if (d[k - 1] != U' ' && d[k - 1] != U'(') {
+      return false;
+    }
+  }
+  return false;
+}
+
 bool number_punct(char32_t c) noexcept {
   return c == U' ' || c == U'-' || c == U'.' || c == U'(' || c == U')' || c == U'+';
 }
@@ -117,7 +131,7 @@ void scan_numbers(Text d, CategorySet enabled, CategorySet& found) {
       j = gap;
     }
     for (std::size_t a = 0; a < groups.size(); ++a) {
-      const bool plus = groups[a].begin > 0 && d[groups[a].begin - 1] == U'+';
+      const bool plus = after_plus(d, groups[a].begin);
       std::u32string digits;
       std::vector<std::size_t> cuts;
       for (std::size_t b = a; b < groups.size() && digits.size() <= 19; ++b) {
@@ -230,6 +244,10 @@ std::vector<Text> runs(Text t, Pred in_run) {
   return out;
 }
 
+bool ipv6_candidate(Text run) {
+  return std::count(run.begin(), run.end(), U':') >= 2 && ipv6(run);
+}
+
 bool has_ip(Text t, Text d) {
   for (const Text run : runs(d, [](char32_t c) { return is_digit(c) || c == U'.'; })) {
     if (has_ipv4(run)) {
@@ -246,7 +264,14 @@ bool has_ip(Text t, Text d) {
     if (run.size() > 1 && run.back() == U':' && run[run.size() - 2] != U':') {
       run.remove_suffix(1);
     }
-    if (std::count(run.begin(), run.end(), U':') >= 2 && ipv6(run)) {
+    if (ipv6_candidate(run)) {
+      return true;
+    }
+    // The run may start with the hex tail of a label glued to the address
+    // ("ipv6:2001:..." starts "6:2001:..."); try it without its first group.
+    const std::size_t colon = run.find(U':');
+    if (colon != Text::npos && colon + 1 < run.size() && run[colon + 1] != U':' &&
+        ipv6_candidate(run.substr(colon + 1))) {
       return true;
     }
   }
@@ -312,21 +337,56 @@ constexpr TokenFormat kTokenFormats[] = {
     {U"eyj", 20},
 };
 
+bool base64url(char32_t c) noexcept { return is_alnum(c) || c == U'_' || c == U'-'; }
+
+// A JWT whose dot-separated parts are each shorter than the single-run rule:
+// a base64url header starting "eyj" ('{"') of at least kJwtMinHeader
+// characters, a dot, and a payload of at least kJwtMinPayload characters.
+// Short real headers, {"typ":"JWT"} and {"alg":"none"}, encode to 18 and 19
+// characters; an empty payload, {}, encodes to "e30".
+constexpr std::size_t kJwtMinHeader = 18;
+constexpr std::size_t kJwtMinPayload = 3;
+
+bool has_jwt(Text t) {
+  for (std::size_t at = t.find(U"eyj"); at != Text::npos; at = t.find(U"eyj", at + 1)) {
+    if (at > 0 && (is_alnum(t[at - 1]) || t[at - 1] == U'_')) {
+      continue;
+    }
+    std::size_t dot = at;
+    while (dot < t.size() && base64url(t[dot])) {
+      ++dot;
+    }
+    if (dot - at < kJwtMinHeader || dot == t.size() || t[dot] != U'.') {
+      continue;
+    }
+    std::size_t end = dot + 1;
+    while (end < t.size() && base64url(t[end])) {
+      ++end;
+    }
+    if (end - dot - 1 >= kJwtMinPayload) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool has_token(Text t) {
-  const auto body_char = [](char32_t c) { return is_alnum(c) || c == U'_' || c == U'-'; };
   for (const TokenFormat& format : kTokenFormats) {
     for (std::size_t at = t.find(format.prefix); at != Text::npos; at = t.find(format.prefix, at + 1)) {
       if (at > 0 && (is_alnum(t[at - 1]) || t[at - 1] == U'_')) {
         continue;
       }
       std::size_t end = at + format.prefix.size();
-      while (end < t.size() && body_char(t[end])) {
+      while (end < t.size() && base64url(t[end])) {
         ++end;
       }
       if (end - at - format.prefix.size() >= format.min_body) {
         return true;
       }
     }
+  }
+  if (has_jwt(t)) {
+    return true;
   }
   // A PEM private key header ("-----BEGIN OPENSSH PRIVATE KEY-----").
   for (std::size_t at = t.find(U"begin"); at != Text::npos; at = t.find(U"begin", at + 1)) {

@@ -17,7 +17,8 @@ namespace spg::detail {
 [[nodiscard]] std::u32string fold_text(std::string_view utf8);
 
 // True for a folded character that separates words in matching_form():
-// anything in ASCII but a-z and 0-9, Unicode whitespace, Latin-1 and General
+// anything in ASCII but a-z and 0-9, Unicode whitespace, punctuation and
+// symbols of any script (separator_table.inc), Latin-1 and General
 // Punctuation, CJK symbols and punctuation, and U+FFFD.
 [[nodiscard]] bool is_separator(char32_t c) noexcept;
 

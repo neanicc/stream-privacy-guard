@@ -58,6 +58,10 @@ TEST_CASE("policy: normalization collapses separators and drops zero-width chara
   CHECK(norm("Zy\xE2\x80\x8Bxa") == "zyxa");                // zero-width space inside a word
   CHECK(norm("Zy\xC2\xADxa") == "zyxa");                    // soft hyphen
   CHECK(norm("zy\xFFxa") == "zy xa");                       // malformed UTF-8 separates
+  CHECK(norm("Zyxa\xD8\x8CQuorbel") == "zyxa quorbel");     // Arabic comma
+  CHECK(norm("Zyxa\xE0\xA5\xA4Quorbel") == "zyxa quorbel");  // Devanagari danda
+  CHECK(norm("Zyxa\xF0\x9F\x98\x80Quorbel") == "zyxa quorbel");  // emoji (a symbol)
+  CHECK(norm("\xD0\x96yxa") == "\xD0\xB6yxa");                // a Cyrillic letter stays a letter
   CHECK(norm("--!!--").empty());
   CHECK(norm("").empty());
 }
@@ -119,6 +123,9 @@ TEST_CASE("policy: short entries match whole words only", "[policy][watchlist]")
   CHECK(hits(entries, "the vex arrives"));
   CHECK(hits(entries, "VEX!"));
   CHECK(hits(entries, "zyxa vex quorbel"));
+  CHECK(hits(entries, "vex\xD8\x8C"));              // Arabic comma ends the word
+  CHECK(hits(entries, "\xE3\x80\x8Cvex\xE3\x80\x8D"));  // CJK corner brackets
+  CHECK(hits(entries, "\xC2\xBFvex?"));             // inverted question mark
   CHECK_FALSE(hits(entries, "convex shapes"));
   CHECK_FALSE(hits(entries, "vexing"));
   CHECK_FALSE(hits(entries, "vax"));  // 3 characters allow no edits
