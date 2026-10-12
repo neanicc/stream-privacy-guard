@@ -129,6 +129,12 @@ FaceDetector FaceDetector::open(runtime::Environment& env, const std::filesystem
   return FaceDetector(runtime::Session::open(env, model, options), config);
 }
 
+FaceDetector FaceDetector::open(runtime::Environment& env, const runtime::ModelBytes& model,
+                                const FaceDetectorConfig& config, const runtime::SessionOptions& options) {
+  check_config(config);  // before paying for a session
+  return FaceDetector(runtime::Session::open(env, model, options), config);
+}
+
 FaceDetector::FaceDetector(runtime::Session session, const FaceDetectorConfig& config)
     : session_(std::move(session)), config_(config) {
   check_config(config_);

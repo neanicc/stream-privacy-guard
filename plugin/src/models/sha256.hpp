@@ -1,13 +1,12 @@
 #pragma once
 
-// SHA-256 (FIPS 180-4), so the plugin checks each model file against the
-// hash pinned in models/manifest.json before ONNX Runtime opens it. No OBS.
+// SHA-256 (FIPS 180-4), so the plugin checks each model's bytes against the
+// hash pinned in models/manifest.json before ONNX Runtime parses those same
+// bytes. No OBS.
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
-#include <optional>
 #include <span>
 #include <string>
 
@@ -32,7 +31,7 @@ class Sha256 {
 // Lower-case hex.
 [[nodiscard]] std::string to_hex(std::span<const std::uint8_t> bytes);
 
-// Lower-case hex SHA-256 of a file's bytes; nullopt when it cannot be read.
-[[nodiscard]] std::optional<std::string> sha256_file(const std::filesystem::path& path);
+// Lower-case hex SHA-256 of `bytes`.
+[[nodiscard]] std::string sha256_hex(std::span<const std::byte> bytes);
 
 }  // namespace spg::plugin

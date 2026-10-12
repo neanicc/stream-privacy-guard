@@ -237,13 +237,29 @@ std::vector<Detection> merge_across_tiles(std::span<const TileDetection> detecti
   return merged;
 }
 
-TextDetector TextDetector::open(runtime::Environment& env, const std::filesystem::path& model,
-                                const TextDetectorConfig& config, runtime::SessionOptions options) {
-  validate(config);  // before paying for a session
+namespace {
+
+// Validates `config` before paying for a session and gives a default warmup.
+runtime::SessionOptions detector_options(const TextDetectorConfig& config, runtime::SessionOptions options) {
+  validate(config);
   if (options.warmup_shapes.empty()) {
     const auto side = static_cast<std::int64_t>(config.tile_size);
     options.warmup_shapes = {{1, 3, side, side}};
   }
+  return options;
+}
+
+}  // namespace
+
+TextDetector TextDetector::open(runtime::Environment& env, const std::filesystem::path& model,
+                                const TextDetectorConfig& config, runtime::SessionOptions options) {
+  options = detector_options(config, std::move(options));
+  return TextDetector(runtime::Session::open(env, model, options), config);
+}
+
+TextDetector TextDetector::open(runtime::Environment& env, const runtime::ModelBytes& model,
+                                const TextDetectorConfig& config, runtime::SessionOptions options) {
+  options = detector_options(config, std::move(options));
   return TextDetector(runtime::Session::open(env, model, options), config);
 }
 

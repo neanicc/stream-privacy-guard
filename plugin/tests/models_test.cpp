@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -153,14 +154,9 @@ TEST_CASE("SHA-256 matches the FIPS 180-4 examples in any chunking", "[models][s
   }
   CHECK(sha256_hex(million, 4096) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
 
-  const fs::path dir = temp_dir("sha");
-  {
-    std::ofstream out(dir / "abc.bin", std::ios::binary);
-    out << abc;
-  }
-  CHECK(spg::plugin::sha256_file(dir / "abc.bin") ==
-        std::optional<std::string>("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
-  CHECK_FALSE(spg::plugin::sha256_file(dir / "absent.bin").has_value());
+  const std::vector<std::byte> bytes = {std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
+  CHECK(spg::plugin::sha256_hex(bytes) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  CHECK(spg::plugin::sha256_hex({}) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }
 
 TEST_CASE("The pinned models are the manifest's three", "[models]") {
@@ -181,7 +177,7 @@ TEST_CASE("The pinned models are the manifest's three", "[models]") {
 TEST_CASE("Missing models are reported and the stages fail closed", "[models]") {
   const fs::path empty = temp_dir("missing");
   const std::vector<fs::path> dirs = {fs::path{}, empty};
-  spg::plugin::ModelPaths paths;
+  spg::plugin::ModelFiles paths;
   const ModelReport located = spg::plugin::locate_models(dirs, paths);
   CHECK(located.status == ModelStatus::Missing);
   CHECK(located.model == "yunet");
@@ -218,7 +214,7 @@ TEST_CASE("Damaged model files are reported and never opened", "[models]") {
   const fs::path first = temp_dir("damaged-first");
   const fs::path second = temp_dir("damaged-second");
   const std::vector<fs::path> dirs = {first, second};
-  spg::plugin::ModelPaths paths;
+  spg::plugin::ModelFiles paths;
 
   SECTION("wrong size, found in the second directory") {
     write_file(second / pins[0].relative, pins[0].size - 1, 'x');
@@ -226,6 +222,14 @@ TEST_CASE("Damaged model files are reported and never opened", "[models]") {
     CHECK(report.status == ModelStatus::Corrupt);
     CHECK(report.model == "yunet");
     CHECK(report.detail.find("damaged-second") != std::string::npos);
+  }
+  SECTION("larger than its pin") {
+    write_file(first / pins[0].relative, pins[0].size + 4096, 'x');
+    const ModelReport report = spg::plugin::locate_models(dirs, paths);
+    CHECK(report.status == ModelStatus::Corrupt);
+    CHECK(report.model == "yunet");
+    CHECK(report.detail.find("more than") != std::string::npos);
+    CHECK(paths.faces.bytes.empty());
   }
   SECTION("right size, wrong bytes") {
     write_file(first / pins[0].relative, pins[0].size, '\0');
@@ -251,6 +255,23 @@ TEST_CASE("Damaged model files are reported and never opened", "[models]") {
       CHECK(report.status == ModelStatus::Corrupt);
       CHECK(report.model == "ppocr-det-en");
     }
+  }
+}
+
+TEST_CASE("The verified bytes are kept for opening, so the file is not read again", "[models][model]") {
+  if (!models_cached()) {
+    SKIP("pinned models not in the cache (run scripts/fetch_models.py)");
+  }
+  const auto pins = spg::plugin::pinned_models();
+  spg::plugin::ModelFiles files;
+  const ModelReport report = spg::plugin::locate_models(std::vector<fs::path>{cache_models()}, files);
+  REQUIRE(report.status == ModelStatus::Ready);
+  const std::array<const spg::plugin::ModelFile*, 3> slots = {&files.faces, &files.text, &files.recognizer};
+  for (std::size_t i = 0; i < pins.size(); ++i) {
+    CAPTURE(pins[i].name);
+    CHECK(slots[i]->path == cache_models() / pins[i].relative);
+    CHECK(slots[i]->bytes.size() == pins[i].size);
+    CHECK(spg::plugin::sha256_hex(slots[i]->bytes) == pins[i].sha256);
   }
 }
 

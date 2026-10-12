@@ -174,13 +174,29 @@ std::vector<float> to_recognizer_tensor(std::span<const detect::BgrImage> images
   return tensor;
 }
 
-TextRecognizer TextRecognizer::open(runtime::Environment& env, const std::filesystem::path& model,
-                                    const TextRecognizerConfig& config, runtime::SessionOptions options) {
-  validate(config);  // before paying for a session
+namespace {
+
+// Validates `config` before paying for a session and gives a default warmup.
+runtime::SessionOptions recognizer_options(const TextRecognizerConfig& config, runtime::SessionOptions options) {
+  validate(config);
   if (options.warmup_shapes.empty()) {
     options.warmup_shapes = {{1, 3, static_cast<std::int64_t>(config.input_height),
                               static_cast<std::int64_t>(config.min_width)}};
   }
+  return options;
+}
+
+}  // namespace
+
+TextRecognizer TextRecognizer::open(runtime::Environment& env, const std::filesystem::path& model,
+                                    const TextRecognizerConfig& config, runtime::SessionOptions options) {
+  options = recognizer_options(config, std::move(options));
+  return TextRecognizer(runtime::Session::open(env, model, options), config);
+}
+
+TextRecognizer TextRecognizer::open(runtime::Environment& env, const runtime::ModelBytes& model,
+                                    const TextRecognizerConfig& config, runtime::SessionOptions options) {
+  options = recognizer_options(config, std::move(options));
   return TextRecognizer(runtime::Session::open(env, model, options), config);
 }
 

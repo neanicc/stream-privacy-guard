@@ -86,6 +86,10 @@ class FaceDetector {
   [[nodiscard]] static FaceDetector open(runtime::Environment& env, const std::filesystem::path& model,
                                          const FaceDetectorConfig& config = {},
                                          const runtime::SessionOptions& options = {});
+  // The same from bytes already read and checked (runtime::ModelBytes).
+  [[nodiscard]] static FaceDetector open(runtime::Environment& env, const runtime::ModelBytes& model,
+                                         const FaceDetectorConfig& config = {},
+                                         const runtime::SessionOptions& options = {});
 
   // Takes an open session. Throws FaceDetectorError unless it has one float32
   // input of static shape [1, 3, H, W] (H and W multiples of 32) and YuNet's

@@ -1,8 +1,6 @@
 #include "models/sha256.hpp"
 
 #include <bit>
-#include <fstream>
-#include <vector>
 
 namespace spg::plugin {
 
@@ -110,23 +108,9 @@ std::string to_hex(std::span<const std::uint8_t> bytes) {
   return out;
 }
 
-std::optional<std::string> sha256_file(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return std::nullopt;
-  }
+std::string sha256_hex(std::span<const std::byte> bytes) {
   Sha256 hash;
-  std::vector<char> chunk(1 << 16);
-  while (in) {
-    in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
-    const std::streamsize got = in.gcount();
-    if (got > 0) {
-      hash.update(std::span{reinterpret_cast<const std::uint8_t*>(chunk.data()), static_cast<std::size_t>(got)});
-    }
-  }
-  if (in.bad()) {
-    return std::nullopt;
-  }
+  hash.update(std::span{reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()});
   return to_hex(hash.finish());
 }
 

@@ -1,9 +1,12 @@
 #include "models/model_set.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <new>
+#include <optional>
 #include <system_error>
 #include <utility>
 
@@ -93,6 +96,32 @@ std::string display(const std::filesystem::path& path) {
   return {reinterpret_cast<const char*>(text.data()), text.size()};
 }
 
+// Reads up to `limit` bytes of `path`; nullopt when it cannot be opened or a
+// read fails. Throws only std::bad_alloc.
+std::optional<std::vector<std::byte>> read_at_most(const std::filesystem::path& path, std::uint64_t limit) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return std::nullopt;
+  }
+  std::vector<std::byte> bytes;
+  constexpr std::size_t kChunk = std::size_t{1} << 16;
+  while (in && bytes.size() < limit) {
+    const std::size_t at = bytes.size();
+    const auto want = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, limit - at));
+    bytes.resize(at + want);
+    in.read(reinterpret_cast<char*>(bytes.data() + at), static_cast<std::streamsize>(want));
+    bytes.resize(at + static_cast<std::size_t>(in.gcount()));
+  }
+  if (in.bad()) {
+    return std::nullopt;
+  }
+  return bytes;
+}
+
+runtime::ModelBytes bytes_of(const ModelFile& file) {
+  return {file.path, file.bytes};
+}
+
 std::string joined(std::span<const std::filesystem::path> dirs) {
   std::string out;
   for (const std::filesystem::path& dir : dirs) {
@@ -143,8 +172,8 @@ std::filesystem::path default_models_dir() {
   return home / ".cache" / "spg" / "models";
 }
 
-ModelReport locate_models(std::span<const std::filesystem::path> dirs, ModelPaths& out) {
-  std::array<std::filesystem::path*, 3> slots = {&out.faces, &out.text, &out.recognizer};
+ModelReport locate_models(std::span<const std::filesystem::path> dirs, ModelFiles& out) {
+  std::array<ModelFile*, 3> slots = {&out.faces, &out.text, &out.recognizer};
   for (std::size_t i = 0; i < kPinned.size(); ++i) {
     const PinnedModel& pin = kPinned[i];
     std::filesystem::path found;
@@ -164,27 +193,33 @@ ModelReport locate_models(std::span<const std::filesystem::path> dirs, ModelPath
                     std::string(pin.relative) + " is not in " + joined(dirs) + " (run scripts/fetch_models.py)");
     }
     std::error_code ec;
-    const std::uintmax_t size = std::filesystem::is_regular_file(found, ec) ? std::filesystem::file_size(found, ec) : 0;
-    if (ec || size != pin.size) {
-      return report(ModelStatus::Corrupt, pin.name,
-                    display(found) + " has " + std::to_string(size) + " bytes, expected " + std::to_string(pin.size));
+    if (!std::filesystem::is_regular_file(found, ec)) {
+      return report(ModelStatus::Corrupt, pin.name, display(found) + " is not a regular file");
     }
-    const std::optional<std::string> hash = sha256_file(found);
-    if (!hash) {
+    // The size and hash are checked on these bytes, and these bytes are what
+    // ONNX Runtime parses: nothing reopens the file after the check.
+    std::optional<std::vector<std::byte>> bytes = read_at_most(found, pin.size + 1);
+    if (!bytes) {
       return report(ModelStatus::Corrupt, pin.name, display(found) + " cannot be read");
     }
-    if (*hash != pin.sha256) {
+    if (bytes->size() != pin.size) {
+      return report(ModelStatus::Corrupt, pin.name,
+                    display(found) + " has " + (bytes->size() > pin.size ? "more than " : "") +
+                        std::to_string(bytes->size()) + " bytes, expected " + std::to_string(pin.size));
+    }
+    if (sha256_hex(*bytes) != pin.sha256) {
       return report(ModelStatus::Corrupt, pin.name, display(found) + " does not match its pinned SHA-256");
     }
-    *slots[i] = std::move(found);
+    slots[i]->path = std::move(found);
+    slots[i]->bytes = std::move(*bytes);
   }
   return report(ModelStatus::Ready, "", "");
 }
 
 LoadResult load_models(std::span<const std::filesystem::path> dirs, const LoadOptions& options) {
-  ModelPaths paths;
+  ModelFiles files;
   LoadResult out;
-  out.report = locate_models(dirs, paths);
+  out.report = locate_models(dirs, files);
   if (out.report.status != ModelStatus::Ready) {
     return out;
   }
@@ -195,11 +230,11 @@ LoadResult load_models(std::span<const std::filesystem::path> dirs, const LoadOp
   const char* opening = kPinned[0].name;
   try {
     auto env = std::make_unique<runtime::Environment>(runtime::Environment::LogLevel::Error);
-    detect::FaceDetector faces = detect::FaceDetector::open(*env, paths.faces, {}, session);
+    detect::FaceDetector faces = detect::FaceDetector::open(*env, bytes_of(files.faces), {}, session);
     opening = kPinned[1].name;
-    detect::TextDetector text = detect::TextDetector::open(*env, paths.text, {}, session);
+    detect::TextDetector text = detect::TextDetector::open(*env, bytes_of(files.text), {}, session);
     opening = kPinned[2].name;
-    ocr::TextRecognizer recognizer = ocr::TextRecognizer::open(*env, paths.recognizer, {}, session);
+    ocr::TextRecognizer recognizer = ocr::TextRecognizer::open(*env, bytes_of(files.recognizer), {}, session);
     std::string providers = std::string("faces=") + std::string(runtime::to_string(faces.session().provider())) +
                             ", text=" + std::string(runtime::to_string(text.session().provider())) +
                             ", recognizer=" + std::string(runtime::to_string(recognizer.session().provider()));

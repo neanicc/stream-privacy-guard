@@ -239,7 +239,9 @@ struct Session::Impl {
 
 namespace {
 
-std::unique_ptr<Session::Impl> create_impl(Ort::Env& env, const fs::path& path, Provider provider,
+// `bytes`, when set, is the model; `path` then only names it.
+std::unique_ptr<Session::Impl> create_impl(Ort::Env& env, const fs::path& path,
+                                           const std::optional<std::span<const std::byte>>& bytes, Provider provider,
                                            const SessionOptions& options) {
   Ort::SessionOptions ort_options;
   ort_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -252,7 +254,8 @@ std::unique_ptr<Session::Impl> create_impl(Ort::Env& env, const fs::path& path, 
   impl->path = path;
   impl->path_label = path_text(path);
   impl->provider = provider;
-  impl->session = Ort::Session(env, path.c_str(), ort_options);
+  impl->session = bytes ? Ort::Session(env, bytes->data(), bytes->size(), ort_options)
+                        : Ort::Session(env, path.c_str(), ort_options);
 
   const Ort::AllocatorWithDefaultOptions allocator;
   const std::size_t input_count = impl->session.GetInputCount();
@@ -292,16 +295,30 @@ Session::Session(Session&&) noexcept = default;
 Session& Session::operator=(Session&&) noexcept = default;
 
 Session Session::open(Environment& env, const std::filesystem::path& model, const SessionOptions& options) {
+  if (env.impl_) {
+    std::error_code ec;
+    if (!fs::is_regular_file(model, ec)) {
+      throw RuntimeError(ErrorCode::ModelNotFound,
+                         "spg runtime: model file not found: " + path_text(model) +
+                             " (run scripts/fetch_models.py, or check the configured model directory)");
+    }
+  }
+  return open_from(env, model, std::nullopt, options);
+}
+
+Session Session::open(Environment& env, const ModelBytes& model, const SessionOptions& options) {
+  if (env.impl_ && model.bytes.empty()) {
+    throw RuntimeError(ErrorCode::ModelLoadFailed, "spg runtime: " + path_text(model.path) + ": the model is empty");
+  }
+  return open_from(env, model.path, model.bytes, options);
+}
+
+Session Session::open_from(Environment& env, const std::filesystem::path& model,
+                           const std::optional<std::span<const std::byte>>& bytes, const SessionOptions& options) {
   const std::string label = path_text(model);
   if (!env.impl_) {
     throw RuntimeError(ErrorCode::InvalidInput,
                        "spg runtime: " + label + ": the Environment was moved from; open sessions with a live one");
-  }
-  std::error_code ec;
-  if (!fs::is_regular_file(model, ec)) {
-    throw RuntimeError(ErrorCode::ModelNotFound,
-                       "spg runtime: model file not found: " + label +
-                           " (run scripts/fetch_models.py, or check the configured model directory)");
   }
 
   std::vector<Provider> order = options.providers;
@@ -322,7 +339,7 @@ Session Session::open(Environment& env, const std::filesystem::path& model, cons
     }
     ErrorCode code = ErrorCode::ModelLoadFailed;
     try {
-      auto impl = create_impl(env.impl_->env, model, provider, options);
+      auto impl = create_impl(env.impl_->env, model, bytes, provider, options);
       Session session(std::move(impl));
       if (options.warmup_runs > 0) {
         session.warmup(options.warmup_shapes, options.warmup_runs);
