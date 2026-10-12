@@ -68,3 +68,40 @@ Template:
   prebuilt dates from March 2024, so a refresh or source build may be needed
   later; OBS plugin builds may need the OpenCV libraries checked
   for position-independent code on Linux (SPG-13).
+
+## 2026-10-12 — SPG-02 Core contracts and geometry (#PR)
+
+- Decision / change: plan section 5 types as headers in `core/include/spg/`
+  (`time`, `frame`, `geometry`, `category`, `detection`, `mask`,
+  `policy_config`, `ground_truth`, `secret`, `error`, `json`), documented in
+  `docs/contracts.md`. Choices the plan left open: `Timestamp` is int64
+  nanoseconds on an arbitrary monotonic epoch with an injected `Clock`
+  (`ManualClock` for tests); `FrameView` carries up to three plane pointers and
+  strides because NV12 and I420 are planar; one `Category` enum serves enabled
+  categories, verdict reason codes (`WATCHLIST`, `PII_CARD`, ...) and
+  ground-truth kinds (`watchlist`, `pii:card`, ..., plus `decoy`); `ModelInput`
+  is a crop of the readback frame resized by stretch or letterbox (center or
+  top-left), so tiles and whole-frame models share one mapping;
+  `core/src/frame/geometry.cpp` is the only space converter and computes in
+  double; `enclosing_pixels` rounds outward so pixel masks never shrink.
+  Watch-list entries and OCR text are a `Secret` type with no stream operator or
+  implicit conversion. JSON uses nlohmann/json 3.12.0 (MIT) via FetchContent
+  pinned by SHA-256 (`json.tar.xz`, 42f6e95c...), linked privately into
+  `spg-core`. Parsing is strict (schema 1, unknown and duplicate fields
+  rejected, ranges checked) and errors never forward library text, which can
+  quote input. Mask plan JSON is defined now too because the SPG-03 scorer reads
+  it. Defaults with no plan value: fuzzy `max_edits` 2, `max_edit_ratio` 0.2,
+  `min_partial_chars` 6; margin 4 px + 0.25 x min(w, h); visibility > 0 counts
+  as visible. SPG-08/09/03 may tune these with eval evidence.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21):
+  `scripts/ci/run.sh setup`, `build`, `test` pass with 36 ctest tests (24 new
+  unit tests: round trips between every pair of spaces over 5000 seeded
+  mappings, direct vs chained conversion, containment, outward pixel rounding,
+  JSON round trips and strictness, fixtures, sentinel test). Mutation check:
+  forwarding the JSON library's parse message made the sentinel test fail.
+- Eval delta: none; no pipeline stage exists yet (`run.sh eval` still prints
+  `THRESHOLDS: NOT RUN`).
+- Open issues or follow-ups: SPG-08 owns the normalization and matching that
+  interpret `fuzzy`; SPG-09 owns the margin formula; SPG-03 should read the
+  committed fixtures in `tests/fixtures/contracts/` to keep the Python side in
+  step with the C++ parser.

@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "space": "source",
+  "frame": 12,
+  "timestamp_ns": 200000000,
+  "width": 1920,
+  "height": 1080,
+  "instances": [
+    {"id": "wl-0", "kind": "watchlist", "box": {"x": 100, "y": 40.5, "w": 220, "h": 18}, "visibility": 1.0},
+    {"id": "pii-3", "kind": "pii:card", "box": {"x": 900, "y": 600, "w": 180, "h": 16}, "visibility": 0.5},
+    {"id": "decoy-1", "kind": "decoy", "box": {"x": 0, "y": 0, "w": 50, "h": 12}, "visibility": 0}
+  ]
+}
