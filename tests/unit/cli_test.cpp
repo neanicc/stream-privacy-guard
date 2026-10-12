@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -330,6 +331,54 @@ TEST_CASE("realtime run feeds the scheduler on the wall clock", "[cli]") {
   }
   CHECK(shared_times->summary().at("face_detect").count == r.latencies_ms.size());
   CHECK(r.padding_frames > 0);
+}
+
+TEST_CASE("realtime run counts a decoding stall in detection latency", "[cli]") {
+  // Frame 40 takes 500 ms to decode. The decoder runs 16 frames ahead, so the
+  // feed reaches frame 40 about 230 ms after it was due. A live source would
+  // not wait: the frame keeps its due time, and the delay shows up as
+  // latency (and, past the lookahead, as fail-closed frames) instead of
+  // silently slowing the feed.
+  constexpr std::size_t kStalled = 40;
+  spg::cli::FrameSource source{60, 60, [](std::size_t i) {
+                                 if (i == kStalled) {
+                                   std::this_thread::sleep_for(std::chrono::milliseconds{500});
+                                 }
+                                 return gray_frame(64, 48, static_cast<std::uint8_t>(16 + i));
+                               }};
+  spg::cli::StageTimes times;
+  auto cycles = std::make_shared<spg::cli::CycleLog>();
+  spg::ScanStages raw;
+  raw.faces = face_from(0);
+  const spg::ScanStages stages = spg::cli::timed(raw, std::make_shared<spg::cli::StageTimes>(), cycles);
+  const auto r = spg::cli::run_realtime(source, faces_only(), stages, spg::cli::DriverOptions{}, times, *cycles);
+  REQUIRE(r.plans.size() == 60);
+  CHECK(r.late_frames >= 1);
+  REQUIRE_FALSE(r.latencies_ms.empty());
+  CHECK(*std::max_element(r.latencies_ms.begin(), r.latencies_ms.end()) >= 200.0);
+}
+
+TEST_CASE("timed stages end a cycle after its policy calls", "[cli]") {
+  auto cycles = std::make_shared<spg::cli::CycleLog>();
+  spg::ScanStages raw;
+  raw.text = std::make_shared<ScriptedDetector>([](Timestamp, spg::Size) {
+    return std::vector<spg::Detection>{spg_test::text_at(4, 4, 20, 8)};
+  });
+  raw.recognizer = std::make_shared<ScriptedRecognizer>([](const spg::Detection&) { return std::string("x"); });
+  raw.policy = std::make_shared<ScriptedPolicy>([] { std::this_thread::sleep_for(std::chrono::milliseconds{50}); });
+  const spg::ScanStages stages = spg::cli::timed(raw, std::make_shared<spg::cli::StageTimes>(), cycles);
+
+  const spg::BgraImage frame = gray_frame(64, 48, 100);
+  const spg::FrameView view = frame.view(spg::SteadyClock{}.now());
+  const std::vector<spg::Detection> regions = stages.text->detect(view, frame.size());
+  const std::vector<spg::Secret> texts = stages.recognizer->recognize(view, frame.size(), regions);
+  REQUIRE(texts.size() == 1);
+  (void)stages.policy->evaluate(texts[0]);
+
+  const std::vector<double> latencies = cycles->latencies_ms();
+  REQUIRE(latencies.size() == 1);
+  // The 50 ms the policy took is part of the cycle.
+  CHECK(latencies[0] >= 50.0);
 }
 
 TEST_CASE("timing summaries use nearest-rank percentiles", "[cli]") {

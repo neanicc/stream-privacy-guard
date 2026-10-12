@@ -1,6 +1,7 @@
 #include "driver.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
@@ -345,6 +346,12 @@ class Prefetcher {
   std::thread thread_;
 };
 
+// `at` on SteadyClock's time base (steady_clock's time since its epoch, as
+// SteadyClock::now() reads it).
+Timestamp steady_timestamp(steady::time_point at) {
+  return Timestamp{std::chrono::duration_cast<Duration>(at.time_since_epoch())};
+}
+
 }  // namespace
 
 SequenceResult run_realtime(const FrameSource& source, const PolicyConfig& policy, const ScanStages& stages,
@@ -381,7 +388,12 @@ SequenceResult run_realtime(const FrameSource& source, const PolicyConfig& polic
       } else {
         ++result.padding_frames;
       }
-      Timestamp t = clock.now();
+      // Stamped with when the frame was due, not when decoding let it in: a
+      // live source keeps its pace, so a frame the feed pushes late arrives
+      // with that delay already spent from its lookahead and counted in its
+      // detection latency. Stamping it on arrival would slow the feed the
+      // workers see and hide the delay.
+      Timestamp t = steady_timestamp(due);
       if (t <= previous) {
         t = previous + Duration{1};
       }

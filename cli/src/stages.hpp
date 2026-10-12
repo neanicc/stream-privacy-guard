@@ -49,7 +49,9 @@ struct OpenedStages {
 
 // `stages` with every non-null stage wrapped to add its call time to `times`
 // (kStageFaces, kStageText, kStageRecognize, kStagePolicy) and, when `cycles`
-// is set, the end of each call to the cycle of the readback it scanned.
+// is set, the end of each call to the cycle of the readback it scanned (a
+// policy call, which has no readback, to the cycle whose earlier stages ran
+// on the same thread).
 // Exceptions pass through unchanged, so run_scan() still fails the cycle.
 [[nodiscard]] ScanStages timed(const ScanStages& stages, std::shared_ptr<StageTimes> times,
                                std::shared_ptr<CycleLog> cycles = nullptr);
