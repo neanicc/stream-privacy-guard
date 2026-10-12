@@ -9,6 +9,16 @@
                         as many values as the right shape
     text_sqrt.onnx      DBNet-shaped, y = sqrt(channel mean of x): NaN where
                         the input is darker than mid gray
+    rec_softmax.onnx    CTC-recognizer-shaped: x [n, 3, 48, w] -> y [n, w, 144],
+                        softmax over each input column's 3 x 48 values; its
+                        'character' metadata has 142 made-up lines, so y has
+                        blank + 142 + space classes (one step per column)
+    rec_sqrt.onnx       as rec_softmax with sqrt instead of softmax: NaN where
+                        the input is darker than mid gray
+    rec_wrong_classes.onnx  rec_softmax with a 10-line dictionary, so y has
+                        more classes than the alphabet (ONNX Runtime infers
+                        the 144, so opening it fails)
+    rec_no_dictionary.onnx  rec_softmax without 'character' metadata
     models.txt          one line per model in models/manifest.json:
                         name<TAB>cache path<TAB>warmup shapes<TAB>metadata keys
 
@@ -27,6 +37,7 @@ import sys
 from pathlib import Path
 
 FLOAT = 1  # TensorProto.DataType.FLOAT
+INT64 = 7  # TensorProto.DataType.INT64
 
 
 def varint(value: int) -> bytes:
@@ -112,6 +123,39 @@ def text_model(name: str, ops: list[tuple[str, list[bytes]]]) -> bytes:
     return field_varint(1, 8) + field_bytes(2, "spg-tests") + field_bytes(7, graph) + field_bytes(8, opset)
 
 
+def rec_model(name: str, last: tuple[str, list[bytes]], metadata: dict[str, str]) -> bytes:
+    """A CTC-recognizer-shaped chain: x float32 [n, 3, 48, w] -> Transpose to
+    [n, w, 3, 48] -> Reshape to [n, w, 144] -> `last` op -> y [n, t, c].
+
+    One time step per input column. Output dims are symbolic, so only
+    recognize() can see what the model really returns.
+    """
+    # TensorProto: dims = 1, data_type = 2, name = 8, raw_data = 9
+    shape = field_varint(1, 3) + field_varint(2, INT64) + field_bytes(8, "shape") \
+        + field_bytes(9, struct.pack("<3q", 0, 0, -1))
+    transpose = field_bytes(1, "x") + field_bytes(2, "cols") + field_bytes(3, "n0") + field_bytes(4, "Transpose") \
+        + field_bytes(5, attribute_ints("perm", [0, 3, 1, 2]))
+    reshape = field_bytes(1, "cols") + field_bytes(1, "shape") + field_bytes(2, "steps") + field_bytes(3, "n1") \
+        + field_bytes(4, "Reshape")
+    op_type, attributes = last
+    final = field_bytes(1, "steps") + field_bytes(2, "y") + field_bytes(3, "n2") + field_bytes(4, op_type)
+    for attribute in attributes:
+        final += field_bytes(5, attribute)
+    graph = field_bytes(1, transpose) + field_bytes(1, reshape) + field_bytes(1, final) + field_bytes(2, name) \
+        + field_bytes(5, shape) + field_bytes(11, value_info("x", ["n", 3, 48, "w"])) \
+        + field_bytes(12, value_info("y", ["n", "t", "c"]))
+    opset = field_bytes(1, "") + field_varint(2, 13)
+    model = field_varint(1, 8) + field_bytes(2, "spg-tests") + field_bytes(7, graph) + field_bytes(8, opset)
+    for key, value in metadata.items():
+        model += field_bytes(14, field_bytes(1, key) + field_bytes(2, value))
+    return model
+
+
+def made_up_dictionary(lines: int) -> str:
+    """`lines` printable ASCII symbols, one per line (not PP-OCR's dictionary)."""
+    return "".join(chr(0x21 + i % 94) + "\n" for i in range(lines))
+
+
 def models_listing(manifest: Path, cache: Path) -> str:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     lines = []
@@ -142,6 +186,14 @@ def main(argv: list[str]) -> int:
         channel_mean, ("SpaceToDepth", [attribute_int("blocksize", 2)])]))
     # sqrt of the channel mean: finite on light pixels, NaN on dark ones.
     (args.out / "text_sqrt.onnx").write_bytes(text_model("spg_text_sqrt", [channel_mean, ("Sqrt", [])]))
+    # 3 x 48 values per column = 144 classes = blank + 142 symbols + space.
+    dictionary = {"character": made_up_dictionary(142)}
+    softmax = ("Softmax", [attribute_int("axis", -1)])
+    (args.out / "rec_softmax.onnx").write_bytes(rec_model("spg_rec_softmax", softmax, dictionary))
+    (args.out / "rec_sqrt.onnx").write_bytes(rec_model("spg_rec_sqrt", ("Sqrt", []), dictionary))
+    (args.out / "rec_wrong_classes.onnx").write_bytes(
+        rec_model("spg_rec_wrong_classes", softmax, {"character": made_up_dictionary(10)}))
+    (args.out / "rec_no_dictionary.onnx").write_bytes(rec_model("spg_rec_no_dictionary", softmax, {}))
     (args.out / "models.txt").write_text(models_listing(args.manifest, args.cache.expanduser()),
                                          encoding="utf-8", newline="\n")
     return 0
