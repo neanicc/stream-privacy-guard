@@ -163,12 +163,18 @@ struct ScanResult {
   ScanFailure failure = ScanFailure::None;
   // Source-space boxes to mask, in the job's source size: faces, and text
   // regions that are sensitive, unread, over the text cap or unjudged.
+  // An incomplete result (a partial cycle) keeps the valid boxes found before
+  // the failure: faces from a face stage that finished, every text region
+  // once the text detector returned (a failed recognizer or policy cleared
+  // none), and the valid boxes of a stage whose output was malformed. The
+  // scheduler holds them without counting the cycle as a scan.
   std::vector<Detection> detections;
 };
 
-// Runs one cycle. Never throws: any exception from a stage (InferenceFailed,
-// DecodeError, ContractError, bad_alloc, or a non-std exception) or invalid
-// output yields an incomplete result. Never logs, and keeps no text.
+// Runs one cycle, stopping at the first failure. Never throws: any exception
+// from a stage (InferenceFailed, DecodeError, ContractError, bad_alloc, or a
+// non-std exception) or invalid output yields an incomplete result with the
+// detections found before it. Never logs, and keeps no text.
 [[nodiscard]] ScanResult run_scan(const ScanStages& stages, const ScanJob& job,
                                   const ScanLimits& limits) noexcept;
 

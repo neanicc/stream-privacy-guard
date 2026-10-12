@@ -8,7 +8,7 @@ fail-closed, retroactive-masking and temporal-hold invariants from
 
 | Piece | What it is |
 | --- | --- |
-| `run_scan()` | One detection cycle over one readback frame: faces, text regions, recognition, policy. Never throws; any exception, invalid output or missing detector for an enabled category makes the cycle incomplete. |
+| `run_scan()` | One detection cycle over one readback frame: faces, text regions, recognition, policy. Never throws; any exception, invalid output or missing detector for an enabled category makes the cycle incomplete, and an incomplete result still carries the valid boxes found before the failure ([partial cycles](#partial-cycles)). |
 | `Lookahead` | Single-threaded state machine: the frame ring, the bounded scan queue, cadence, coverage, retroactive masks, release and fallback. Tests and offline tools drive it directly with a `ManualClock`. |
 | `Scheduler` | `Lookahead` behind a mutex plus a pool of worker threads that call `run_scan()`. This is what the plugin (SPG-14) uses. |
 
@@ -66,10 +66,12 @@ without boxes held over it or found just after it.
 
 Every other path only feeds the gate: `push()` sets `bad_timestamp` (rule 4)
 and `apply_failed` for frames up to `ts + hold` of a failed result;
-`complete()` sets `covered` (rules 1 and 2) or `apply_failed`; an incomplete
-result, a job dropped from a full queue or by `take_job()`, a cadence-skipped
-frame and a readback that matches no buffered frame set nothing, so their
-frames stay `NotScanned` unless another cycle covers them; a resize or
+`complete()` sets `covered` (rules 1 and 2, complete results only) or
+`apply_failed`; an incomplete result (whose boxes are still held, see
+[partial cycles](#partial-cycles)), a job dropped from a full queue or by
+`take_job()`, a cadence-skipped frame and a readback that matches no buffered
+frame never set `covered`, so their frames stay `NotScanned` unless another
+cycle covers them; a resize or
 `mark_discontinuity()` starts a segment so earlier cycles do not cover later
 frames. A result that lands after its frames were released (late
 `complete()`) cannot rescue them; it still reaches the tracker and, through
@@ -102,13 +104,51 @@ previous frame (plan section 7), so `push(t, size, readback)` with
 `readback.timestamp == t_prev` queues a cycle on `t_prev`. A readback whose
 timestamp matches no buffered frame with a valid timestamp is not scanned.
 
+### Partial cycles
+
+A cycle can fail after some of its stages finished: faces found, then the text
+detector throws; text regions found, then the recognizer or the policy throws.
+The boxes found before the failure are real detections. Until SPG-10c
+`run_scan()` dropped them, so the failed frame blurred but the boxes never
+reached the tracker: if the face detector missed on the next cycle, frames
+that cycle covered aired the face inside its hold.
+
+`run_scan()` stops at the first failure and returns an incomplete result whose
+`detections` keep what was found before it:
+
+| Failure | Boxes kept |
+| --- | --- |
+| face detector throws | none (text never runs) |
+| face detector returns malformed output | its valid faces (text never runs) |
+| text detector throws | the faces |
+| text detector returns malformed output | the faces and its valid regions |
+| recognizer throws or returns the wrong count | the faces and every region |
+| policy throws on some region | the faces and every region, including any it judged safe before failing |
+| missing detector for an enabled category | none (nothing runs) |
+
+A box is kept only when it passes `validate()` and has the stage's kind; a
+non-finite, negative, wrong-space or wrong-kind box, or a bad score, is never
+held. A region that no finished text stage cleared is masked (recall over
+precision), as it is when no recognizer or policy is configured.
+
+`Lookahead::complete()` treats an incomplete result with boxes like a complete
+one for masking: the boxes enter the tracker (held for `hold`), become
+retroactive rects on buffered frames in `[ts - retro, ts)`, and mark the
+re-emit candidate in their reach. If they cannot be applied (tracker
+rejection, allocation failure, or a job from before more resizes than the size
+history holds) they fail closed exactly as a complete result's do
+(`ApplyFailed` from `ts - retro` to `ts + hold`). The one difference is
+coverage: an incomplete cycle never sets `covered`, so it never lets a frame
+air clean (rule 1). It counts in `scans_failed`, never in `scans_completed`.
+An incomplete result with no boxes changes nothing but `scans_failed`.
+
 ## Masks
 
 `MaskPlan.rects` for a frame at `t` is the union of:
 
 - `Tracker::masks(t)`: every detection seen in `[t - hold, t]`, with margin and
   constant-velocity prediction ([tracker.md](tracker.md));
-- **retroactive rects**: each box of a complete cycle at `ts` in `(t, t + retro]`
+- **retroactive rects**: each box of a cycle (complete, or partial) at `ts` in `(t, t + retro]`
   that finished while the frame was buffered, grown by the same margin and
   rounded outward to whole pixels. The tracker only covers frames at or after
   a detection, so this is what blurs a secret from its first frame.
@@ -220,9 +260,10 @@ Offline, `spg-cli` (SPG-11) can drive `Lookahead` directly: push, take a job,
 `tests/unit/lookahead_test.cpp` (deterministic cases),
 `tests/unit/lookahead_property_test.cpp` (1500 seeded scenes; its oracle also
 checks every re-emitted frame against every box that could reach it, and its
-scenes include results the tracker rejects and a source that changes size
-faster than the size history) and `tests/unit/scheduler_test.cpp` (real
-threads). See the SPG-10 entry in
-[agent-log.md](agent-log.md). None of this is synthetic-eval or live evidence;
+scenes include results the tracker rejects, a source that changes size
+faster than the size history, and failed cycles that return partial boxes,
+which the oracle checks for retro and hold like a complete cycle's but never
+counts as coverage) and `tests/unit/scheduler_test.cpp` (real threads). See
+the SPG-10, SPG-10b and SPG-10c entries in [agent-log.md](agent-log.md). None of this is synthetic-eval or live evidence;
 cadence, worker count and the fail-closed rate on real detectors are for
 `spg-cli bench` (SPG-11/16) to measure.

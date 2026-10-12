@@ -983,6 +983,238 @@ TEST_CASE("a complete result older than the size history fails closed", "[schedu
   }
 }
 
+// SPG-10c: a cycle that fails after some of its stages finished still found
+// those boxes. They are held (temporal hold) and masked retroactively, so a
+// later cycle whose face detector misses cannot air them inside the hold; the
+// failed cycle still covers no frame.
+TEST_CASE("detections from a failed cycle are held and masked retroactively", "[schedule]") {
+  const Rect box{40, 40, 30, 30};
+  SchedulerConfig config = small_config();  // retro 100, hold 200
+  config.lookahead = 500ms;
+  // The face detector sees the box only on frame 1040 (flicker), and the text
+  // detector throws on that frame.
+  const auto faces = std::make_shared<spg_test::ScriptedDetector>([box](Timestamp t, Size) {
+    std::vector<Detection> out;
+    if (t == at_ms(1040)) {
+      out.push_back(face_at(box.x, box.y, box.width, box.height));
+    }
+    return out;
+  });
+  const auto text = std::make_shared<spg_test::ScriptedDetector>(
+      [](Timestamp, Size) { return std::vector<Detection>{}; },
+      [](Timestamp t) {
+        if (t == at_ms(1040)) {
+          throw std::runtime_error("InferenceFailed: session run");
+        }
+      });
+  Sim sim(config, spg::ScanStages{faces, text, nullptr, nullptr});
+  sim.push(1000, false);
+  sim.push(1020, false);
+  sim.push(1040, true);
+  const spg::ScanResult partial = sim.scan_now();
+  CHECK_FALSE(partial.complete);
+  CHECK(partial.failure == spg::ScanFailure::TextDetector);
+  CHECK(partial.detections.size() == 1);
+  CHECK(sim.la.stats().scans_failed == 1);
+  CHECK(sim.la.stats().scans_completed == 0);
+  sim.push(1060, false);
+
+  SECTION("later cycles that miss the face keep it masked within the hold") {
+    sim.push(1080, false);
+    sim.push(1100, true);
+    CHECK(sim.scan_now().complete);  // sees nothing; covers 1000 .. 1100
+    sim.push(1200, true);            // within the hold (1040 + 200)
+    CHECK(sim.scan_now().complete);  // sees nothing
+    const auto out = sim.release_at(1800);
+    REQUIRE(out.size() == 7);
+    for (const ReleasedFrame& r : out) {
+      INFO("frame at " << spg::to_ns(r.frame_time) / 1'000'000);
+      // On main these aired clean without the box: 1000 and 1020 before it
+      // was found (retroactive), 1040 .. 1200 after it (hold).
+      CHECK(r.action == FallbackAction::None);
+      CHECK(covered_by(r.plan, box));
+    }
+    CHECK(sim.la.stats().scans_completed == 2);
+  }
+  SECTION("on its own it covers no frame") {
+    const auto out = sim.release_at(1800);
+    REQUIRE(out.size() == 4);
+    for (const ReleasedFrame& r : out) {
+      INFO("frame at " << spg::to_ns(r.frame_time) / 1'000'000);
+      CHECK(r.reason == FallbackReason::NotScanned);
+      CHECK(covered_by(r.plan, box));  // the fallback plan still lists it
+    }
+  }
+}
+
+TEST_CASE("a failed cycle keeps the valid boxes its stages found before the failure", "[schedule]") {
+  const Rect face{10, 10, 20, 20};
+  const Rect r1{0, 50, 60, 10};
+  const Rect r2{0, 70, 60, 10};
+  const auto faces = faces_always(face);
+  const auto regions = std::make_shared<spg_test::ScriptedDetector>([=](Timestamp, Size) {
+    return std::vector<Detection>{text_at(r1.x, r1.y, r1.width, r1.height), text_at(r2.x, r2.y, r2.width, r2.height)};
+  });
+  // Region r1 reads "fine", r2 reads "boom".
+  const auto recognizer = std::make_shared<spg_test::ScriptedRecognizer>(
+      [](const Detection& d) { return std::string(d.box.rect.y == 50.0F ? "fine" : "boom"); });
+  // Clears "fine" and throws on "boom", after judging r1 safe.
+  struct BoomPolicy final : spg::TextPolicy {
+    spg::Verdict evaluate(const spg::Secret& text) const override {
+      if (text.reveal() == "boom") {
+        throw std::runtime_error("policy failed");
+      }
+      return {};
+    }
+  };
+  struct ThrowingRecognizer final : spg::TextRecognizer {
+    std::vector<spg::Secret> recognize(const spg::FrameView&, Size,
+                                       std::span<const Detection>) const override {
+      throw std::runtime_error("InferenceFailed");
+    }
+  };
+  struct ShortRecognizer final : spg::TextRecognizer {
+    std::vector<spg::Secret> recognize(const spg::FrameView&, Size,
+                                       std::span<const Detection>) const override {
+      return {};
+    }
+  };
+  const auto throwing = [](Timestamp) { throw std::runtime_error("InferenceFailed"); };
+  const auto empty = [](Timestamp, Size) { return std::vector<Detection>{}; };
+
+  Sim sim(small_config());
+  sim.push(1000, true);
+  std::optional<spg::ScanJob> job = sim.la.take_job();
+  REQUIRE(job.has_value());
+  const spg::ScanLimits& all = sim.la.config().scan;
+  const auto rects = [](const spg::ScanResult& r) {
+    std::vector<Rect> out;
+    for (const Detection& d : r.detections) {
+      out.push_back(d.box.rect);
+    }
+    return out;
+  };
+  const auto expect = [&](const spg::ScanStages& stages, spg::ScanFailure failure, const std::vector<Rect>& kept) {
+    const spg::ScanResult r = spg::run_scan(stages, *job, all);
+    CHECK_FALSE(r.complete);
+    CHECK(r.failure == failure);
+    CHECK(rects(r) == kept);
+    for (const Detection& d : r.detections) {
+      CHECK_NOTHROW(spg::validate(d));
+    }
+  };
+
+  // Faces found, then the text detector throws.
+  expect(spg::ScanStages{faces, std::make_shared<spg_test::ScriptedDetector>(empty, throwing), nullptr, nullptr},
+         spg::ScanFailure::TextDetector, {face});
+  // Text regions found, then the recognizer throws or miscounts: no region
+  // was cleared, so every region is kept.
+  expect(spg::ScanStages{faces, regions, std::make_shared<ThrowingRecognizer>(),
+                         std::make_shared<spg_test::ScriptedPolicy>()},
+         spg::ScanFailure::Recognizer, {face, r1, r2});
+  expect(spg::ScanStages{faces, regions, std::make_shared<ShortRecognizer>(),
+                         std::make_shared<spg_test::ScriptedPolicy>()},
+         spg::ScanFailure::InvalidOutput, {face, r1, r2});
+  // The policy throws midway: r1, judged safe before it failed, is kept too.
+  expect(spg::ScanStages{faces, regions, recognizer, std::make_shared<BoomPolicy>()}, spg::ScanFailure::Policy,
+         {face, r1, r2});
+  // The face detector throws first: nothing was found, and text never runs.
+  const auto text_calls = regions->calls.load();
+  expect(spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>(empty, throwing), regions, nullptr, nullptr},
+         spg::ScanFailure::FaceDetector, {});
+  CHECK(regions->calls == text_calls);
+  // Malformed output is never kept (non-finite, negative, wrong space or
+  // kind, bad score); its valid siblings are.
+  Detection nan_box = face_at(1, 1, 5, 5);
+  nan_box.box.rect.x = std::nanf("");
+  Detection wrong_space = face_at(1, 1, 5, 5);
+  wrong_space.box.space = spg::Space::Readback;
+  Detection bad_score = face_at(1, 1, 5, 5);
+  bad_score.score = 2.0F;
+  expect(spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([=](Timestamp, Size) {
+                           return std::vector<Detection>{nan_box, face_at(face.x, face.y, face.width, face.height),
+                                                         wrong_space, bad_score, text_at(1, 1, 5, 5),
+                                                         face_at(1, 1, -5, 5)};
+                         }),
+                         regions, nullptr, nullptr},
+         spg::ScanFailure::InvalidOutput, {face});
+  CHECK(regions->calls == text_calls);
+  expect(spg::ScanStages{faces, std::make_shared<spg_test::ScriptedDetector>([=](Timestamp, Size) {
+                           return std::vector<Detection>{text_at(r1.x, r1.y, r1.width, r1.height),
+                                                         text_at(0, 0, -1, 4), face_at(0, 0, 4, 4)};
+                         }),
+                         recognizer, std::make_shared<spg_test::ScriptedPolicy>()},
+         spg::ScanFailure::InvalidOutput, {face, r1});
+}
+
+TEST_CASE("a failed cycle whose boxes cannot be applied fails closed every frame they could mask",
+          "[schedule]") {
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;  // retro 100 ms, hold 200 ms
+  Sim sim(config, spg::ScanStages{nothing(), nullptr, nullptr, nullptr});
+  sim.push(1000, true);
+  sim.scan_now();  // an empty cycle covers 1000
+  sim.push(1050, true);
+  auto [job, result] = sim.run();
+  // A partial result the tracker rejects: its valid box would have masked
+  // 1000 retroactively and later frames by hold.
+  result.complete = false;
+  result.failure = spg::ScanFailure::TextDetector;
+  result.detections = {face_at(10, 10, 20, 20), face_at(10, 10, -5, 5)};
+  sim.la.complete(job, result);
+  CHECK(sim.la.stats().scans_failed == 1);
+  CHECK(sim.la.stats().scans_completed == 1);
+  sim.push(1100, true);  // within the hold after 1050
+  sim.scan_now();
+  sim.push(1300, true);  // past it
+  sim.scan_now();
+  const auto out = sim.release_at(1900);
+  REQUIRE(out.size() == 4);
+  CHECK(out[0].reason == FallbackReason::ApplyFailed);  // on main: clean, without the box
+  CHECK(out[1].reason == FallbackReason::ApplyFailed);
+  CHECK(out[2].reason == FallbackReason::ApplyFailed);
+  CHECK(out[3].action == FallbackAction::None);
+}
+
+TEST_CASE("hold-last-scanned never re-emits a frame a failed cycle's boxes would have masked", "[schedule]") {
+  const Rect box{40, 40, 30, 30};
+  SchedulerConfig config = small_config();  // lookahead 100, retro 100, hold 200
+  config.fallback = FallbackMode::HoldLastScanned;
+  const auto faces = std::make_shared<spg_test::ScriptedDetector>([box](Timestamp t, Size) {
+    std::vector<Detection> out;
+    if (t == at_ms(1000)) {
+      out.push_back(face_at(box.x, box.y, box.width, box.height));
+    }
+    return out;
+  });
+  const auto text = std::make_shared<spg_test::ScriptedDetector>(
+      [](Timestamp, Size) { return std::vector<Detection>{}; },
+      [](Timestamp t) {
+        if (t == at_ms(1000)) {
+          throw spg_test::NotAStdException{3};
+        }
+      });
+  Sim sim(config, spg::ScanStages{faces, text, nullptr, nullptr});
+  sim.push(1000, true);
+  auto [slow, partial] = sim.run();  // finds the box, then fails; returns late
+  CHECK_FALSE(partial.complete);
+  CHECK(partial.detections.size() == 1);
+  const spg::FrameId clean = sim.push(1010, true);
+  sim.scan_now();  // sees nothing; covers 1000 and 1010
+  sim.push(1020, false);
+  auto out = sim.release_at(1110);
+  REQUIRE(out.size() == 2);
+  REQUIRE(out[1].id == clean);
+  REQUIRE(out[1].action == FallbackAction::None);
+
+  sim.la.complete(slow, partial);  // the box at 1000 is held over 1010
+  out = sim.release_at(1120);
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].reason == FallbackReason::NotScanned);
+  CHECK(out[0].action == FallbackAction::BlurSource);  // not frame 1010 again
+  CHECK(out[0].reemit == 0);
+}
+
 TEST_CASE("a discontinuity stops older cycles from covering new frames", "[schedule]") {
   Sim sim(small_config(), spg::ScanStages{nothing(), nullptr, nullptr, nullptr});
   sim.push(1000, false);
