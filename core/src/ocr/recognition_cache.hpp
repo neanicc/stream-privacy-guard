@@ -1,20 +1,24 @@
 #pragma once
 
 // Per-track recognition cache (SPG-07, lane:vision). Plan section 6:
-// recognition runs on new or changed text tracks only. A tracked text region
-// is read again when it is new, when its box changed size, when its pixels
-// changed, or when its cached text is older than max_age; otherwise the text
-// read before is reused.
+// recognition runs on new or changed text tracks only.
 //
-// "Changed pixels" compares a small luma thumbnail of the region (six cells
-// across the line height, square cells) cell by cell, and any cell that moved
-// by more than content_tolerance is a change. The readback is the source as
-// rendered, before the encoder, so a still region repeats exactly and a
-// changed character moves several cells by far more than that: a new digit
-// in a chat line is read again on the next cycle. When unsure, the cache misses (recall over
-// precision): a miss costs a model run, a stale hit can let a secret air.
+// The cache stores recognized text, never a verdict: the policy evaluates the
+// text again on every cycle. A cached text is reused for a track only when
+// all of these hold, and the region is read again otherwise:
+//   - the track has an entry, stored after a recognize() call that succeeded;
+//   - the frame time is not before the read and at most max_age after it;
+//   - the region's readback crop has exactly the same width and height;
+//   - every byte of the crop's decoded BGR pixels is identical.
+// The recognizer reads only the crop's pixels, so a hit returns what reading
+// the region again would return (with max_batch 1; a larger batch only pads).
+// Position may differ: the same pixels moved with their box (scrolling) are
+// the same text. Any other change, however small (one pixel, a colour change
+// with the same brightness, a resize of the source or of the box, a track id
+// reused for other content), is a miss. Misses cost model runs, never recall.
 //
-// The cache holds recognized text (Secret) in memory only and is not
+// The cache holds recognized text (Secret) and crop pixels in memory only,
+// bounded by `capacity` entries and `max_bytes` of pixels, and is not
 // synchronized: one worker owns it.
 
 #include <cstddef>
@@ -36,44 +40,39 @@ struct RecognitionCacheConfig {
   // A cached text is reused for at most this long (frame time) after it was
   // read, however still the region looks.
   Duration max_age = std::chrono::milliseconds{1000};
-  // The readback crop may change width and height by at most this fraction
-  // (and the thumbnail grid must match) for a hit.
-  float size_tolerance = 0.1F;
-  // Largest luma change of any thumbnail cell (0-255) still counted as the
-  // same content.
-  float content_tolerance = 6.0F;
   // Tracks kept; the oldest read is dropped first beyond this.
   std::size_t capacity = 1024;
+  // Crop pixels kept over all entries; the oldest read is dropped first
+  // beyond this. A crop larger than the budget is not cached.
+  std::size_t max_bytes = std::size_t{64} << 20;
 };
 
 // Throws ContractError naming the field when a value is out of range.
 void validate(const RecognitionCacheConfig& config);
 
-// What a region looked like when it was read.
+// What a region looked like when it was read: its whole readback crop.
 struct Fingerprint {
   Size crop;  // readback crop size in pixels; zero when outside the frame
-  Size grid;  // thumbnail size in cells
-  std::vector<std::uint8_t> luma;  // grid.width * grid.height, row-major
+  std::vector<std::uint8_t> pixels;  // packed BGR, crop.width * crop.height * 3
   friend bool operator==(const Fingerprint&, const Fingerprint&) = default;
 };
 
 // The fingerprint of a Source-space region of `frame` (Readback pixels of a
-// source of size `source`): its readback crop size and a luma thumbnail of
-// square cells, six across the crop's shorter side (each side 1 to 256
-// cells). Throws ContractError for an invalid frame or a box that is not a
-// valid Source-space box.
+// source of size `source`): the same readback crop the recognizer reads
+// (readback_crop()), decoded to BGR at scale 1. Throws ContractError for an
+// invalid frame or a box that is not a valid Source-space box.
 [[nodiscard]] Fingerprint fingerprint(const FrameView& frame, Size source, const Box& region);
 
-// Whether `now` and `before` show the same content under `config`.
-[[nodiscard]] bool same_content(const Fingerprint& now, const Fingerprint& before,
-                                const RecognitionCacheConfig& config);
+// Whether `now` and `before` are the same non-empty crop, pixel for pixel.
+[[nodiscard]] bool same_content(const Fingerprint& now, const Fingerprint& before);
 
 class RecognitionCache {
  public:
   explicit RecognitionCache(const RecognitionCacheConfig& config = {});
 
-  // The text read for `track` when it was read no more than max_age before
-  // `now` (and not after it) from content `print` still matches.
+  // The text read for `track`, when it was read no more than max_age before
+  // `now` (and not after it) from exactly the content `print` holds; nothing
+  // otherwise.
   [[nodiscard]] std::optional<Recognition> find(TrackId track, const Fingerprint& print, Timestamp now) const;
   // Records what was read for `track` at frame time `now`.
   void store(TrackId track, Fingerprint print, Recognition recognition, Timestamp now);
@@ -83,6 +82,7 @@ class RecognitionCache {
   void prune(Timestamp now);
 
   [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
+  [[nodiscard]] std::size_t bytes() const noexcept { return bytes_; }
   [[nodiscard]] const RecognitionCacheConfig& config() const noexcept { return config_; }
 
  private:
@@ -91,8 +91,11 @@ class RecognitionCache {
     Recognition recognition;
     Timestamp read_at{};
   };
+  void drop_oldest();
+
   RecognitionCacheConfig config_;
   std::unordered_map<TrackId, Entry> entries_;
+  std::size_t bytes_ = 0;
 };
 
 // A text region and the track it belongs to.

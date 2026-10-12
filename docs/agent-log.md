@@ -726,15 +726,27 @@ Template:
   (1x320) and 16.0 ms (1x1280) against CPU 4.56 ms and 15.2 ms. Widths are
   rounded up to a multiple of 8 instead, with no bucket padding. A static
   model would mean re-exporting it, a new pinned artifact.
-- Per-track cache: `RecognitionCache` reuses a track's text while its readback
-  crop size is within 10% and a luma thumbnail (square cells, six across the
-  short side) differs by at most 6 levels in every cell, for at most 1 s of
-  frame time. The readback is pre-encoder, so a still region repeats exactly
-  and a changed digit misses (test: one digit of a card number changes, only
-  that track is read again and reads the new digit). `recognize_tracks()`
-  sends all misses to one `recognize()` call and stores results only after
-  it succeeds, so a failed frame leaves the cache unchanged. One owner, not
-  synchronized.
+- Per-track cache: `RecognitionCache` stores recognized text, never a
+  verdict (the policy evaluates the text again every cycle). It reuses a
+  track's text only when the entry was stored after a successful read, the
+  frame time is within [read, read + 1 s], and the region's readback crop has
+  the same size and identical decoded BGR pixels. The recognizer reads only
+  those pixels, so a hit returns what a new read would. Any other change is a
+  miss: one pixel, a colour change, a resized box or source, or a track id
+  reused for other content. Same pixels moved with their box (scrolling) hit.
+  A store replaces the track's old entry even when the new crop is not cached
+  (empty, or over the 64 MiB pixel budget); `capacity` and `max_bytes` evict
+  the oldest read. `recognize_tracks()` sends all misses to one `recognize()`
+  call and stores results only after it succeeds, so a failed frame leaves
+  the cache unchanged. One owner, not synchronized.
+- Security review fix (before review): the first version compared a luma
+  thumbnail (six square cells across the short side, each within 6 levels)
+  and allowed a 10% size change. A background review flagged it as a
+  possible fail-open stale cache, and it was one: a colour change with the
+  same brightness, faint text, or a one-pixel change in a large crop all
+  matched and reused stale text for up to 1 s. Reinstating the thumbnail rule
+  as a mutation fails four new unit sections (colour change in BGRA and NV12,
+  faint text, one pixel); the exact comparison passes them.
 - Fail closed: an output whose shape is not `[n, width / 8, 97]`, or that
   holds a value that is not a finite probability, throws `ocr::DecodeError`;
   a model without the dictionary or with a class count that does not match
@@ -744,8 +756,8 @@ Template:
   streams, then fails two broken fixture recognizers on the same frame:
   nothing is printed and no error holds any fragment of it.
 - Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang):
-  `scripts/ci/run.sh build` (plugin included) and `test` pass, 181/181
-  ctest tests, 30 new `ocr.*` cases, no skips. Model cases: six made-up
+  `scripts/ci/run.sh build` (plugin included) and `test` pass, 195/195 after
+  merging main at 87ed3f5, 30 new `ocr.*` cases, no skips. Model cases: six made-up
   strings on three panel styles, cap heights 10, 14 and 22 readback px,
   readback scale 1 and 1/2, BGRA/NV12/I420, each read within two edits
   (Hershey's 'a' reads as 'o' at cap height 8 to 10); merged lines; chunked
@@ -767,4 +779,5 @@ Template:
   measure recall on the text suite; 180-degree text needs PP-OCR's direction
   classifier (another pinned model); lines that touch stay one crop;
   `spg-cli bench` should measure recognition cost and the cache hit rate
-  (a box that jitters by a pixel misses, which costs time, not recall).
+  (any pixel change misses, so animated or noisy sources get no hits, which
+  costs time, not recall).

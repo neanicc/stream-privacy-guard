@@ -439,52 +439,78 @@ Canvas strokes(const std::vector<std::uint32_t>& columns, std::uint8_t ink = 20,
 
 }  // namespace
 
-TEST_CASE("fingerprint: square cells, six across the short side", "[ocr][cache]") {
-  const Canvas canvas = strokes({30, 40, 50, 60});
-  const spg::test::OwnedFrame frame = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
-  const ocr::Fingerprint print =
-      ocr::fingerprint(frame.view, {200, 60}, {{20.0F, 18.0F, 80.0F, 20.0F}, spg::Space::Source});
+namespace {
+
+const spg::Box kBox{{20.0F, 18.0F, 80.0F, 20.0F}, spg::Space::Source};
+
+ocr::Fingerprint print_of(const Canvas& canvas, const spg::Box& box = kBox,
+                          spg::PixelFormat format = spg::PixelFormat::BGRA) {
+  const spg::test::OwnedFrame frame = spg::test::to_frame(canvas, format);
+  return ocr::fingerprint(frame.view, {canvas.width(), canvas.height()}, box);
+}
+
+}  // namespace
+
+TEST_CASE("fingerprint: the exact readback crop the recognizer reads", "[ocr][cache]") {
+  const ocr::Fingerprint print = print_of(strokes({30, 40, 50, 60}));
   CHECK(print.crop == Size{80, 20});
-  CHECK(print.grid == Size{24, 6});
-  CHECK(print.luma.size() == 24 * 6);
-  const ocr::Fingerprint outside =
-      ocr::fingerprint(frame.view, {200, 60}, {{500.0F, 18.0F, 80.0F, 20.0F}, spg::Space::Source});
-  CHECK(outside.luma.empty());
-  CHECK_FALSE(ocr::same_content(outside, outside, {}));
+  CHECK(print.pixels.size() == 80 * 20 * 3);
+  const ocr::Fingerprint outside = print_of(strokes({30}), {{500.0F, 18.0F, 80.0F, 20.0F}, spg::Space::Source});
+  CHECK(outside.pixels.empty());
+  CHECK_FALSE(ocr::same_content(outside, outside));
 }
 
-TEST_CASE("same_content: a changed glyph or size is new content", "[ocr][cache]") {
-  const ocr::RecognitionCacheConfig config;
-  const auto print_of = [&](const Canvas& canvas, const spg::Box& b = {{20.0F, 18.0F, 80.0F, 20.0F},
-                                                                        spg::Space::Source}) {
-    const spg::test::OwnedFrame frame = spg::test::to_frame(canvas, spg::PixelFormat::NV12);
-    return ocr::fingerprint(frame.view, {200, 60}, b);
-  };
+TEST_CASE("same_content: any change of the crop is new content", "[ocr][cache]") {
   const ocr::Fingerprint before = print_of(strokes({30, 40, 50, 60}));
-  CHECK(ocr::same_content(print_of(strokes({30, 40, 50, 60})), before, config));
-  // One stroke moved by 3 px (a different glyph).
-  CHECK_FALSE(ocr::same_content(print_of(strokes({30, 40, 53, 60})), before, config));
-  // One more stroke, low contrast ink (gray on light gray).
-  CHECK_FALSE(ocr::same_content(print_of(strokes({30, 40, 50, 60, 70}, 170, 230)),
-                                print_of(strokes({30, 40, 50, 60}, 170, 230)), config));
-  // The same content moved with its box (scrolling) is the same.
+  CHECK(ocr::same_content(print_of(strokes({30, 40, 50, 60})), before));
+  // The same pixels moved with their box (scrolling) are the same content.
   CHECK(ocr::same_content(print_of(strokes({40, 50, 60, 70}), {{30.0F, 18.0F, 80.0F, 20.0F}, spg::Space::Source}),
-                          before, config));
-  // A box 20% wider is not.
-  CHECK_FALSE(ocr::same_content(print_of(strokes({30, 40, 50, 60}), {{20.0F, 18.0F, 96.0F, 20.0F},
-                                                                     spg::Space::Source}),
-                                before, config));
+                          before));
+  SECTION("a different glyph") {
+    CHECK_FALSE(ocr::same_content(print_of(strokes({30, 40, 53, 60})), before));
+  }
+  // The cases below passed the earlier thumbnail comparison (luma cells
+  // within 6 levels, size within 10%) and would have reused stale text.
+  SECTION("a colour change with the same brightness") {
+    Canvas recoloured = strokes({30, 40, 50, 60});
+    recoloured.rect(70, 20, 73, 36, {255, 230, 220});  // luma 230, as the paper
+    CHECK_FALSE(ocr::same_content(print_of(recoloured), before));
+  }
+  SECTION("one pixel in a large crop") {
+    const spg::Box large{{0.0F, 0.0F, 200.0F, 60.0F}, spg::Space::Source};
+    Canvas dotted = strokes({30, 40, 50, 60});
+    dotted.set(120, 50, {20, 20, 20});
+    CHECK_FALSE(ocr::same_content(print_of(dotted, large), print_of(strokes({30, 40, 50, 60}), large)));
+  }
+  SECTION("faint text") {
+    CHECK_FALSE(ocr::same_content(print_of(strokes({30, 40, 50, 60, 70}, 226, 230)),
+                                  print_of(strokes({30, 40, 50, 60}, 226, 230))));
+  }
+  SECTION("a box one pixel wider") {
+    CHECK_FALSE(ocr::same_content(print_of(strokes({30, 40, 50, 60}), {{20.0F, 18.0F, 81.0F, 20.0F},
+                                                                         spg::Space::Source}),
+                                  before));
+  }
+  SECTION("the same box after a source resize") {
+    // Twice the source size, same readback frame: the Source box now covers
+    // other readback pixels.
+    const spg::test::OwnedFrame frame = spg::test::to_frame(strokes({30, 40, 50, 60}), spg::PixelFormat::BGRA);
+    CHECK_FALSE(ocr::same_content(ocr::fingerprint(frame.view, {400, 120}, kBox), before));
+  }
+  SECTION("chroma only, in a subsampled format") {
+    Canvas recoloured = strokes({30, 40, 50, 60});
+    recoloured.rect(70, 20, 74, 36, {255, 230, 220});
+    CHECK_FALSE(ocr::same_content(print_of(recoloured, kBox, spg::PixelFormat::NV12),
+                                  print_of(strokes({30, 40, 50, 60}), kBox, spg::PixelFormat::NV12)));
+  }
 }
 
-TEST_CASE("RecognitionCache: hits only for the same track, content and age", "[ocr][cache]") {
+TEST_CASE("RecognitionCache: hits only for the same track, pixels and age", "[ocr][cache]") {
   ocr::RecognitionCacheConfig config;
   config.max_age = std::chrono::milliseconds{1000};
   ocr::RecognitionCache cache(config);
-  const spg::test::OwnedFrame frame = spg::test::to_frame(strokes({30, 40, 50, 60}), spg::PixelFormat::BGRA);
-  const ocr::Fingerprint print = ocr::fingerprint(frame.view, {200, 60}, {{20, 18, 80, 20}, spg::Space::Source});
-  const spg::test::OwnedFrame other_frame = spg::test::to_frame(strokes({30, 45, 50, 60}), spg::PixelFormat::BGRA);
-  const ocr::Fingerprint other =
-      ocr::fingerprint(other_frame.view, {200, 60}, {{20, 18, 80, 20}, spg::Space::Source});
+  const ocr::Fingerprint print = print_of(strokes({30, 40, 50, 60}));
+  const ocr::Fingerprint other = print_of(strokes({30, 45, 50, 60}));
 
   CHECK_FALSE(cache.find(7, print, at_ms(0)));
   cache.store(7, print, reading("made-up text"), at_ms(100));
@@ -493,7 +519,8 @@ TEST_CASE("RecognitionCache: hits only for the same track, content and age", "[o
   CHECK_FALSE(cache.find(7, print, at_ms(1101)));  // too old
   CHECK_FALSE(cache.find(7, print, at_ms(99)));    // earlier than the read
   CHECK_FALSE(cache.find(8, print, at_ms(200)));   // another track
-  CHECK_FALSE(cache.find(7, other, at_ms(200)));   // changed content
+  CHECK_FALSE(cache.find(7, other, at_ms(200)));   // changed content (or a reused id)
+  CHECK(cache.bytes() == print.pixels.size());
 
   cache.store(8, print, reading("b"), at_ms(500));
   cache.prune(at_ms(1200));  // track 7 is past max_age, 8 is not
@@ -501,6 +528,7 @@ TEST_CASE("RecognitionCache: hits only for the same track, content and age", "[o
   CHECK(cache.find(8, print, at_ms(1200)));
   cache.erase(8);
   CHECK(cache.size() == 0);
+  CHECK(cache.bytes() == 0);
 
   SECTION("capacity drops the oldest read") {
     config.capacity = 2;
@@ -513,15 +541,34 @@ TEST_CASE("RecognitionCache: hits only for the same track, content and age", "[o
     CHECK(tiny.find(1, print, at_ms(20)));
     CHECK(tiny.find(3, print, at_ms(20)));
   }
+  SECTION("the byte budget drops the oldest read") {
+    config.max_bytes = 2 * print.pixels.size();
+    ocr::RecognitionCache tiny(config);
+    tiny.store(1, print, reading("1"), at_ms(10));
+    tiny.store(2, print, reading("2"), at_ms(20));
+    tiny.store(3, print, reading("3"), at_ms(30));
+    CHECK(tiny.size() == 2);
+    CHECK(tiny.bytes() == 2 * print.pixels.size());
+    CHECK_FALSE(tiny.find(1, print, at_ms(30)));
+  }
+  SECTION("a crop over the budget is not cached and drops the track's old entry") {
+    config.max_bytes = print.pixels.size();
+    ocr::RecognitionCache tiny(config);
+    tiny.store(1, print, reading("old"), at_ms(10));
+    const ocr::Fingerprint big =
+        print_of(strokes({30, 40, 50, 60}), {{0.0F, 0.0F, 200.0F, 60.0F}, spg::Space::Source});
+    tiny.store(1, big, reading("new"), at_ms(20));
+    CHECK(tiny.size() == 0);
+    CHECK_FALSE(tiny.find(1, print, at_ms(20)));
+    CHECK_FALSE(tiny.find(1, big, at_ms(20)));
+  }
+  SECTION("an empty crop is not cached") {
+    cache.store(9, ocr::Fingerprint{}, reading(""), at_ms(10));
+    CHECK_FALSE(cache.find(9, ocr::Fingerprint{}, at_ms(10)));
+  }
   SECTION("config validation") {
     ocr::RecognitionCacheConfig bad;
     bad.max_age = std::chrono::milliseconds{-1};
-    CHECK_THROWS_AS(ocr::RecognitionCache(bad), spg::ContractError);
-    bad = {};
-    bad.size_tolerance = 2.0F;
-    CHECK_THROWS_AS(ocr::RecognitionCache(bad), spg::ContractError);
-    bad = {};
-    bad.content_tolerance = std::numeric_limits<float>::quiet_NaN();
     CHECK_THROWS_AS(ocr::RecognitionCache(bad), spg::ContractError);
     bad = {};
     bad.capacity = 0;
