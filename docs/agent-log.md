@@ -1317,3 +1317,87 @@ Template:
   The drop and the retire of older generations back each other up, so (1)
   reverts both. The GPU change needs a graphics context and is
   covered only by the live check.
+
+## 2026-10-12 — SPG-10c Hold detections from partial scan cycles (#51)
+
+- Decision / change: `run_scan()` returned an empty incomplete result on any
+  stage failure, so boxes found by the stages that had finished (faces, then
+  the text detector throws; text regions, then the recognizer or policy
+  throws) never reached the tracker. The failed frame blurred, but nothing
+  was held: if the face detector missed on the next cycle, frames that cycle
+  covered aired the face inside its hold (AGENTS.md temporal hold), and
+  buffered frames before it lost their retroactive rects. Fix: an incomplete
+  `ScanResult` now keeps the valid boxes found before the failure (table in
+  [scheduler.md](scheduler.md#partial-cycles)), and `Lookahead::complete()`
+  holds and retro-masks them like a complete result's, fails closed the same
+  way when they cannot be applied, and marks the re-emit candidate in their
+  reach, but sets `covered` only for a complete cycle. The gate
+  (`Lookahead::gate()`) is unchanged. `Scheduler` signatures are unchanged;
+  `ScanResult` gains one field, `detections_lost` (see the review follow-up
+  below).
+- Decisions (no one to ask; recall over precision, smallest change):
+  (1) A recognizer or policy failure keeps **every** region, including any
+  the policy judged safe before it threw: no text stage that finished
+  cleared them. (2) Malformed output (fails `validate()` or has the wrong
+  kind) is never held; its valid siblings in the same output are, since
+  holding a box only adds blur. A malformed box passed straight to
+  `complete()` still fails closed (`ApplyFailed`). (3) `run_scan()` still
+  stops at the first failure rather than running later stages to find more
+  boxes; a stage that throws may be under memory pressure, and running more
+  inference in a failed cycle delays the next one. (4) `MissingStage` runs
+  nothing, as before. (5) No new stats counter; a partial cycle counts in
+  `scans_failed` only.
+- Evidence (automated, dev Mac, macOS 26.5.2 arm64, Apple clang 21.0.0):
+  four new `lookahead_test.cpp` cases (face found, text stage throws, the
+  next cycles miss the face: frames 1000 .. 1200 stay masked, by retro
+  before 1040 and by hold after; on its own the failed cycle covers nothing;
+  what `run_scan()` keeps per failure point, including malformed output; a
+  partial result that cannot be applied fails closed; hold-last-scanned does
+  not re-emit a frame a partial result reaches) and the property-test
+  extension (failed cycles in 60% of scenes return a random subset of their
+  boxes; the oracle checks those boxes for retro and hold on every on-time
+  frame and every re-emit, never as coverage) were run against `main`'s
+  `scan.cpp` and `lookahead.cpp` first: 5 of 46 `[schedule]` cases and 26
+  assertions failed, including 7 frames released clean without the face
+  (1000 .. 1200) and the property oracle (seed 16: frame at 3052 without the
+  partial box of a cycle at 3030). With the fix: `[schedule]` passes (46
+  cases, 1,581,022 assertions); `scripts/ci/run.sh build` and `test` pass
+  (262/262, plugin included). Mutation: letting a partial cycle set
+  `covered` fails 3 cases, including the property oracle's coverage rule.
+  Property totals: 434 applied partial cycles, 77 partial results not
+  applied, 4,740 partial-box mask checks, 750 partial-box re-emit checks.
+  Oracle change: `spoiled` (when a re-emit is refused) now also counts a
+  partial result's boxes, which only permits more `BlurSource`; every other
+  assertion is unchanged or extended to partial boxes. GCC is not installed
+  on the dev Mac, so the GCC `-Werror` build is CI's ubuntu-24.04 job.
+- Eval delta: not measured locally; the agent sandbox refuses the eval
+  command. Nothing feeds the scheduler a real pipeline until SPG-11; see the
+  PR's Check log for the CI stage.
+- Review follow-up (Greptile, P1): an allocation failure while `run_scan()`
+  collected boxes a stage had returned (the face insert, the per-region
+  policy flags, appending regions) returned only what was collected, so
+  `complete()` held less than the cycle saw. `ScanResult::detections_lost`
+  now marks that case and `complete()` fails closed the boxes' whole window
+  (`ApplyFailed`, `ts - retro` to `ts + hold`). Tests: a sweep that fails
+  each allocation of one cycle in turn (`tests/unit/fail_alloc.cpp` replaces
+  `operator new` for `spg-unit-tests`) over three cycles (complete; the
+  recognizer throws, so every region is appended; malformed faces, so their
+  valid siblings are kept), reaching every collection site, and a
+  `complete()` case; all fail with the fix removed.
+- CI follow-up: the ubuntu-24.04 job failed the property test at seed 1444
+  (frame 67 released clean, "no complete cycle covers it"). libstdc++ and
+  libc++ implement `uniform_int_distribution`, `bernoulli_distribution` and
+  `std::shuffle` differently, so each platform runs different scenes for one
+  seed; replaying libstdc++'s algorithms on macOS reproduced it exactly. The
+  scheduler was right: that scene's one-off resize landed on a flapping frame
+  that toggled straight back, so the pushed size did not change, but the
+  oracle counted two resizes and a new segment. The oracle now counts a
+  resize only when the pushed size differs from the previous frame's (the
+  only thing the scheduler can see); its assertions are unchanged. All 1500
+  seeds pass under both libc++ and the replayed libstdc++ sequence.
+- Open issues or follow-ups: `native_secure_platform()` and
+  `SecureHeap::process()` (core/src/secure/secure_memory.cpp) allocate on
+  first use; the former is `noexcept`, so an allocation failure on the
+  first `Secret` of a process terminates instead of throwing. Pre-existing,
+  outside this ticket. The coverage-assumption risk in scheduler.md (content
+  that appears and disappears between cycles) is unchanged.

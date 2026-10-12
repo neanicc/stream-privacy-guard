@@ -4,10 +4,12 @@
 // late, take random time, fail, stall forever or return after their frames
 // were released, random cadence and queue limits, render hiccups, a resize in
 // some scenes and a content switch in others, a source that flaps between two
-// sizes faster than the size history, and results that cannot be applied. An
-// oracle kept by the test, not the scheduler, checks every released frame and
-// every frame re-emitted by hold-last-scanned (SPG-10b: every path that airs a
-// frame passes the same gate).
+// sizes faster than the size history, results that cannot be applied, and
+// failed cycles that still return the boxes their finished stages found
+// (SPG-10c: those are held and masked, but cover no frame). An oracle kept by
+// the test, not the scheduler, checks every released frame and every frame
+// re-emitted by hold-last-scanned (SPG-10b: every path that airs a frame
+// passes the same gate).
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -77,7 +79,8 @@ struct Completion {
   Size size;
   int segment;
   bool ok;              // the cycle was complete
-  bool applied;         // and its result could be applied (not rejected, not too old)
+  bool held;            // its boxes go to the scheduler: complete, or failed with partial boxes
+  bool applied;         // held, and they could be applied (not rejected, not too old)
   std::uint64_t order;  // completion sequence number
   std::vector<Rect> boxes;
 };
@@ -104,6 +107,7 @@ struct Pending {
   spg::ScanJob job;
   std::int64_t done_ms;  // when the "worker" returns; -1 never
   bool ok;
+  bool partial;  // failed after some stages finished: returns some of the boxes
 };
 
 // Totals over every scene, so the run shows each path was exercised.
@@ -111,7 +115,8 @@ struct Totals {
   std::uint64_t clean = 0, fallback = 0, reemits = 0, late = 0, bad = 0, early = 0, retro_checks = 0,
                 hold_checks = 0, resized_scenes = 0, lagged_scans = 0, not_scanned = 0, apply_failed = 0,
                 unapplied_rejected = 0, unapplied_too_old = 0, reemit_checks = 0, reemits_refused = 0,
-                switched_scenes = 0, flapping_scenes = 0;
+                switched_scenes = 0, flapping_scenes = 0, partial_cycles = 0, partial_unapplied = 0,
+                partial_mask_checks = 0, partial_reemit_checks = 0;
 };
 
 struct Scene {
@@ -177,6 +182,9 @@ void run_scene(std::uint32_t seed, Totals& totals) {
     ++totals.flapping_scenes;
   }
   const double fail_rate = s.chance(0.5) ? 0.2 : 0.0;
+  // Of the failed cycles, the share that fail after some stages finished
+  // (faces found, then the text detector throws) and return those boxes.
+  const double partial_rate = s.chance(0.6) ? 0.7 : 0.0;
   const double stall_rate = s.chance(0.3) ? 0.1 : 0.0;
   const std::int64_t max_work_ms = std::max<std::int64_t>(5, 2 * lookahead_ms);
 
@@ -224,25 +232,37 @@ void run_scene(std::uint32_t seed, Totals& totals) {
       if (it->done_ms >= 0 && (all_ready || it->done_ms <= now_ms)) {
         spg::ScanResult result;
         result.complete = it->ok;
-        if (it->ok) {
+        if (it->ok || it->partial) {
           result.detections = detect(spg::to_ns(it->job.frame_time) / 1'000'000, it->job.source);
         }
+        if (it->partial) {
+          // The boxes of the stages that finished before the failure: a
+          // random subset, possibly none.
+          std::erase_if(result.detections, [&s](const spg::Detection&) { return s.chance(0.4); });
+        }
         const PushedFrame& pf = pushed.at(it->job.frame);
-        Completion c{pf.t_ms, pf.size, pf.segment, it->ok, it->ok, ++order, {}};
+        Completion c{pf.t_ms, pf.size, pf.segment, it->ok, false, false, ++order, {}};
         for (const spg::Detection& d : result.detections) {
           c.boxes.push_back(d.box.rect);
         }
-        if (it->ok && s.chance(reject_rate)) {
+        if ((it->ok || it->partial) && s.chance(reject_rate)) {
           // A score the tracker rejects (validate()); a resize cannot repair it.
           spg::Detection rejected = spg_test::face_at(1, 1, 4, 4);
           rejected.score = 2.0F;
           result.detections.push_back(rejected);
-          c.applied = false;
-          ++totals.unapplied_rejected;
-        } else if (it->ok && pushed_resizes - pf.resizes >= kSizeHistory) {
-          c.applied = false;
-          ++totals.unapplied_too_old;
+          c.held = true;
+          ++(it->ok ? totals.unapplied_rejected : totals.partial_unapplied);
+        } else {
+          // The scheduler takes the boxes of a complete cycle, and of a
+          // failed one that found any.
+          c.held = it->ok || !result.detections.empty();
+          c.applied = c.held;
+          if (c.held && pushed_resizes - pf.resizes >= kSizeHistory) {
+            c.applied = false;
+            ++(it->ok ? totals.unapplied_too_old : totals.partial_unapplied);
+          }
         }
+        totals.partial_cycles += !it->ok && c.applied ? 1U : 0U;
         la.complete(it->job, result);
         completions.push_back(c);
         it = workers.erase(it);
@@ -301,7 +321,7 @@ void run_scene(std::uint32_t seed, Totals& totals) {
             const bool spoiled =
                 latest != nullptr &&
                 std::any_of(completions.begin(), completions.end(), [&](const Completion& c) {
-                  if (!c.ok || c.order <= latest->released_after) {
+                  if (!c.held || c.order <= latest->released_after) {
                     return false;
                   }
                   if (!c.applied) {
@@ -315,21 +335,22 @@ void run_scene(std::uint32_t seed, Totals& totals) {
               REQUIRE(r.reemit == latest->id);
               REQUIRE(latest->segment == f.segment);
               // What airs is the re-emitted frame as it was released: it must
-              // cover every box of every complete cycle finished by now within
-              // the retro window after it or the hold before it.
+              // cover every box of every cycle finished by now (complete, or
+              // failed with partial boxes) within the retro window after it or
+              // the hold before it.
               for (const Completion& c : completions) {
-                if (!c.ok) {
+                if (!c.held) {
                   continue;
                 }
                 const bool retro = c.t_ms >= latest->t_ms && c.t_ms <= latest->t_ms + retro_ms;
-                const bool held = c.t_ms <= latest->t_ms && latest->t_ms <= c.t_ms + hold_ms;
-                if (!retro && !held) {
+                const bool in_hold = c.t_ms <= latest->t_ms && latest->t_ms <= c.t_ms + hold_ms;
+                if (!retro && !in_hold) {
                   continue;
                 }
                 for (const Rect& b : c.boxes) {
                   INFO("re-emitted frame at " << latest->t_ms << ", cycle at " << c.t_ms);
                   REQUIRE(plan_covers(latest->plan, scaled(b, c.size, latest->size)));
-                  ++totals.reemit_checks;
+                  ++(c.ok ? totals.reemit_checks : totals.partial_reemit_checks);
                 }
               }
               REQUIRE_FALSE(spoiled);
@@ -347,28 +368,33 @@ void run_scene(std::uint32_t seed, Totals& totals) {
         ++totals.early;
       }
 
-      // Masks, for any frame released on time: every box a complete cycle
-      // found within the retro window after the frame, or within the hold
-      // before it, is covered (scaled across a resize).
+      // Masks, for any frame released on time: every box a cycle found
+      // (complete, or failed with partial boxes; SPG-10c) within the retro
+      // window after the frame, or within the hold before it, is covered
+      // (scaled across a resize).
       if (f.bad || now_ms > f.t_ms + lookahead_ms + grace_ms) {
         continue;
       }
       for (const Completion& c : completions) {
-        if (!c.ok) {
+        if (!c.held) {
           continue;
         }
         const bool retro = c.t_ms >= f.t_ms && c.t_ms <= f.t_ms + retro_ms;
-        const bool held = c.t_ms <= f.t_ms && f.t_ms <= c.t_ms + hold_ms;
-        if (!retro && !held) {
+        const bool in_hold = c.t_ms <= f.t_ms && f.t_ms <= c.t_ms + hold_ms;
+        if (!retro && !in_hold) {
           continue;
         }
         if (!c.applied && r.action != FallbackAction::None) {
           continue;  // in no plan; the fallback covers the whole frame
         }
         for (const Rect& b : c.boxes) {
-          INFO("cycle at " << c.t_ms << " frame at " << f.t_ms);
+          INFO("cycle at " << c.t_ms << " frame at " << f.t_ms << (c.ok ? "" : " (partial)"));
           REQUIRE(plan_covers(r.plan, scaled(b, c.size, f.size)));
-          ++(retro && c.t_ms > f.t_ms ? totals.retro_checks : totals.hold_checks);
+          if (c.ok) {
+            ++(retro && c.t_ms > f.t_ms ? totals.retro_checks : totals.hold_checks);
+          } else {
+            ++totals.partial_mask_checks;
+          }
         }
       }
     }
@@ -380,13 +406,18 @@ void run_scene(std::uint32_t seed, Totals& totals) {
     // source sends frames fast, so cycles stay in flight across many resizes.
     now_ms += flapping ? s.pick(1, 3) : (s.chance(0.03) ? s.pick(100, 1500) : s.pick(8, 25));
     clock.set(at_ms(now_ms));
-    if (i == resize_at && size_b != size) {
+    // A resize is new content. The scheduler only sees the size it is
+    // pushed, so a change counts once per frame and only if that size
+    // differs from the last one: the resize landing on a flapping frame that
+    // toggles straight back leaves the source as it was.
+    const Size before = size;
+    if (i == resize_at) {
       size = size_b;
-      ++segment;  // a resize is new content
-      ++resizes;
     }
     if (flapping && size_a != size_b) {
       size = size == size_a ? size_b : size_a;
+    }
+    if (size != before) {
       ++segment;
       ++resizes;
     }
@@ -421,7 +452,10 @@ void run_scene(std::uint32_t seed, Totals& totals) {
       std::optional<spg::ScanJob> job = la.take_job();
       REQUIRE(job.has_value());
       const bool stall = s.chance(stall_rate);
-      workers.push_back(Pending{*job, stall ? -1 : now_ms + s.pick(0, max_work_ms), !s.chance(fail_rate)});
+      const std::int64_t done_ms = stall ? -1 : now_ms + s.pick(0, max_work_ms);
+      const bool ok = !s.chance(fail_rate);
+      const bool partial = !ok && s.chance(partial_rate);
+      workers.push_back(Pending{*job, done_ms, ok, partial});
     }
     finish_due(false);
     release();
@@ -470,11 +504,18 @@ TEST_CASE("no frame is released without a complete scan or the fallback, and mas
   CHECK(totals.reemits_refused > 0);
   CHECK(totals.switched_scenes > 100);
   CHECK(totals.flapping_scenes > 100);
+  // SPG-10c: failed cycles with partial boxes, held and checked like any box.
+  CHECK(totals.partial_cycles > 200);
+  CHECK(totals.partial_unapplied > 10);
+  CHECK(totals.partial_mask_checks > 1000);
+  CHECK(totals.partial_reemit_checks > 100);
   UNSCOPED_INFO("clean " << totals.clean << " fallback " << totals.fallback << " reemits " << totals.reemits
                          << " late " << totals.late << " bad " << totals.bad << " early " << totals.early
                          << " retro " << totals.retro_checks << " hold " << totals.hold_checks
                          << " not_scanned " << totals.not_scanned << " apply_failed " << totals.apply_failed
                          << " unapplied " << totals.unapplied_rejected << "/" << totals.unapplied_too_old
-                         << " reemit_checks " << totals.reemit_checks << " refused " << totals.reemits_refused);
+                         << " reemit_checks " << totals.reemit_checks << " refused " << totals.reemits_refused
+                         << " partial " << totals.partial_cycles << "/" << totals.partial_unapplied << " checks "
+                         << totals.partial_mask_checks << "/" << totals.partial_reemit_checks);
   CHECK(totals.clean > 0);
 }
