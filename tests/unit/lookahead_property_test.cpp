@@ -406,13 +406,18 @@ void run_scene(std::uint32_t seed, Totals& totals) {
     // source sends frames fast, so cycles stay in flight across many resizes.
     now_ms += flapping ? s.pick(1, 3) : (s.chance(0.03) ? s.pick(100, 1500) : s.pick(8, 25));
     clock.set(at_ms(now_ms));
-    if (i == resize_at && size_b != size) {
+    // A resize is new content. The scheduler only sees the size it is
+    // pushed, so a change counts once per frame and only if that size
+    // differs from the last one: the resize landing on a flapping frame that
+    // toggles straight back leaves the source as it was.
+    const Size before = size;
+    if (i == resize_at) {
       size = size_b;
-      ++segment;  // a resize is new content
-      ++resizes;
     }
     if (flapping && size_a != size_b) {
       size = size == size_a ? size_b : size_a;
+    }
+    if (size != before) {
       ++segment;
       ++resizes;
     }
