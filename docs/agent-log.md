@@ -327,7 +327,7 @@ Template:
   be read as boxes. The test `OwnedFrame` is move-only so its view cannot
   point into another frame's buffers.
 
-## 2026-10-12 — SPG-06 Text detector (#PR)
+## 2026-10-12 — SPG-06 Text detector (#35)
 
 - Decision / change: `TextDetector` in `spg-detect` (`core/src/detect/`,
   lane:vision) runs the pinned PP-OCRv3 English DBNet
