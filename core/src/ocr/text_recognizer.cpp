@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "spg/error.hpp"
+#include "spg/secure_memory.hpp"
 
 namespace spg::ocr {
 
@@ -89,6 +90,23 @@ detect::BgrImage render_job(const FrameView& frame, const ReadJob& job, std::uin
       detect::render_model_input(frame, ModelInputMapping(crop, Size{input_height, job.width}, Fit::Stretch));
   return rotate(upright, job.rotation);
 }
+
+// Zeroes the model's output when it goes out of scope, decoded or not: the
+// most probable class per step spells the text.
+class WipeOutputs {
+ public:
+  explicit WipeOutputs(std::vector<runtime::Tensor>& outputs) noexcept : outputs_(outputs) {}
+  ~WipeOutputs() {
+    for (runtime::Tensor& output : outputs_) {
+      secure_wipe(output.data.data(), output.data.size() * sizeof(float));
+    }
+  }
+  WipeOutputs(const WipeOutputs&) = delete;
+  WipeOutputs& operator=(const WipeOutputs&) = delete;
+
+ private:
+  std::vector<runtime::Tensor>& outputs_;
+};
 
 }  // namespace
 
@@ -204,11 +222,13 @@ std::vector<Recognition> TextRecognizer::recognize(const FrameView& frame, Size 
   }
 
   // Run jobs in width order so a batch pads little; decode into per-job text.
+  // Every buffer that holds recognized text is a SecureText (protected memory,
+  // zeroed when released); no std::string holds any of it.
   std::vector<std::size_t> order(jobs.size());
   std::iota(order.begin(), order.end(), std::size_t{0});
   std::stable_sort(order.begin(), order.end(),
                    [&](std::size_t a, std::size_t b) { return jobs[a].read.width < jobs[b].read.width; });
-  std::vector<std::string> texts(jobs.size());
+  std::vector<SecureText> texts(jobs.size());
   std::vector<CtcStats> stats(jobs.size());
   const std::size_t classes = alphabet_.size();
   for (std::size_t first = 0; first < order.size(); first += config_.max_batch) {
@@ -226,7 +246,8 @@ std::vector<Recognition> TextRecognizer::recognize(const FrameView& frame, Size 
     const std::array<std::int64_t, 4> shape{static_cast<std::int64_t>(count), 3, static_cast<std::int64_t>(height),
                                             static_cast<std::int64_t>(width)};
     const std::array<runtime::TensorView, 1> inputs{{{tensor, shape}}};
-    const std::vector<runtime::Tensor> outputs = session_.run(inputs);
+    std::vector<runtime::Tensor> outputs = session_.run(inputs);
+    const WipeOutputs wipe_outputs(outputs);
     const std::size_t steps = width / config_.time_stride;
     const std::array<std::int64_t, 3> want{static_cast<std::int64_t>(count), static_cast<std::int64_t>(steps),
                                            static_cast<std::int64_t>(classes)};
@@ -245,7 +266,7 @@ std::vector<Recognition> TextRecognizer::recognize(const FrameView& frame, Size 
   }
 
   // Join each region's texts: chunks of one view by ' ', views by '\n'.
-  std::vector<std::string> joined(regions.size());
+  std::vector<SecureText> joined(regions.size());
   std::vector<CtcStats> totals(regions.size());
   std::vector<std::size_t> last_view(regions.size(), static_cast<std::size_t>(-1));
   for (std::size_t j = 0; j < jobs.size(); ++j) {
@@ -256,14 +277,14 @@ std::vector<Recognition> TextRecognizer::recognize(const FrameView& frame, Size 
       continue;
     }
     if (!joined[r].empty()) {
-      joined[r] += jobs[j].read.view == last_view[r] ? ' ' : '\n';
+      joined[r].push_back(jobs[j].read.view == last_view[r] ? ' ' : '\n');
     }
-    joined[r] += texts[j];
+    joined[r].insert(joined[r].end(), texts[j].begin(), texts[j].end());
     last_view[r] = jobs[j].read.view;
   }
   std::vector<Recognition> results(regions.size());
   for (std::size_t r = 0; r < regions.size(); ++r) {
-    results[r].text = Secret(std::move(joined[r]));
+    results[r].text = Secret::copy_of(view(joined[r]));
     results[r].score = totals[r].characters == 0
                            ? 0.0F
                            : totals[r].confidence_sum / static_cast<float>(totals[r].characters);

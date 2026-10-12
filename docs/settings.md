@@ -169,6 +169,7 @@ What uses it:
 | Copy | Where |
 | --- | --- |
 | `spg::Secret` (entries, `PolicyConfig::watchlist`, OCR text) | Its bytes, always; a `std::vector<Secret>` holds only pointers and sizes |
+| OCR text while it is decoded and joined | `ocr::SecureText` buffers; the whole OCR path is in [policy.md](policy.md#recognized-text-in-memory) |
 | `Secret(std::string)` | Copies the string, then zeroes the string's whole buffer |
 | Policy engine's compiled entries | `SecureU32String`s in a vector on `SecureAllocator` |
 | Policy folding, matching forms, reversed forms, PII digit views | `SecureU32String` / `SecureString` temporaries |
