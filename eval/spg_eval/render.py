@@ -26,7 +26,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageOps, features
 
 from .contracts import Box, GroundTruthFrame, Instance, serialize_ground_truth_frame
-from .suite import TRUTH
+from .suite import PLANS, TRUTH
 
 if not features.check("freetype2"):
     raise RuntimeError("Pillow was built without FreeType; the pinned wheels include it")
@@ -177,6 +177,11 @@ def write_sequence(seq_dir: Path, background: Image.Image, frame_fn, n: int, fps
     """Render n frames (frame_fn(i) -> placements) and their ground truth into seq_dir."""
     w, h = background.size
     (seq_dir / "frames").mkdir(parents=True, exist_ok=True)
+    # Regenerating into an old output (say full, then ci) must not leave frames
+    # or mask plans that the new ground truth does not describe.
+    for stale in (seq_dir / "frames").glob("*.png"):
+        stale.unlink()
+    (seq_dir / PLANS).unlink(missing_ok=True)
     lines = []
     for i in range(n):
         image, instances = compose(background, frame_fn(i))

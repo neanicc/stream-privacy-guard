@@ -103,7 +103,9 @@ class _Reader:
         v = self.require(key)
         if not isinstance(v, (int, float)) or isinstance(v, bool):
             raise self.fail(key, "must be a number")
-        if not math.isfinite(v):
+        # Range first: an int too large for a float would make math.isfinite raise
+        # OverflowError. Python compares ints with floats exactly.
+        if isinstance(v, float) and not math.isfinite(v):
             raise self.fail(key, "must be finite")
         if not lo <= v <= hi:
             raise self.fail(key, rule)

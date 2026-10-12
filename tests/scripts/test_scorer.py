@@ -4,6 +4,7 @@ Run by ctest (scoring.scorer) or directly: python3 -I tests/scripts/test_scorer.
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,9 @@ class ContractTests(unittest.TestCase):
             head + '{"id":"a","kind":"face","box":{"x":0,"y":-1e39,"w":1,"h":1},"visibility":1}]}',
             head + '{"id":"a","kind":"face","box":{"x":NaN,"y":0,"w":1,"h":1},"visibility":1}]}',
             head + '{"id":"a","kind":"face","box":{"x":1e400,"y":0,"w":1,"h":1},"visibility":1}]}',
+            # An integer too large for a float must be a contract error, not an OverflowError.
+            head + '{"id":"a","kind":"face","box":{"x":' + "9" * 400 + ',"y":0,"w":1,"h":1},"visibility":1}]}',
+            head + '{"id":"a","kind":"face",' + box + ',"visibility":-' + "9" * 400 + '}]}',
             head + '{"id":"","kind":"face",' + box + ',"visibility":1}]}',
             head + '{"id":"a","kind":"face",' + box + ',"visibility":1,"text":"x"}]}',
             head + '{"id":"a","kind":"face",' + box + ',"visibility":1},{"id":"a","kind":"face",' + box
@@ -102,6 +106,8 @@ class ContractTests(unittest.TestCase):
             '{"schema":1,"space":"source","timestamp_ns":0,"fallback":false,"rects":[{"box":{"x":0,"y":0,"w":1e39,"h":1},"style":"blur"}]}',
             '{"schema":1,"space":"source","timestamp_ns":0.5,"fallback":false,"rects":[]}',
             '{"schema":1,"space":"source","timestamp_ns":0,"fallback":false}',
+            '{"schema":1,"space":"source","timestamp_ns":0,"fallback":false,"rects":[{"box":{"x":0,"y":0,"w":'
+            + "1" * 400 + ',"h":1},"style":"blur"}]}',
         ]
         for text in bad:
             with self.subTest(text=text), self.assertRaises(ContractError):
@@ -242,6 +248,37 @@ class VerdictTests(unittest.TestCase):
                     scoring.evaluate(scoring.load_thresholds(path), {"text": self.run_for("noop")}, "ci")
 
 
+class SuiteLayoutTests(unittest.TestCase):
+    def write_suite(self, root: Path, declared, truth: list[GroundTruthFrame]) -> Path:
+        out = root / "text"
+        (out / "seq-000").mkdir(parents=True)
+        seq = {"name": "seq-000"} if declared is None else {"name": "seq-000", "frames": declared}
+        (out / "suite.json").write_text(json.dumps({"schema": 1, "suite": "text", "sequences": [seq]}))
+        (out / "seq-000" / suite.TRUTH).write_text(
+            "".join(contracts.serialize_ground_truth_frame(f) + "\n" for f in truth))
+        suite.write_plans(out / "seq-000" / suite.PLANS, suite.reference_plans(truth, "oracle"))
+        return out
+
+    def test_complete_suite_loads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.write_suite(Path(tmp), 10, synthetic_suite())
+            self.assertEqual(len(suite.load_run(out).sequences[0].truth), 10)
+
+    def test_ground_truth_must_hold_every_declared_frame(self) -> None:
+        # Shortened ground truth with equally shortened plans pairs cleanly, so
+        # only the declared count can catch it.
+        full = synthetic_suite()
+        cases = {"short": (10, full[:4]), "empty": (10, []), "gap": (10, full[:5] + full[6:]),
+                 "extra": (9, full), "no count": (None, full), "zero": (0, []), "bool": (True, full[:1])}
+        for label, (declared, truth) in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                out = self.write_suite(Path(tmp), declared, truth)
+                with self.assertRaises(scoring.ScoreError):
+                    suite.load_run(out)
+                with self.assertRaises(scoring.ScoreError):
+                    suite.reference_run(out, "oracle")
+
+
 class CommandLineTests(unittest.TestCase):
     def test_score_cli_prints_one_verdict(self) -> None:
         import importlib.util
@@ -251,8 +288,9 @@ class CommandLineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "text"
             (out / "seq-000").mkdir(parents=True)
-            (out / "suite.json").write_text('{"schema": 1, "suite": "text", "sequences": [{"name": "seq-000"}]}')
             truth = synthetic_suite()
+            (out / "suite.json").write_text(json.dumps(
+                {"schema": 1, "suite": "text", "sequences": [{"name": "seq-000", "frames": len(truth)}]}))
             (out / "seq-000" / suite.TRUTH).write_text(
                 "".join(contracts.serialize_ground_truth_frame(f) + "\n" for f in truth))
             for pipeline, code, verdict in (("noop", 1, "THRESHOLDS: FAIL"), ("oracle", 1, "THRESHOLDS: FAIL")):

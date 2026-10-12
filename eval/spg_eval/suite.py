@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .contracts import (Box, GroundTruthFrame, MaskPlan, MaskRect, parse_ground_truth_frame, parse_mask_plan,
                         read_jsonl, serialize_mask_plan)
-from .scoring import Sequence, SuiteRun
+from .scoring import ScoreError, Sequence, SuiteRun
 
 INDEX = "suite.json"
 TRUTH = "ground_truth.jsonl"
@@ -34,8 +34,22 @@ def read_index(suite_dir: Path) -> dict:
 
 
 def load_truth(suite_dir: Path) -> dict[str, list[GroundTruthFrame]]:
-    return {s["name"]: read_jsonl(suite_dir / s["name"] / TRUTH, parse_ground_truth_frame)
-            for s in read_index(suite_dir)["sequences"]}
+    """Each sequence's ground truth, which must hold exactly the frames 0..n-1 that suite.json declares.
+
+    Plans are paired with ground truth frame by frame, so a shortened ground
+    truth file would let a matching shortened plan file pass unnoticed.
+    """
+    truth = {}
+    for seq in read_index(suite_dir)["sequences"]:
+        name, declared = seq["name"], seq.get("frames")
+        if not isinstance(declared, int) or isinstance(declared, bool) or declared < 1:
+            raise ScoreError(f"{suite_dir / INDEX}: sequence {name} must declare a positive frame count")
+        frames = read_jsonl(suite_dir / name / TRUTH, parse_ground_truth_frame)
+        if sorted(f.frame for f in frames) != list(range(declared)):
+            raise ScoreError(f"{name}: ground truth holds {len(frames)} frame(s), "
+                             f"suite.json declares frames 0..{declared - 1}")
+        truth[name] = frames
+    return truth
 
 
 def load_run(suite_dir: Path, plans_dir: Path | None = None) -> SuiteRun:

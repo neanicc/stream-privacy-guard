@@ -17,6 +17,7 @@ Writes <out>/report.txt and <out>/report.json (metrics only, no item text).
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -89,6 +90,8 @@ def main(argv: list[str]) -> int:
         print("\n".join(lines))
         try:
             for name, suite_dir in suite_dirs.items():
+                # Plans left by an earlier run must never be scored as this run's output.
+                shutil.rmtree(args.out / "plans" / name, ignore_errors=True)
                 run_pipeline(args.build_dir, suite_dir, args.out / "plans" / name)
         except PipelineUnavailable as exc:
             verdict = f"THRESHOLDS: NOT RUN ({exc})"

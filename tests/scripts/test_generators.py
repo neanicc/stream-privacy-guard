@@ -146,10 +146,17 @@ class TextSuiteTests(unittest.TestCase):
         self.assertEqual(oracle.verdict, "THRESHOLDS: PASS", oracle.lines)
 
     def test_frames_match_ground_truth(self) -> None:
+        # Leftovers of a longer profile in the same output must not survive regeneration.
+        stale = self.out / "frames" / "seq-000"
+        (stale / "frames").mkdir(parents=True)
+        for i in (0, 39, 40, 89):
+            (stale / "frames" / f"{i:06d}.png").write_bytes(b"stale")
+        (stale / suite.PLANS).write_text("stale\n")
         index = text_suite.generate(self.out / "frames", 7, "ci", frames=True)
+        self.assertFalse((stale / suite.PLANS).exists())
         for seq in index["sequences"][:2]:
             frames = sorted((self.out / "frames" / seq["frames_dir"]).glob("*.png"))
-            self.assertEqual(len(frames), seq["frames"])
+            self.assertEqual([p.name for p in frames], [f"{i:06d}.png" for i in range(seq["frames"])])
             with Image.open(frames[-1]) as img:
                 self.assertEqual((img.mode, img.size), ("RGB", (seq["width"], seq["height"])))
         # Rendering frames does not change the ground truth.
