@@ -434,11 +434,14 @@ bool watchlist_add_clicked(obs_properties_t * /*props*/, obs_property_t * /*prop
   obs_data_t *settings = obs_source_get_settings(state->context);
   try {
     // The text is in pending_entry, or still in the settings when a script
-    // set the field and pressed Add on properties built before that.
+    // set the field and pressed Add on properties built before that. A field
+    // the settings hold as empty means "nothing to add", not "use what was
+    // typed earlier".
+    const bool in_settings = obs_data_has_user_value(settings, kWatchlistNewEntryKey);
     Secret entry = take_masked_entry(settings);
     {
       const std::lock_guard lock{state->mutex};
-      if (entry.empty()) {
+      if (!in_settings) {
         entry = std::move(state->pending_entry);
       }
       state->pending_entry = Secret{};

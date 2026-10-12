@@ -171,17 +171,25 @@ bool write_new_file(const fs::path& path, std::string_view body) {
   return closer.close() && synced;
 }
 
-// Reads at most `limit` bytes of the file into protected memory. nullopt on
-// an I/O error.
+// Reads the file through one descriptor until end of file or `limit` bytes,
+// whichever comes first, into protected memory (the buffer grows as needed;
+// each outgrown block is wiped when released). The size is never taken from
+// an earlier stat, so a file that grew or was replaced since then is read
+// whole or not at all, never cut off at its old length. nullopt on an I/O
+// error.
 std::optional<SecureString> read_file(const fs::path& path, std::size_t limit) {
+  constexpr std::size_t kFirstRead = 4096;
   const int fd = open_for_read(path);
   if (fd < 0) {
     return std::nullopt;
   }
   FileCloser closer{fd};
-  SecureString body(limit, '\0');
+  SecureString body;
   std::size_t used = 0;
-  while (used < body.size()) {
+  while (used < limit) {
+    if (used == body.size()) {
+      body.resize(std::min(limit, std::max(kFirstRead, 2 * body.size())));
+    }
     const long long got = read_some(fd, body.data() + used, body.size() - used);
     if (got < 0 && errno == EINTR) {
       continue;
@@ -367,17 +375,8 @@ WatchlistLoad WatchlistStore::load(long long expected_entries) const {
     return result;
   }
 #endif
-  const std::uintmax_t size = fs::file_size(file_, ec);
-  if (ec) {
-    result.error = StoreError::Unreadable;
-    return result;
-  }
-  if (size > kMaxFileBytes) {
-    result.error = StoreError::Corrupt;
-    return result;
-  }
-  // One byte past the size, so a file that grew since file_size() is caught.
-  const std::optional<SecureString> body = read_file(file_, static_cast<std::size_t>(size) + 1);
+  // One byte past the limit, so an oversized file is caught.
+  const std::optional<SecureString> body = read_file(file_, static_cast<std::size_t>(kMaxFileBytes) + 1);
   if (!body) {
     result.error = StoreError::Unreadable;
     return result;

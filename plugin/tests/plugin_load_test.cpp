@@ -351,6 +351,18 @@ void check_undo_snapshots(const fs::path &watchlist_dir) {
   check(obs_data_get_int(settings, plugin::kWatchlistCountKey) == 1, "text the rebuilt field no longer shows is not added");
   check(read_file(file).find(kTypedOnly) == std::string::npos, "the dropped text is not in the watch-list file");
 
+  // Text typed in the view, then the field set to empty in the settings (a
+  // script) before Add: Add sees an empty entry and adds nothing.
+  props = obs_source_properties(source);
+  view_edit(source, props, settings, plugin::kWatchlistNewEntryKey, burst, write_string, kTypedOnly);
+  view_record_undo(settings, burst, undo_stack);
+  obs_data_set_string(settings, plugin::kWatchlistNewEntryKey, "");
+  obs_property_button_clicked(obs_properties_get(props, plugin::kWatchlistAddKey), source);
+  obs_properties_destroy(props);
+  check(obs_data_get_int(settings, plugin::kWatchlistCountKey) == 1, "an emptied field adds nothing");
+  check(read_file(file).find(kTypedOnly) == std::string::npos, "text typed before the field was emptied is not added");
+  check(!obs_data_has_user_value(settings, plugin::kWatchlistNewEntryKey), "Add clears the emptied field");
+
   bool secret_in_undo = false;
   bool ref_in_undo = true;
   for (const std::string &json : undo_stack) {

@@ -357,6 +357,21 @@ TEST_CASE("the store saves, replaces and loads a user-only file", "[watchlist]")
     write_file(store.file(), std::string{encode_watchlist({})} + std::string(1 << 20, 'q') + "\n");
     CHECK(store.load(0).error == StoreError::Corrupt);
   }
+  SECTION("a list at the limits is read whole, past every buffer growth") {
+    // Escaped backslashes make the file ~130 KB, just under the size limit.
+    std::vector<Secret> full;
+    for (std::size_t i = 0; i < kMaxWatchlistEntries; ++i) {
+      std::string entry(kMaxEntryBytes - 6, '\\');
+      const std::string index = std::to_string(100000 + i);
+      entry += index;
+      full.push_back(Secret::copy_of(entry));
+    }
+    REQUIRE(store.save(full) == StoreError::None);
+    REQUIRE(fs::file_size(store.file()) > 120U * 1024U);
+    const WatchlistLoad loaded = store.load(static_cast<long long>(full.size()));
+    CHECK(loaded.error == StoreError::None);
+    CHECK(loaded.entries == full);
+  }
   SECTION("a directory where the file should be is unreadable") {
     fs::create_directories(store.file());
     CHECK(store.load(0).error == StoreError::Unreadable);
