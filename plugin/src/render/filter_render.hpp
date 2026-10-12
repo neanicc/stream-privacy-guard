@@ -6,8 +6,10 @@
 //
 // Threads: publish() runs wherever the settings change (the video thread for
 // `update`, the UI thread for the watch-list buttons) and builds the new
-// scheduler there; render() runs on the graphics thread; status() may run on
-// any thread.
+// scheduler there; when the module's detection models finish loading, the
+// model loader thread rebuilds it the same way (SPG-14b). Models are never
+// loaded on any of these threads. render() runs on the graphics thread;
+// status() may run on any thread.
 
 #include <atomic>
 #include <chrono>
@@ -35,16 +37,21 @@ inline constexpr std::chrono::hours kWorkerJoinTimeout{1};
 
 class FilterRender {
  public:
+  // Starts loading the module's detection models if nothing has yet, and
+  // rebuilds the scheduler when they are ready.
   explicit FilterRender(obs_source_t* filter);
-  // Frees GPU resources; the host then retires the schedulers to the reaper.
+  // Stops listening for the models, frees GPU resources; the host then
+  // retires the schedulers to the reaper.
   ~FilterRender();
   FilterRender(const FilterRender&) = delete;
   FilterRender& operator=(const FilterRender&) = delete;
 
-  // Hands the render thread a scheduler for `policy` (none: every frame is
-  // covered whole with `fallback`). Skips the rebuild when nothing changed.
-  // On any failure every frame is covered with a solid fill until a later
-  // publish succeeds.
+  // Hands the render thread a scheduler for `policy` with the module's
+  // detection models. No policy, or no models (still loading, missing or
+  // failed): no scheduler, and every frame is covered whole with the
+  // fallback. Skips the rebuild when neither the policy nor the models
+  // changed. On any failure every frame is covered with a solid fill until a
+  // later publish succeeds.
   void publish(const std::optional<PolicyConfig>& policy, FallbackMode fallback) noexcept;
   void set_debug_overlay(bool on) noexcept { overlay_.store(on, std::memory_order_relaxed); }
 
@@ -55,6 +62,10 @@ class FilterRender {
 
  private:
   void log_transition(const DrawPlan& plan) noexcept;
+  // publish_mutex_ held.
+  void publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback) noexcept;
+  // The model loader thread: rebuild the last published policy with the models.
+  void models_changed() noexcept;
 
   obs_source_t* filter_;
   ObsFrameGpu gpu_;
@@ -65,6 +76,8 @@ class FilterRender {
   FallbackMode published_fallback_ = FallbackMode::BlurSource;
   bool have_published_ = false;
   bool publish_failed_ = false;
+  std::uint64_t published_models_ = 0;  // ModelHub generation the scheduler was built with
+  std::uint64_t models_listener_ = 0;
 
   std::atomic<bool> overlay_{false};
   // Render thread only.

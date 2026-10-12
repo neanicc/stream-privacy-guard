@@ -6,6 +6,8 @@
 #include <chrono>
 #include <utility>
 
+#include "model_loading.hpp"
+#include "models/model_set.hpp"
 #include "pipeline/reaper.hpp"
 #include "plugin-support.hpp"
 #include "settings/filter_settings.hpp"
@@ -33,14 +35,6 @@ const Clock& obs_clock() noexcept {
 // still be draining after a settings change, plus the frame on screen and
 // the last clean frame.
 constexpr std::size_t kRingCapacity = 2 * SchedulerConfig{}.max_buffered_frames + 2;
-
-// The detection stages for `policy`. Not loaded by this build yet (models and
-// ONNX Runtime in the plugin are a follow-up to SPG-14): with no detector for
-// an enabled category every cycle fails (ScanFailure::MissingStage), so every
-// frame is released with the fallback. Never fail open.
-ScanStages make_stages(const PolicyConfig& /*policy*/) {
-  return ScanStages{};
-}
 
 constexpr std::uint64_t kLogInterval = 10'000'000'000ULL;  // ns
 
@@ -78,9 +72,16 @@ FilterRender::FilterRender(obs_source_t* filter)
     : filter_(filter),
       gpu_(filter, kRingCapacity),
       host_(gpu_, kRingCapacity,
-            [](std::unique_ptr<FrameScheduler> scheduler) { module_reaper().retire(std::move(scheduler)); }) {}
+            [](std::unique_ptr<FrameScheduler> scheduler) { module_reaper().retire(std::move(scheduler)); }) {
+  // Last, so a throw above leaves nothing subscribed. Loading runs on the
+  // hub's thread; until it ends this filter publishes no scheduler.
+  models_listener_ = module_models().subscribe([this] { models_changed(); });
+  module_models().start();
+}
 
 FilterRender::~FilterRender() {
+  // No models_changed() runs on this object once this returns.
+  module_models().unsubscribe(models_listener_);
   // host_ is destroyed after this body (members in reverse order), retiring
   // its schedulers; the GPU resources go first, inside the graphics context.
   gpu_.destroy();
@@ -89,14 +90,39 @@ FilterRender::~FilterRender() {
 void FilterRender::publish(const std::optional<PolicyConfig>& policy, FallbackMode fallback) noexcept {
   try {
     const std::lock_guard lock(publish_mutex_);
-    if (have_published_ && !publish_failed_ && published_ == policy && published_fallback_ == fallback) {
-      return;  // the same policy (a debug overlay toggle, an unrelated update)
+    publish_locked(policy, fallback);
+  } catch (...) {
+    host_.fail();  // the lock could not be taken: nothing may keep running the old policy
+  }
+}
+
+void FilterRender::models_changed() noexcept {
+  try {
+    const std::lock_guard lock(publish_mutex_);
+    if (have_published_) {
+      const std::optional<PolicyConfig> policy = published_;
+      publish_locked(policy, published_fallback_);
+    }
+  } catch (...) {
+    // Copying the policy failed: the current generation keeps running
+    // without models (every frame covered whole).
+  }
+}
+
+void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback) noexcept {
+  try {
+    const ModelHub::Snapshot models = module_models().snapshot();
+    if (have_published_ && !publish_failed_ && published_ == policy && published_fallback_ == fallback &&
+        published_models_ == models.generation) {
+      return;  // the same policy and models (a debug overlay toggle, an unrelated update)
     }
     // Until this publish succeeds, nothing may keep running the old policy.
     publish_failed_ = true;
     auto spec = std::make_unique<PipelineSpec>();
     spec->fallback = policy ? policy->fallback : fallback;
-    if (policy) {
+    // Without models no scheduler is built: every frame is covered whole
+    // (Cover::NoDetection) and nothing is read back or scanned.
+    if (policy && models.models != nullptr) {
       SchedulerConfig config = SchedulerConfig::from_policy(*policy);
       // Clamped again where consumed (settings are clamped when read).
       config.lookahead = std::chrono::milliseconds(clamp_lookahead_ms(policy->lookahead.count()));
@@ -104,13 +130,21 @@ void FilterRender::publish(const std::optional<PolicyConfig>& policy, FallbackMo
       config.tracker.hold = std::chrono::milliseconds(clamp_hold_ms(policy->hold.count()));
       config.shutdown_timeout = kWorkerJoinTimeout;
       spec->hold = config.tracker.hold;
-      spec->scheduler = std::make_unique<ThreadedScheduler>(obs_clock(), std::move(config), make_stages(*policy));
+      spec->scheduler =
+          std::make_unique<ThreadedScheduler>(obs_clock(), std::move(config), make_stages(models.models, *policy));
     }
+    const bool first_with_models = spec->scheduler != nullptr && published_models_ != models.generation;
     published_ = policy;
     published_fallback_ = fallback;
+    published_models_ = models.generation;
     have_published_ = true;
     host_.offer(std::move(spec));
     publish_failed_ = false;
+    if (first_with_models) {
+      // The source name is the user's label for the filter, not frame content.
+      const char* name = obs_source_get_name(filter_);
+      log(LOG_INFO, "'%s': scanning with the detection models", name != nullptr ? name : "");
+    }
   } catch (...) {
     // No scheduler for these settings: cover everything until one is built.
     host_.fail();
