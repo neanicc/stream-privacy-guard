@@ -69,7 +69,7 @@ Template:
   later; OBS plugin builds may need the OpenCV libraries checked
   for position-independent code on Linux (SPG-13).
 
-## 2026-10-12 — SPG-02 Core contracts and geometry (#PR)
+## 2026-10-12 — SPG-02 Core contracts and geometry (#23)
 
 - Decision / change: plan section 5 types as headers in `core/include/spg/`
   (`time`, `frame`, `geometry`, `category`, `detection`, `mask`,
