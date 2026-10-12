@@ -26,6 +26,12 @@ tested" is a valid result.
   the fail-closed fallback; confirm the whole source blurs rather than leaking.
 - Change settings live; restart OBS and confirm the watch-list persisted without
   appearing in the scene collection JSON in plain text (per the storage decision).
+- Type a planted entry into the masked field slowly, wait two seconds, move a
+  slider, press Add, then undo and redo several times (Edit menu): the field
+  keeps showing dots while typing, Add stores the entry, and no undo step
+  restores text into the field. Close and reopen the properties with text
+  typed but not added: the field is empty and Add adds nothing. Check the OBS
+  log for `watch-list memory: crash-dump exclusion:` and record its value.
 
 ## Scrub the recording
 
