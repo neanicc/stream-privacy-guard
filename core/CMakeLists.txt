@@ -32,6 +32,11 @@ target_link_libraries(spg-core PRIVATE nlohmann_json::nlohmann_json)
 target_compile_definitions(spg-core PRIVATE SPG_VERSION_STRING="${PROJECT_VERSION}")
 spg_target_defaults(spg-core)
 
+# Protected memory for watch-list text (SPG-15b): Secret and SecureHeap.
+# Windows Error Reporting's dump exclusion is looked up in kernel32 at run
+# time (Windows 10 1703 and later), so nothing extra is linked.
+target_sources(spg-core PRIVATE src/secure/secret.cpp src/secure/secure_memory.cpp)
+
 # Tracker and temporal hold (SPG-09).
 target_sources(spg-core PRIVATE src/track/tracker.cpp)
 

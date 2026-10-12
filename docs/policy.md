@@ -23,8 +23,9 @@ Every check first folds the text:
   is not full NFKC, and characters outside those blocks pass through.
 - Zero-width characters (U+200B..U+200D, U+2060, U+FEFF) and soft hyphens are
   deleted; control characters and Unicode whitespace become one space.
-- A malformed UTF-8 byte becomes U+FFFD, which separates words. Evaluation never
-  throws on recognized text.
+- A malformed UTF-8 byte becomes U+FFFD, which separates words. No text makes
+  evaluation throw; only running out of protected memory does (see
+  [Secrecy](#secrecy)).
 
 ## Watch-list matching
 
@@ -77,14 +78,33 @@ construction, matching, PII scanning, `describe()` and three config errors
 while capturing the sink and `std::cout`/`std::cerr`/`std::clog`, and asserts
 that no captured text contains any fragment of the entry, raw or normalized.
 
-`Secret` is a type-level guard (no stream operator, no implicit conversion), not
-protected memory: it does not lock or zero its storage. The compiled matching
-forms (`std::u32string`, private to the engine) and the folded copies
-`evaluate()` makes of recognized text are held the same way, so they are as
-exposed as the `PolicyConfig` itself in a full-memory dump. Keeping watch-list
-text out of crash dumps (AGENTS.md) therefore needs a process-level measure in
-the plugin; the engine does not provide one.
+`Secret` is a type-level guard (no stream operator, no implicit conversion)
+and, since SPG-15b, protected memory: its text lives in `SecureHeap`, which
+keeps it out of crash dumps where the OS allows, locks it in RAM where it can
+and zeroes it on release. The compiled matching forms, the folded and matching
+copies `evaluate()` makes of recognized text and the PII digit views use the
+same heap through `SecureAllocator`. What each OS covers, and the copies that
+remain outside it (short-string buffers on the stack, OBS and Qt copies of the
+typed entry), are in [settings.md](settings.md#watch-list-text-in-memory).
 
 `evaluate()` costs O(entries × entry length × text length) per call, with up to
 three passes per entry, and has no length cap of its own. It is meant for a
 worker thread; the OCR stage that calls it should bound the text it passes in.
+Its temporaries for a line of up to 4096 code points reuse blocks of the
+shared heap, so after warm-up a call makes no system call and holds the heap's
+lock only to take and return blocks; a longer line maps a region of its own
+per temporary (outside the lock). Measured on the dev Mac (M-series, 10
+synthetic entries, `evaluate()` in a tight loop): no change single-threaded
+(about 26 µs for a 170-character line, 440 µs for 3000 characters); with four
+threads evaluating at once, a 170-character line went from about 28 to 33 µs
+because the threads share the heap's lock. The scheduler ticket should
+measure this against the frame budget; a per-class lock is the next step if
+it matters.
+
+**Requirement on callers (SPG-10 scheduler, SPG-07 OCR stage):** the
+`PolicyEngine` constructor and `evaluate()` throw `std::bad_alloc` when
+`SecureHeap` cannot map a region (`mmap` or `VirtualAlloc` failed, for
+example at `vm.max_map_count`). `mlock` and dump exclusion are best effort;
+mapping is not. The caller must catch it and treat the frame as not scanned,
+so the configured fallback applies (default: blur the whole source). An
+exception from the policy stage must never let an unscanned frame through.

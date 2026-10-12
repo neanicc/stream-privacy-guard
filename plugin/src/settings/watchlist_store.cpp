@@ -2,8 +2,8 @@
 
 #include <algorithm>
 #include <array>
-#include <fstream>
 #include <iterator>
+#include <optional>
 #include <random>
 #include <system_error>
 #include <utility>
@@ -11,12 +11,15 @@
 #include "spg/policy.hpp"
 #include "spg/policy_config.hpp"
 
-#ifndef _WIN32
+#include <cerrno>
+#include <climits>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#include <share.h>
+#else
 #include <unistd.h>
-
-#include <cerrno>
 #endif
 
 namespace spg::plugin {
@@ -95,40 +98,112 @@ StoreError ensure_directory(const fs::path& directory) {
   return StoreError::None;
 }
 
-// Writes `body` to a new file only the user can read and syncs it.
-bool write_new_file(const fs::path& path, const std::string& body) {
+// Unbuffered file I/O: watch-list bytes go straight between protected memory
+// and the OS, never through a stream or stdio buffer on the ordinary heap.
 #ifdef _WIN32
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    return false;
-  }
-  out.write(body.data(), static_cast<std::streamsize>(body.size()));
-  out.flush();
-  return static_cast<bool>(out);
+int open_for_read(const fs::path& path) noexcept {
+  int fd = -1;
+  return _wsopen_s(&fd, path.c_str(), _O_RDONLY | _O_BINARY | _O_NOINHERIT, _SH_DENYNO, 0) == 0 ? fd : -1;
+}
+// A new file; the per-user profile ACL applies (docs/settings.md).
+int create_user_only(const fs::path& path) noexcept {
+  int fd = -1;
+  return _wsopen_s(&fd, path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY | _O_NOINHERIT, _SH_DENYNO,
+                   _S_IREAD | _S_IWRITE) == 0
+             ? fd
+             : -1;
+}
+long long read_some(int fd, char* data, std::size_t size) noexcept {
+  return _read(fd, data, static_cast<unsigned int>(std::min<std::size_t>(size, INT_MAX)));
+}
+long long write_some(int fd, const char* data, std::size_t size) noexcept {
+  return _write(fd, data, static_cast<unsigned int>(std::min<std::size_t>(size, INT_MAX)));
+}
+bool sync_file(int fd) noexcept { return _commit(fd) == 0; }
+bool close_file(int fd) noexcept { return _close(fd) == 0; }
 #else
-  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+int open_for_read(const fs::path& path) noexcept { return ::open(path.c_str(), O_RDONLY | O_CLOEXEC); }
+int create_user_only(const fs::path& path) noexcept {
+  return ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+}
+long long read_some(int fd, char* data, std::size_t size) noexcept { return ::read(fd, data, size); }
+long long write_some(int fd, const char* data, std::size_t size) noexcept { return ::write(fd, data, size); }
+bool sync_file(int fd) noexcept { return ::fsync(fd) == 0; }
+bool close_file(int fd) noexcept { return ::close(fd) == 0; }
+#endif
+
+// Closes a descriptor on every path out of a function.
+class FileCloser {
+ public:
+  explicit FileCloser(int fd) noexcept : fd_(fd) {}
+  FileCloser(const FileCloser&) = delete;
+  FileCloser& operator=(const FileCloser&) = delete;
+  ~FileCloser() {
+    if (fd_ >= 0) {
+      static_cast<void>(close_file(fd_));
+    }
+  }
+  // Closes now and reports whether that succeeded.
+  bool close() noexcept { return close_file(std::exchange(fd_, -1)); }
+
+ private:
+  int fd_;
+};
+
+// Writes `body` to a new file only the user can read and syncs it.
+bool write_new_file(const fs::path& path, std::string_view body) {
+  const int fd = create_user_only(path);
   if (fd < 0) {
     return false;
   }
-  const char *data = body.data();
-  std::size_t left = body.size();
-  bool ok = true;
-  while (left > 0) {
-    const ssize_t written = ::write(fd, data, left);
-    if (written < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      ok = false;
+  FileCloser closer{fd};
+  while (!body.empty()) {
+    const long long written = write_some(fd, body.data(), body.size());
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written <= 0) {
+      return false;
+    }
+    body.remove_prefix(static_cast<std::size_t>(written));
+  }
+  const bool synced = sync_file(fd);
+  return closer.close() && synced;
+}
+
+// Reads the file through one descriptor until end of file or `limit` bytes,
+// whichever comes first, into protected memory (the buffer grows as needed;
+// each outgrown block is wiped when released). The size is never taken from
+// an earlier stat, so a file that grew or was replaced since then is read
+// whole or not at all, never cut off at its old length. nullopt on an I/O
+// error.
+std::optional<SecureString> read_file(const fs::path& path, std::size_t limit) {
+  constexpr std::size_t kFirstRead = 4096;
+  const int fd = open_for_read(path);
+  if (fd < 0) {
+    return std::nullopt;
+  }
+  FileCloser closer{fd};
+  SecureString body;
+  std::size_t used = 0;
+  while (used < limit) {
+    if (used == body.size()) {
+      body.resize(std::min(limit, std::max(kFirstRead, 2 * body.size())));
+    }
+    const long long got = read_some(fd, body.data() + used, body.size() - used);
+    if (got < 0 && errno == EINTR) {
+      continue;
+    }
+    if (got < 0) {
+      return std::nullopt;
+    }
+    if (got == 0) {
       break;
     }
-    data += written;
-    left -= static_cast<std::size_t>(written);
+    used += static_cast<std::size_t>(got);
   }
-  ok = ok && ::fsync(fd) == 0;
-  ok = (::close(fd) == 0) && ok;
-  return ok;
-#endif
+  body.resize(used);
+  return body;
 }
 
 }  // namespace
@@ -144,7 +219,7 @@ bool is_valid_watchlist_ref(std::string_view ref) noexcept {
 }
 
 EntryError check_new_entry(std::string_view utf8, const std::vector<Secret>& existing) {
-  const Secret entry{std::string(utf8)};
+  const Secret entry = Secret::copy_of(utf8);
   if (is_blank(entry)) {
     return EntryError::Empty;
   }
@@ -187,8 +262,8 @@ std::string_view describe(StoreError error) noexcept {
   return "unknown";
 }
 
-std::string encode_watchlist(const std::vector<Secret>& entries) {
-  std::string out{kHeader};
+SecureString encode_watchlist(const std::vector<Secret>& entries) {
+  SecureString out{kHeader};
   out.push_back('\n');
   for (const Secret& entry : entries) {
     for (const char c : entry.reveal()) {
@@ -224,7 +299,7 @@ std::optional<std::vector<Secret>> decode_watchlist(std::string_view body) {
     }
     const std::string_view line = body.substr(0, end);
     body.remove_prefix(end + 1);
-    std::string entry;
+    SecureString entry;
     for (std::size_t i = 0; i < line.size(); ++i) {
       const char c = line[i];
       if (c == '\r') {
@@ -251,7 +326,7 @@ std::optional<std::vector<Secret>> decode_watchlist(std::string_view body) {
           return std::nullopt;
       }
     }
-    Secret secret{std::move(entry)};
+    Secret secret = Secret::copy_of(entry);
     if (secret.size() > kMaxEntryBytes || entries.size() >= kMaxWatchlistEntries || is_blank(secret)) {
       return std::nullopt;
     }
@@ -300,26 +375,17 @@ WatchlistLoad WatchlistStore::load(long long expected_entries) const {
     return result;
   }
 #endif
-  const std::uintmax_t size = fs::file_size(file_, ec);
-  if (ec) {
+  // One byte past the limit, so an oversized file is caught.
+  const std::optional<SecureString> body = read_file(file_, static_cast<std::size_t>(kMaxFileBytes) + 1);
+  if (!body) {
     result.error = StoreError::Unreadable;
     return result;
   }
-  if (size > kMaxFileBytes) {
+  if (body->size() > kMaxFileBytes) {
     result.error = StoreError::Corrupt;
     return result;
   }
-  std::ifstream in(file_, std::ios::binary);
-  if (!in) {
-    result.error = StoreError::Unreadable;
-    return result;
-  }
-  const std::string body{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-  if (in.bad()) {
-    result.error = StoreError::Unreadable;
-    return result;
-  }
-  std::optional<std::vector<Secret>> entries = decode_watchlist(body);
+  std::optional<std::vector<Secret>> entries = decode_watchlist(*body);
   if (!entries) {
     result.error = StoreError::Corrupt;
     return result;
