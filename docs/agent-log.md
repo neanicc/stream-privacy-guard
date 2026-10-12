@@ -196,7 +196,7 @@ Template:
   committed fixtures in `tests/fixtures/contracts/` to keep the Python side in
   step with the C++ parser.
 
-## 2026-10-12 — SPG-05 Face detector (#PR)
+## 2026-10-12 — SPG-05 Face detector (#29)
 
 - Decision / change: `spg-detect` (`core/src/detect/`, lane:vision) with
   `FaceDetector`: YuNet 2023mar through `spg::runtime::Session`. The pinned
