@@ -29,6 +29,9 @@ nlohmann/json 3.12.0 (Niels Lohmann)
 
 Not included in this package
   libobs and OBS Studio (GPL-2.0-or-later): provided by your OBS installation.
+  Microsoft Visual C++ 2015-2022 Redistributable (Windows: msvcp140.dll,
+  vcruntime140.dll, concrt140.dll): a system component that OBS Studio
+  requires to start; not redistributed with this plugin.
   Catch2 (BSL-1.0): used only by the test suite.
   Detection models (YuNet, MIT; PP-OCR via RapidOCR, Apache-2.0): fetched
   separately by scripts/fetch_models.py into your user cache. A package built

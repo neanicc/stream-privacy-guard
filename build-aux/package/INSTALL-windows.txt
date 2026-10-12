@@ -10,6 +10,10 @@ Requirements
   - Windows 10 or 11, x64.
   - OBS Studio 32.1 or a later 32.x release (64-bit). Built against
     libobs 32.1.2; other OBS versions are untested.
+  - Microsoft Visual C++ 2015-2022 Redistributable (x64), 14.40 or later.
+    OBS Studio needs it too and will not start without it, so a working
+    OBS already has it. The plugin uses its msvcp140.dll, vcruntime140.dll
+    and concrt140.dll; the package does not include them.
   - Python 3 (3.12 tested), once, to fetch the detection models.
   - Detection runs on the CPU (no GPU acceleration in this build).
 

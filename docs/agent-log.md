@@ -1629,6 +1629,28 @@ Template:
   ONNX Runtime: TRUE`; the README status, limitations, INSTALL texts and
   release notes say the plugin loads the models. The package contents per OS
   from CI are listed in the PR's Validation section.
+- After that merge the Windows check failed: `obs-spg.dll` imports
+  `CONCRT140.dll`. Cause: the pinned static OpenCV (`opencv_core490.lib`) is
+  built with MSVC's Concurrency Runtime as its `parallel_for` backend
+  (`/DEFAULTLIB:"concrt"`, `Concurrency::structured_task_group`), and
+  SPG-14b links it into the module. Not removable without rebuilding
+  OpenCV: the static `libconcrt.lib` is `/MT` and cannot link into a `/MD`
+  module. Decision: `concrt140.dll` joins `msvcp140`/`vcruntime140` as part
+  of the Microsoft Visual C++ 2015-2022 Redistributable, which OBS 32
+  requires to start (`vc_runtime_outdated()` in `frontend/obs-main.cpp`
+  checks `msvcp140.dll` >= 14.40) and which installs all three in System32.
+  Shipping it beside the module instead would take a Microsoft binary out
+  of the GPL-2.0 system-library exception the other two rely on. The
+  requirement is now stated in INSTALL-windows.txt, the README and the
+  notices. Review follow-ups (Greptile): search paths are now resolved and
+  normalized (`$ORIGIN`, `@loader_path`) and must stay inside the plugin
+  folder or bundle and reach the shipped libraries' folder (`$ORIGIN/../lib`
+  and `@loader_path/../../../outside` fail); the libraries shipped beside the
+  module are read too, so a missing dependency of ONNX Runtime fails the
+  check, and a library loaded only by another shipped one counts as used.
+  Windows ONNX Runtime 1.30.0 imports `SETUPAPI.dll`, now allow-listed as
+  an OS DLL. Checked against the pinned ONNX Runtime binaries of all three
+  OSes: no problems.
 - Open issues or follow-ups: no live OBS install from a package has been
   done; the live check should install from the CI artifact rather than the
   build tree.

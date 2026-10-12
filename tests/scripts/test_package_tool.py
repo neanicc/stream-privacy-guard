@@ -112,12 +112,76 @@ class DependencyTest(unittest.TestCase):
         problems = problems_for("windows-x64", Imports(["obs.dll"]), ["onnxruntime.dll"])
         self.assertEqual(problems, ["ships onnxruntime.dll, which the module does not import"])
 
+    def test_windows_vc_redistributable_is_provided(self):
+        # The static OpenCV's parallel_for imports the Concurrency Runtime;
+        # it comes with the VC++ redistributable OBS 32 requires, like
+        # msvcp140 and vcruntime140. A DLL outside that set still fails.
+        imports = Imports(["obs.dll", "MSVCP140.dll", "VCRUNTIME140_1.dll", "CONCRT140.dll"])
+        self.assertEqual(problems_for("windows-x64", imports, []), [])
+        for other in ("msvcr120.dll", "concrt140d.dll", "vcomp140.dll"):
+            problems = problems_for("windows-x64", Imports(["obs.dll", other]), [])
+            self.assertEqual(len(problems), 1, other)
+
     def test_linux_needs_origin_runpath(self):
         imports = Imports(["libobs.so.0", "libc.so.6", "libstdc++.so.6", "libonnxruntime.so.1"], [])
         problems = problems_for("linux-x64", imports, ["libonnxruntime.so.1"])
-        self.assertEqual(problems, ["ships libraries but its RUNPATH has no $ORIGIN"])
-        imports.rpaths = ["$ORIGIN"]
-        self.assertEqual(problems_for("linux-x64", imports, ["libonnxruntime.so.1"]), [])
+        self.assertEqual(problems, ["ships libraries but its RUNPATH has no $ORIGIN (the module's folder)"])
+        for good in (["$ORIGIN"], ["${ORIGIN}"], ["$ORIGIN/"], ["$ORIGIN/../64bit"]):
+            imports.rpaths = good
+            self.assertEqual(problems_for("linux-x64", imports, ["libonnxruntime.so.1"]), [], good)
+
+    def test_linux_runpath_must_reach_the_shipped_libraries(self):
+        # The libraries sit beside the module in bin/64bit; $ORIGIN/../lib
+        # names a folder that does not hold them.
+        imports = Imports(["libobs.so.0", "libonnxruntime.so.1"], ["$ORIGIN/../lib"])
+        self.assertEqual(problems_for("linux-x64", imports, ["libonnxruntime.so.1"]),
+                         ["ships libraries but its RUNPATH has no $ORIGIN (the module's folder)"])
+
+    def test_linux_runpath_must_stay_in_the_plugin_folder(self):
+        for bad in ("/home/runner/.cache/spg/deps/onnxruntime/lib", "$ORIGIN/../../..", "$ORIGIN/../../../x",
+                    "lib", "$ORIGINAL"):
+            imports = Imports(["libobs.so.0", "libonnxruntime.so.1"], ["$ORIGIN", bad])
+            self.assertEqual(problems_for("linux-x64", imports, ["libonnxruntime.so.1"]),
+                             [f"search path {bad} points outside the plugin folder"], bad)
+
+    def test_resolve_search_path(self):
+        resolve = package_tool.resolve_search_path
+        self.assertEqual(str(resolve("linux-x64", "$ORIGIN")), "obs-spg/bin/64bit")
+        self.assertEqual(str(resolve("linux-x64", "$ORIGIN/../lib")), "obs-spg/bin/lib")
+        self.assertEqual(str(resolve("macos-arm64", "@loader_path/../Frameworks")),
+                         "obs-spg.plugin/Contents/Frameworks")
+        self.assertEqual(str(resolve("macos-arm64", "@loader_path/../../../outside")), "outside")
+        self.assertIsNone(resolve("macos-arm64", "@executable_path/../Frameworks"))
+        self.assertIsNone(resolve("linux-x64", "/usr/lib"))
+
+    def test_shipped_libraries_imports_are_checked(self):
+        imports = Imports(["obs.dll", "onnxruntime.dll"])
+        ort = Imports(["KERNEL32.dll", "SETUPAPI.dll", "MSVCP140_1.dll", "dxgi.dll"])
+        self.assertEqual(problems_for("windows-x64", imports, ["onnxruntime.dll"], {"onnxruntime.dll": ort}), [])
+        ort.libraries.append("onnxruntime_providers_shared.dll")
+        self.assertEqual(problems_for("windows-x64", imports, ["onnxruntime.dll"], {"onnxruntime.dll": ort}),
+                         ["onnxruntime.dll imports onnxruntime_providers_shared.dll, which the package "
+                          "does not ship and OBS or the OS does not provide"])
+
+    def test_library_loaded_only_by_a_shipped_library_counts_as_used(self):
+        imports = Imports(["libobs.so.0", "libonnxruntime.so.1"], ["$ORIGIN"])
+        shipped = ["libonnxruntime.so.1", "libonnxruntime_providers_shared.so"]
+        loads = {"libonnxruntime.so.1": Imports(["libc.so.6", "libonnxruntime_providers_shared.so"]),
+                 "libonnxruntime_providers_shared.so": Imports(["libc.so.6"])}
+        self.assertEqual(problems_for("linux-x64", imports, shipped, loads), [])
+        loads["libonnxruntime.so.1"] = Imports(["libc.so.6"])
+        self.assertEqual(problems_for("linux-x64", imports, shipped, loads),
+                         ["ships libonnxruntime_providers_shared.so, which the module does not import"])
+
+    def test_macos_rpath_must_stay_in_the_bundle(self):
+        base = ["@rpath/libobs.framework/Versions/A/libobs", "@rpath/libonnxruntime.1.dylib"]
+        for bad in ("@loader_path/../../../outside", "@loader_path/../../..", "@executable_path/../Frameworks"):
+            imports = Imports(base, ["@loader_path/../Frameworks", bad])
+            self.assertEqual(problems_for("macos-arm64", imports, ["libonnxruntime.1.dylib"]),
+                             [f"search path {bad} points outside the bundle"], bad)
+        # Normalized, the right folder still counts.
+        imports = Imports(base, ["@loader_path/../MacOS/../Frameworks"])
+        self.assertEqual(problems_for("macos-arm64", imports, ["libonnxruntime.1.dylib"]), [])
 
     def test_macos_rules(self):
         base = ["@rpath/libobs.framework/Versions/A/libobs", "/usr/lib/libc++.1.dylib",
@@ -187,6 +251,17 @@ class LayoutTest(unittest.TestCase):
             path.unlink()
         problems = package_tool.layout_problems(layout, self.manifest, False)
         self.assertEqual(len(problems), 3, problems)
+
+    def test_check_reads_the_shipped_libraries(self):
+        # PE files are read in Python, so the whole check runs on any OS.
+        layout = staged(self.root / "w", "windows-x64")
+        write(layout.module, make_pe(["obs.dll", "onnxruntime.dll", "CONCRT140.dll"], []))
+        ort = write(layout.lib_dir / "onnxruntime.dll", make_pe(["KERNEL32.dll", "SETUPAPI.dll"], []))
+        self.assertEqual(package_tool.check(layout, self.manifest, False), [])
+        write(ort, make_pe(["KERNEL32.dll", "onnxruntime_providers_shared.dll"], []))
+        problems = package_tool.check(layout, self.manifest, False)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith("onnxruntime.dll imports onnxruntime_providers_shared.dll"))
 
     def test_models_only_with_flag(self):
         layout = staged(self.root / "s")

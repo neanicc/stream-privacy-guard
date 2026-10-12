@@ -7,10 +7,11 @@ package, write the archive.
     package_tool.py archive --stage DIR --out DIST
 
 `check` is the package's test: it fails when the module, its data or a
-license is missing, when the module imports a library the package neither
-ships nor can expect from OBS or the OS, when the package ships a library the
-module does not import, when a macOS rpath points outside the bundle, or when
-a model file is present without --with-models. Standard library only; it
+license is missing, when the module or a library shipped beside it imports a
+library the package neither ships nor can expect from OBS or the OS, when the
+package ships a library nothing in it loads, when a search path (macOS rpath,
+Linux RUNPATH) leads outside the plugin or misses the shipped libraries, or
+when a model file is present without --with-models. Standard library only; it
 calls otool/codesign on macOS and readelf on Linux, and reads Windows imports
 from the PE file itself.
 """
@@ -20,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import struct
@@ -28,7 +30,7 @@ import sys
 import tarfile
 import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PLATFORMS = ("macos-arm64", "windows-x64", "linux-x64")
 MODULE = "obs-spg"
@@ -41,6 +43,15 @@ OBS_LIBS = {
     "linux-x64": [r"libobs\.so\.\d+"],
     "windows-x64": [r"obs\.dll"],
 }
+# On Windows the Microsoft Visual C++ 2015-2022 Redistributable (x64) counts as
+# part of the OS: OBS 32 refuses to start without it (frontend/obs-main.cpp,
+# vc_runtime_outdated(): msvcp140.dll 14.40 or later) and its updater installs
+# it. These are the DLLs that redistributable puts in System32 and that the
+# module or ONNX Runtime import: the C++ library, the compiler runtime, and the
+# Concurrency Runtime that the static OpenCV's parallel_for backend calls.
+# Shipping them beside a GPL-2.0 module would take them out of the GPL's
+# system-library exception, so the package relies on the installed copy.
+VC_REDIST = [r"vcruntime140(_1)?\.dll", r"msvcp140(_\d+)?\.dll", r"concrt140\.dll"]
 SYSTEM_LIBS = {
     "macos-arm64": [],  # absolute /usr/lib and /System paths, checked separately
     "linux-x64": [r"libc\.so\.6", r"libm\.so\.6", r"libstdc\+\+\.so\.6", r"libgcc_s\.so\.1",
@@ -48,9 +59,11 @@ SYSTEM_LIBS = {
     "windows-x64": [r"kernel32\.dll", r"user32\.dll", r"advapi32\.dll", r"ole32\.dll",
                     r"oleaut32\.dll", r"shell32\.dll", r"shlwapi\.dll", r"ws2_32\.dll",
                     r"bcrypt\.dll", r"dbghelp\.dll", r"version\.dll", r"d3d11\.dll", r"dxgi\.dll",
-                    r"api-ms-win-.*\.dll", r"ucrtbase\.dll", r"vcruntime140(_1)?\.dll",
-                    r"msvcp140(_\d+)?\.dll"],
+                    r"setupapi\.dll", r"api-ms-win-.*\.dll", r"ucrtbase\.dll"] + VC_REDIST,
 }
+
+# What a search path relative to the module starts with.
+ORIGIN_TOKENS = {"macos-arm64": ("@loader_path",), "linux-x64": ("$ORIGIN", "${ORIGIN}")}
 
 
 class PackageError(Exception):
@@ -104,47 +117,99 @@ def _matches(patterns: list[str], name: str) -> bool:
     return any(re.fullmatch(p, name, re.IGNORECASE) for p in patterns)
 
 
-def dependency_problems(platform: str, imports: Imports, shipped: list[str]) -> list[str]:
-    """Problems with the module's imports against the libraries shipped
-    beside it (`shipped`: file names in Layout.lib_dir, the module excluded)."""
+def _relative(path: Path) -> PurePosixPath:
+    return PurePosixPath(path.as_posix())
+
+
+def resolve_search_path(platform: str, entry: str) -> PurePosixPath | None:
+    """Where a search path relative to the module leads, relative to the
+    package root with `..` normalized away; None when it is not relative to
+    the module (an absolute path, @executable_path, ...)."""
+    module_dir = _relative(Layout(platform, Path()).module.parent)
+    for token in ORIGIN_TOKENS.get(platform, ()):
+        if entry == token or entry.startswith(token + "/"):
+            rest = entry[len(token):].lstrip("/")
+            return PurePosixPath(posixpath.normpath((module_dir / rest).as_posix()))
+    return None
+
+
+def search_path_problems(platform: str, rpaths: list[str], ships_libraries: bool) -> list[str]:
+    """Every search path must stay inside the bundle (macOS) or the plugin
+    folder (Linux), and when the package ships libraries one must lead to the
+    folder they are in. Windows has none: libobs adds the module's folder to
+    the DLL search path."""
+    if platform not in ORIGIN_TOKENS:
+        return []
+    layout = Layout(platform, Path())
+    container = PurePosixPath(_relative(layout.module).parts[0])
+    lib_dir = _relative(layout.lib_dir)
+    where = "the bundle" if platform == "macos-arm64" else "the plugin folder"
+    problems = []
+    reaches_libraries = False
+    for entry in rpaths:
+        target = resolve_search_path(platform, entry)
+        if target is None or not (target == container or container in target.parents):
+            problems.append(f"search path {entry} points outside {where}")
+        elif target == lib_dir:
+            reaches_libraries = True
+    if ships_libraries and not reaches_libraries:
+        if platform == "macos-arm64":
+            problems.append("ships libraries but has no @loader_path/../Frameworks rpath")
+        else:
+            problems.append("ships libraries but its RUNPATH has no $ORIGIN (the module's folder)")
+    return problems
+
+
+def _resolve_import(platform: str, lib: str, shipped: list[str]) -> tuple[str | None, str | None]:
+    """(the shipped library `lib` loads, the problem with it). Both are None
+    when OBS or the OS provides it."""
+    if platform == "macos-arm64":
+        if lib.startswith(("/usr/lib/", "/System/")):
+            return None, None
+        match = re.fullmatch(r"@(?:rpath|loader_path/\.\./Frameworks)/(.+)", lib)
+        if not match:
+            return None, f"{lib}, which is outside the bundle and the OS"
+        name = match.group(1)
+        if _matches(OBS_LIBS[platform], name):
+            return None, None
+        top = name.split("/", 1)[0]
+        if top in shipped:
+            return top, None
+        return None, f"{lib}, but Contents/Frameworks has no {top}"
+    if _matches(OBS_LIBS[platform], lib) or _matches(SYSTEM_LIBS[platform], lib):
+        return None, None
+    found = next((s for s in shipped if s.lower() == lib.lower()), None)
+    if found:
+        return found, None
+    return None, f"{lib}, which the package does not ship and OBS or the OS does not provide"
+
+
+def dependency_problems(platform: str, imports: Imports, shipped: list[str],
+                        shipped_imports: dict[str, Imports] | None = None) -> list[str]:
+    """Problems with what the module and the libraries shipped beside it
+    import (`shipped`: file names in Layout.lib_dir, the module excluded;
+    `shipped_imports`: each one's imports, without its own install name). A
+    shipped library is used when the module loads it, directly or through
+    another shipped library."""
+    shipped_imports = shipped_imports or {}
     problems: list[str] = []
     used: set[str] = set()
-    for lib in imports.libraries:
-        if platform == "macos-arm64":
-            if lib.startswith(("/usr/lib/", "/System/")):
-                continue
-            match = re.fullmatch(r"@(?:rpath|loader_path/\.\./Frameworks)/(.+)", lib)
-            if not match:
-                problems.append(f"imports {lib}, which is outside the bundle and the OS")
-                continue
-            name = match.group(1)
-            if _matches(OBS_LIBS[platform], name):
-                continue
-            top = name.split("/", 1)[0]
-            if top in shipped:
-                used.add(top)
-            else:
-                problems.append(f"imports {lib}, but Contents/Frameworks has no {top}")
-            continue
-        if _matches(OBS_LIBS[platform], lib) or _matches(SYSTEM_LIBS[platform], lib):
-            continue
-        found = next((s for s in shipped if s.lower() == lib.lower()), None)
-        if found:
-            used.add(found)
-        else:
-            problems.append(f"imports {lib}, which the package does not ship and OBS or the OS does not provide")
+
+    def visit(who: str | None, imp: Imports) -> None:
+        for lib in imp.libraries:
+            found, problem = _resolve_import(platform, lib, shipped)
+            if problem:
+                problems.append(f"{who} imports {problem}" if who else f"imports {problem}")
+            if found and found not in used:
+                used.add(found)
+                visit(found, shipped_imports.get(found, Imports()))
+
+    visit(None, imports)
     for name in shipped:
         if name not in used:
             problems.append(f"ships {name}, which the module does not import")
-    if platform == "macos-arm64":
-        for rpath in imports.rpaths:
-            if not rpath.startswith("@loader_path/"):
-                problems.append(f"rpath {rpath} points outside the bundle")
-        if used and "@loader_path/../Frameworks" not in imports.rpaths:
-            problems.append("ships libraries but has no @loader_path/../Frameworks rpath")
-    if platform == "linux-x64" and used:
-        if not any("$ORIGIN" in r for r in imports.rpaths):
-            problems.append("ships libraries but its RUNPATH has no $ORIGIN")
+            visit(name, shipped_imports.get(name, Imports()))
+    problems += search_path_problems(platform, imports.rpaths, bool(used))
     return problems
 
 
@@ -161,8 +226,11 @@ def _run(args: list[str]) -> str:
 
 
 def macho_imports(path: Path) -> Imports:
+    """otool -L lists a dylib's own install name first; it is left out."""
+    own = {line.strip() for line in _run(["otool", "-D", str(path)]).splitlines()[1:] if line.strip()}
     libs = [line.strip().split(" (compatibility")[0]
             for line in _run(["otool", "-L", str(path)]).splitlines()[1:] if line.strip()]
+    libs = [lib for lib in libs if lib not in own]
     rpaths = re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (.+?) \(offset \d+\)",
                         _run(["otool", "-l", str(path)]))
     return Imports(libs, rpaths)
@@ -226,12 +294,14 @@ def pe_imports(data: bytes) -> Imports:
         raise PackageError(f"malformed PE file: {exc}") from exc
 
 
-def read_imports(layout: Layout) -> Imports:
-    if layout.platform == "macos-arm64":
-        return macho_imports(layout.module)
-    if layout.platform == "linux-x64":
-        return elf_imports(layout.module)
-    return pe_imports(layout.module.read_bytes())
+def read_imports(platform: str, path: Path) -> Imports:
+    if path.name.endswith(".framework"):  # a shipped framework: read its binary
+        path = path / path.name[:-len(".framework")]
+    if platform == "macos-arm64":
+        return macho_imports(path)
+    if platform == "linux-x64":
+        return elf_imports(path)
+    return pe_imports(path.read_bytes())
 
 
 # Models -----------------------------------------------------------------------
@@ -348,10 +418,12 @@ def check(layout: Layout, manifest: Path, with_models: bool) -> list[str]:
     problems = layout_problems(layout, manifest, with_models)
     if not layout.module.is_file():
         return problems
-    shipped = sorted(p.name for p in layout.lib_dir.iterdir()
+    shipped = sorted(p for p in layout.lib_dir.iterdir()
                      if p != layout.module and is_shared_library(p, layout.platform)) \
         if layout.lib_dir.is_dir() else []
-    problems += dependency_problems(layout.platform, read_imports(layout), shipped)
+    problems += dependency_problems(layout.platform, read_imports(layout.platform, layout.module),
+                                    [p.name for p in shipped],
+                                    {p.name: read_imports(layout.platform, p) for p in shipped})
     if layout.platform == "macos-arm64":
         problems += signature_problems(layout)
     return problems

@@ -34,7 +34,9 @@ packages for each OS (the `packages-<os>` artifacts of the Check workflow);
 1. Quit OBS and copy the plugin as above. It needs OBS Studio 32.1 or a later
    32.x release; it is built against libobs 32.1.2 and other versions are
    untested. On Linux, use a native OBS install (not the Flatpak) with glibc
-   2.39 or newer.
+   2.39 or newer. On Windows it uses the Microsoft Visual C++ 2015-2022
+   Redistributable (x64) that OBS itself requires; the package does not
+   include it.
 2. The packages are not signed with a developer certificate or notarized
    (no signing identity exists for this project). The macOS bundle carries
    only an ad-hoc signature, so a browser-downloaded copy is quarantined;
