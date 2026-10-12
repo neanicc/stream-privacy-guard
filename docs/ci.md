@@ -17,13 +17,23 @@ aggregate `check` job.
 Workflows are human-owned. Agents change what CI does by editing
 `scripts/ci/run.sh` (lane:build), which every stage calls. Since SPG-01 the
 build stages are real: `setup` runs `scripts/fetch_deps.py` against
-`deps/manifest.json` and (since SPG-04) `scripts/fetch_models.py` against
-`models/manifest.json`, `build` configures CMake (Ninja when installed, the newest
+`deps/manifest.json`, (since SPG-04) `scripts/fetch_models.py` against
+`models/manifest.json` and (since SPG-13) `build-aux/build_libobs.py`, which
+builds libobs from the pinned OBS sources on macOS and Windows for the plugin
+(Linux uses the pinned Ubuntu package), `build` configures CMake (Ninja when installed, the newest
 Visual Studio with C++ tools on Windows) and prints ccache statistics, and
 `test` runs `ctest`, which fails if no tests are registered. One pin lives
 outside the manifest: Catch2 is fetched by CMake `FetchContent` at configure
 time, pinned by URL and SHA-256 in `tests/CMakeLists.txt`, so the first
 configure needs network access.
+
+Plugin coverage differs by OS. `plugin.loads` (headless libobs: module load,
+filter registration, locale, defaults, property types) runs on macOS and
+Windows only; on Linux the Ubuntu `libobs.so` needs system FFmpeg, PulseAudio
+and Wayland libraries the pins do not provide, so the Linux job proves the
+module builds, links and exports its entry points (`plugin.exports`) and
+nothing more (#27). No job renders through the filter: the fail-closed fill in
+`video_render` is checked only by live OBS ([live check](live-check.md)).
 
 Dependencies, models and the ccache cache (`~/.cache/spg/ccache`) are cached in
 `~/.cache/spg` keyed on the manifests and `CMakeLists.txt`.

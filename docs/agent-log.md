@@ -196,6 +196,137 @@ Template:
   committed fixtures in `tests/fixtures/contracts/` to keep the Python side in
   step with the C++ parser.
 
+## 2026-10-12 — SPG-13 OBS plugin shell (#26)
+
+- Decision / change: `plugin/` holds `obs-spg`, a C++20 OBS module in the
+  obs-plugintemplate layout (`src/`, `data/locale/`, `buildspec.json` at the
+  root for name and bundle id, helper scripts in `build-aux/`), built when
+  `-DSPG_BUILD_PLUGIN=ON`; `scripts/ci/run.sh` turns it on unless
+  `SPG_BUILD_PLUGIN=0`. It registers the video filter `spg_privacy_guard_filter`
+  ("Privacy Guard") with a properties stub (status notice, lookahead 500 ms,
+  hold 750 ms; saved, not yet used) and links `spg-core` (now built with
+  `CMAKE_POSITION_INDEPENDENT_CODE`). With no pipeline yet the filter fails
+  closed: `video_render` never draws its target and covers the source with an
+  opaque fill (the plan's "solid fill" fallback, since the blur effect is
+  SPG-14). libobs: OBS 32.1.2 for every OS. Linux links the official
+  `OBS-Studio-32.1.2-Ubuntu-24.04-x86_64.deb` release asset (headers, CMake
+  package and `libobs.so` only; SIMDe 0.8.2 headers alongside), unpacked by
+  `fetch_deps.py`. macOS and Windows follow the template: `build-aux/build_libobs.py`
+  builds `libobs` and `obs-frontend-api` from the `OBS-Studio-32.1.2-Sources`
+  release against obs-deps 2025-08-23 (the version OBS 32.1.2 pins) and installs
+  the Development component into `$SPG_CACHE_DIR/deps/libobs/`, cached by an
+  input marker; CMake refuses a cached libobs whose marker differs from the
+  current obs-studio, obs-deps (and x86 obs-deps) hashes or builder digest, and
+  asks for `setup`. Every archive is in `deps/manifest.json` with SHA-256; OBS's own
+  configure-time downloads (obs-deps, Qt, CEF) are disabled by an override
+  `buildspec.cmake`, and the 32-bit helper configure OBS always runs on Windows
+  gets the pinned x86 obs-deps archive placed in `<source>/.deps`. 32.1.2 rather
+  than 32.2.2: 32.2 requires Xcode 26.5 and the `macos-15` runner tops out at
+  26.3. OBS 32.1 enables Swift only from a plugin directory, so the macOS build
+  injects `enable_language(Swift)` (`CMAKE_PROJECT_INCLUDE`) for libobs-metal.
+  `fetch_deps.py` gained `.deb` unpacking, `include` member filters (recorded
+  in the unpack marker, so changing the filter unpacks again), explicit
+  `{"unused": reason}` platform entries, `"unpack": false` and `--skip-group`.
+- Frame-access spike (plan question 1, recommended default kept): readback
+  through `gs_texrender` plus `gs_stagesurface`, not an async filter. Display,
+  window and game capture are synchronous GPU sources, and OBS documents
+  `filter_video` as "only used with asynchronous video filters", so an async
+  filter never sees them; a filter on them only gets `video_render`. The
+  readback plan for SPG-14: in `video_render`, render the target into a
+  downscaled `gs_texrender`, `gs_stage_texture` it into one of two (or three)
+  stage surfaces and `gs_stagesurface_map` the surface staged on the previous
+  frame, because OBS notes staging stalls unless given a frame to complete;
+  the mapped pixels are copied into a bounded queue for the workers and the
+  render thread never waits on them. Full-resolution frames for the lookahead
+  ring are kept as textures (question 2 default). Audio: a filter cannot delay
+  its source's audio, so the default is guidance, not automation: the
+  properties will show the Sync Offset (`lookahead_ms`) to set on the audio
+  sources tied to the filtered video (Advanced Audio Properties); the plugin
+  does not change other sources' offsets itself. Nothing here was measured:
+  render-thread cost and stalls need a live OBS run in SPG-14.
+- OpenCV PIC check (Linux, SPG-01 note): the occ-ai
+  `opencv-linux-v4.9.0-1-Release` static libraries are position-independent.
+  `objdump -r` finds no `R_X86_64_32`/`R_X86_64_32S` relocations in
+  `libopencv_core.a`, `libopencv_imgproc.a` or `3rdparty/libzlib.a`, and
+  `libopencv_core.a` uses `R_X86_64_REX_GOTPCRELX` (1224) and `PLT32`, so they
+  can be linked into the plugin module. The shell does not link OpenCV yet.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, Xcode 26.6): all five new
+  pins downloaded and matched SHA-256 (`fetch_deps.py --platform all
+  --no-extract`); the real `.deb` unpacks to 1.8 MB with the include filter;
+  `run.sh setup` built libobs 32.1.2 from source with Xcode; `run.sh build`
+  and `test` pass 14 tests, including `plugin.exports` (module exports every
+  `obs_module_*` entry point) and `plugin.loads` (headless libobs:
+  `obs_open_module`/`obs_init_module` succeed, the filter is a registered
+  video filter, locale name, defaults and properties as expected);
+  `SPG_BUILD_PLUGIN=0` setup/build/test pass 12 tests. CI results are in the PR.
+  Not tested: the fail-closed render path (needs a graphics context), loading
+  in the OBS app, and `plugin.loads` on Linux (the Ubuntu `libobs.so` needs
+  system FFmpeg 6, PulseAudio and Wayland libraries that the pinned inputs do
+  not provide, so Linux runs `plugin.exports` only).
+- Eval delta: none (no pipeline change; `run.sh eval` still NOT RUN).
+- Open issues or follow-ups: live load in OBS on the dev Mac (human);
+  packaging the module and its data per OS (SPG-17); readback, ring buffer,
+  blur and audio guidance (SPG-14).
+
+## 2026-10-12 — SPG-05 Face detector (#29)
+
+- Decision / change: `spg-detect` (`core/src/detect/`, lane:vision) with
+  `FaceDetector`: YuNet 2023mar through `spg::runtime::Session`. The pinned
+  model has a static 640x640 input, so the whole readback frame is letterboxed
+  top-left into it (uniform scale, black padding right and bottom, as OpenCV's
+  `FaceDetectorYN` pads) with `ModelInputMapping(..., Fit::LetterboxTopLeft)`;
+  boxes go back through `spg::convert()` only, then are clipped to the source
+  (far edge narrowed outward) and dropped when wholly in the padding.
+  `detect(frame, source)` takes the readback pixels plus the source size, so
+  `FrameView` and the contract headers are unchanged. Preprocessing
+  (`frame_image.cpp`, OpenCV private): crop must be whole pixels inside the
+  frame; area resize when downscaling, bilinear when upscaling; BGR raw 0-255
+  NCHW (OpenCV `blobFromImage` defaults); NV12/I420 decoded as BT.709 limited
+  range (OBS default), odd sizes supported. Decode and NMS (`yunet.cpp`) follow
+  OpenCV 4.x `face_detect.cpp` (score sqrt(clamp(cls) * clamp(obj)), center
+  offset and log size per stride 8/16/32, `NMSBoxes` semantics with top_k),
+  with one SPG change: a non-finite score anywhere, or a non-finite box on a
+  kept candidate, throws `DecodeError` so the frame fails closed instead of
+  silently dropping a face. Defaults: score threshold 0.6 (OpenCV's demo uses
+  0.9; lowered for recall over precision), NMS IoU 0.3, top_k 5000; SPG-12
+  tunes them on the faces suite. Landmarks are decoded by YuNet but unused.
+  Content size in the model input rounds to the nearest pixel, so a model
+  coordinate maps back within half a model pixel on the non-limiting axis
+  (under 1.5 Source px for 1080p), far below the tracker margin.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang): `scripts/ci/run.sh
+  build` and `test` pass, 78/78 ctest tests, 26 new `detect.*` cases. Unit cases
+  use synthetic tensors (decode per stride, clamping, inclusive threshold, NaN/
+  overflow fail closed, NMS threshold/top_k/ties), the mapping (four
+  source/readback/aspect combinations, clipping, padding drop, 200 fractional
+  boxes contain their exact Source image) and rendering (BGRA/NV12/I420 colors,
+  stride padding never read, odd sizes, upscaling, invalid crops). Model cases
+  (skip when YuNet is not cached) find no face in 24 empty synthetic frames and
+  find a drawn cartoon face (ellipses, no real likeness) in six scenes, on CPU
+  and the default provider (CoreML here), with the Source box centered within
+  0.15 face sizes; three faces stay three; four threads agree. A YuNet probe on
+  the drawn face scored about 0.86. Mutation check: ignoring the readback scale
+  in `detect()` failed 3 cases (every downscaled scene, both providers).
+- Eval delta: none. The detector is not wired into a pipeline yet (SPG-10/11),
+  and the eval stage was not run here (the eval driver has not landed).
+- Open issues or follow-ups: `Session::run` allocation per call is not
+  measured; leave it to `spg-cli bench` (SPG-11/16). Small faces (recall gap,
+  staff review P2): a 1080p frame is scaled by 1/3, so faces under about 30
+  Source px may be missed, and a missed face airs. SPG-12 must treat tiling or
+  a larger input as a recall item, not an option, and the 0.6 score threshold
+  is untuned until then. No recall claim is made for small or distant faces
+  before SPG-12 measures them on the faces suite. The text
+  detector (SPG-06) can reuse `render_model_input()` for its tiles.
+  `docs/contracts.md` describes `FrameView` as Source space; detectors also
+  use it for the readback copy, so lane:policy may want to say so there.
+- Review fixes (Greptile): `decode` also throws `DecodeError` when a kept
+  candidate's raw box values are not finite or its decoded width or height is
+  not positive (a -inf or underflowing log size used to decode to an empty box
+  that clipping dropped silently). `stride_outputs()` checks every run's
+  output shapes are exactly `[1, cells, 1|4]`, since the model may declare
+  dynamic output dimensions and a same-count transposed tensor would otherwise
+  be read as boxes. The test `OwnedFrame` is move-only so its view cannot
+  point into another frame's buffers.
+
 ## 2026-10-12 — SPG-08 Policy engine (#30)
 
 - Decision / change: `spg::PolicyEngine` (`core/include/spg/policy.hpp`,

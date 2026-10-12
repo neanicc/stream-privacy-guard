@@ -1,0 +1,11 @@
+{
+    "name": "obs-spg",
+    "displayName": "Stream Privacy Guard",
+    "author": "Stream Privacy Guard contributors",
+    "website": "https://github.com/neanicc/stream-privacy-guard",
+    "platformConfig": {
+        "macos": {
+            "bundleId": "io.github.neanicc.obs-spg"
+        }
+    }
+}
