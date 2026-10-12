@@ -32,8 +32,10 @@ catch_discover_tests(spg-unit-tests TEST_PREFIX "unit." DISCOVERY_MODE PRE_TEST
 # Tracker and temporal hold (SPG-09).
 target_sources(spg-unit-tests PRIVATE unit/tracker_test.cpp)
 # Scheduler, lookahead and fail-closed release (SPG-10). The mask helper tests
-# include core/src/mask/ directly.
+# include core/src/mask/ directly. fail_alloc.cpp replaces operator new for
+# this binary so a test can fail one allocation on purpose.
 target_sources(spg-unit-tests PRIVATE
+  unit/fail_alloc.cpp
   unit/lookahead_test.cpp
   unit/lookahead_property_test.cpp
   unit/scheduler_test.cpp)

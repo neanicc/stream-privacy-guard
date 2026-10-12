@@ -295,3 +295,66 @@ TEST_CASE("an owned frame copies every plane tightly", "[schedule]") {
   bad.strides[0] = 2;
   CHECK_THROWS_AS(spg::OwnedFrame::copy(bad), spg::ContractError);
 }
+
+TEST_CASE("an adopted frame keeps its owner alive and copies nothing", "[schedule]") {
+  auto pixels = std::make_shared<std::vector<std::uint8_t>>(4 * 4 * 4, std::uint8_t{9});
+  std::weak_ptr<std::vector<std::uint8_t>> watch = pixels;
+  spg::FrameView view;
+  view.planes[0] = pixels->data();
+  view.strides[0] = 16;
+  view.width = 4;
+  view.height = 4;
+  view.timestamp = at_ms(3);
+  auto adopted = spg::OwnedFrame::adopt(view, pixels);
+  CHECK(adopted->view().planes[0] == pixels->data());
+  CHECK(adopted->view().timestamp == at_ms(3));
+  pixels.reset();
+  CHECK_FALSE(watch.expired());
+  adopted.reset();
+  CHECK(watch.expired());
+
+  CHECK_THROWS_AS(spg::OwnedFrame::adopt(view, nullptr), spg::ContractError);
+  spg::FrameView bad = view;
+  bad.width = 0;
+  CHECK_THROWS_AS(spg::OwnedFrame::adopt(bad, std::make_shared<int>(0)), spg::ContractError);
+}
+
+TEST_CASE("a pushed owned readback is scanned for the frame its timestamp names", "[schedule][threads]") {
+  // The plugin maps the stage surface one frame late: the readback pushed
+  // with frame t shows frame t - 10 ms.
+  const Rect box{40, 50, 60, 30};
+  spg_test::AtomicClock clock(at_ms(1000));
+  const auto faces = std::make_shared<spg_test::ScriptedDetector>([box](Timestamp, Size) {
+    return std::vector<Detection>{spg_test::face_at(box.x, box.y, box.width, box.height)};
+  });
+  spg::Scheduler scheduler(clock, threaded_config(), spg::ScanStages{faces, nullptr, nullptr, nullptr});
+  std::vector<ReleasedFrame> out;
+  std::weak_ptr<const spg::OwnedFrame> last;
+  for (std::int64_t t = 1000; t < 1300; t += 10) {
+    clock.set(at_ms(t));
+    std::shared_ptr<const spg::OwnedFrame> readback;
+    if (t > 1000) {
+      REQUIRE(scheduler.wants_scan(at_ms(t - 10)));
+      const spg_test::TinyFrame frame(at_ms(t - 10));
+      readback = spg::OwnedFrame::copy(frame.view());
+      last = readback;
+    }
+    const std::uint64_t before = scheduler.stats().scans_completed;
+    scheduler.push(at_ms(t), k720, std::move(readback));
+    if (t > 1000) {
+      REQUIRE(eventually([&] { return scheduler.stats().scans_completed > before; }));
+    }
+    scheduler.release_due(out);
+  }
+  clock.set(at_ms(1400));
+  scheduler.release_due(out);
+  REQUIRE(out.size() == 30);
+  // Every frame but the last had its readback scanned (one frame late).
+  for (std::size_t i = 0; i + 1 < out.size(); ++i) {
+    CHECK(out[i].action == FallbackAction::None);
+    CHECK(covered_by(out[i].plan, box));
+  }
+  CHECK(out.back().action == FallbackAction::BlurSource);
+  // The worker dropped its reference once the scan finished.
+  CHECK(eventually([&] { return last.expired(); }));
+}

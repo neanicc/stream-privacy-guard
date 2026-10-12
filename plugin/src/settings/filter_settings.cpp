@@ -15,6 +15,10 @@ long long clamp_hold_ms(long long value) noexcept {
   return std::clamp(value, kMinHoldMs, kMaxHoldMs);
 }
 
+long long clamp_vram_budget_mb(long long value) noexcept {
+  return std::clamp(value, kMinVramBudgetMb, kMaxVramBudgetMb);
+}
+
 std::string_view to_string(Sensitivity sensitivity) noexcept {
   switch (sensitivity) {
     case Sensitivity::High:
@@ -56,6 +60,7 @@ FilterSettings sanitize(const RawFilterSettings& raw) noexcept {
   FilterSettings out;
   out.lookahead_ms = clamp_lookahead_ms(raw.lookahead_ms);
   out.hold_ms = clamp_hold_ms(raw.hold_ms);
+  out.vram_budget_mb = clamp_vram_budget_mb(raw.vram_budget_mb);
   out.categories = raw.categories;
   out.sensitivity = parse_sensitivity(raw.sensitivity).value_or(Sensitivity::Standard);
   out.fallback = parse_fallback_mode(raw.fallback).value_or(FallbackMode::BlurSource);

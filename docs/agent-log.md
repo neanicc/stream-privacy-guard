@@ -986,6 +986,584 @@ Template:
   failing to load the DLL. The Windows branch was syntax-checked locally
   against a stub `windows.h` only; the Windows CI job is the build evidence.
 
+## 2026-10-12 — SPG-15d Recognized text in wiped, dump-excluded memory (#46)
+
+- Decision / change: the recognizer builds text in `ocr::SecureText`
+  (`std::vector<char, SecureAllocator<char>>`) instead of `std::string`:
+  CTC decoding appends straight into the caller's buffer (a decode error
+  zeroes what it appended and cuts it off again), each read job has one, and a
+  region's views are joined in another before `Secret::copy_of()`. A vector
+  rather than `SecureString`, because a string keeps short text in its
+  short-string buffer, inside the object, which for a temporary is on the
+  stack; most OCR lines are short. The model's output probabilities (whose
+  per-step argmax spells the text) are zeroed once a batch is decoded or
+  fails. The cache already stored text only as `Secret` (unchanged; a
+  `static_assert` keeps it so).
+- Crop fingerprints: `Fingerprint` now zeroes its pixels, unused capacity
+  included, when destroyed or assigned over, and a moved-from one is empty;
+  the cache also zeroes each fingerprint it holds when the entry is replaced,
+  erased, expires, is evicted or refused, and when the cache is destroyed,
+  with a test-only observer like `SecureHeap`'s. The pixels stay in ordinary
+  memory on purpose: up to 64 MiB of crops, most over the 16 KiB size
+  classes, would each be a SecureHeap region of their own, using up
+  `RLIMIT_MEMLOCK` and, on Windows, the 512 WER exclusions that keep
+  watch-list regions out of dumps. `RecognitionCache` is no longer copyable
+  or movable (one worker owns it; nothing copied one).
+- Scan path: `run_scan()` gets `std::vector<Secret>`, checks sizes and passes
+  each `Secret` to the policy by reference; `recognize_tracks()` moves them
+  into `TextHit`s; `PolicyEngine::evaluate()` folds into `SecureU32String`s.
+  No plain-string copy there, so `scan.cpp` is unchanged. Copies that remain
+  (ONNX Runtime's output arena, pixel buffers, the policy's short-string
+  buffers for lines of 3 or 4 code points) are in `docs/policy.md`,
+  "Recognized text in memory".
+- Behaviour: identical. A scratch probe (not committed) hashed every text and
+  printed every score for 7 regions x 4 cap heights (10 to 22 px) x BGRA and
+  NV12 with the pinned model, plus the `rec_softmax` fixture: the 58 lines
+  match `main` (7ee5fd8) exactly.
+- Timing (dev Mac, M4, macOS 26.5, ORT 1.30.0 CPU, Release build, scratch
+  probe, median per call, 3 rounds x 2 runs each): one region read as one
+  48x320 crop, `main` 4.54 to 5.10 ms, branch 4.59 to 4.67 ms (SPG-07: about
+  4.5 ms); six regions of a 900x420 panel, `main` 32.5 to 34.3 ms, branch
+  32.3 to 33.9 ms; `ctc_greedy_decode` of 40 steps x 97 classes alone,
+  `main` 8.20 to 8.35 us, branch 8.19 to 8.32 us. No regression beyond
+  noise. Six cache hits (100 KB of crops) take 11.3 to 13.4 us on the
+  branch; `main` was not measured for that path (see open issues).
+- Evidence (automated, dev Mac): new cases `CTC decode builds the text in
+  protected memory and zeroes it`, `RecognitionCache zeroes every fingerprint
+  it lets go of` (all seven ways out), `Fingerprint: moved-from and wiped
+  fingerprints are empty`, and `Recognizer temporaries are protected blocks,
+  zeroed when released` (fixture model: one live block per region after the
+  call, at least two zeroed per region, all zero). The sentinel case
+  (`Recognized text never reaches streams, errors or verdicts`) passes
+  unchanged. Mutation checks: joining a region's text in a `std::string`
+  failed the recognizer case; a cache release that does not zero failed the
+  cache case; dropping an entry without the release failed it too. Review
+  follow-up: `RecognitionCache::release()` (noexcept) now swallows an
+  exception from its test observer, as `SecureHeap` does, and new cases check
+  the bytes a failed decode appended, `Fingerprint::wipe()` on its own
+  (used part and spare capacity), and a throwing observer; dropping each of
+  those three lines failed its case. Not covered by a test: zeroing the
+  model's output probabilities (one `secure_wipe` call; needs a model run).
+  The residual risk of cached crop pixels is stated in `docs/policy.md`.
+- Eval delta: none expected (memory handling only; texts identical). The eval
+  stage was not run locally (the agent sandbox refuses that command); CI runs
+  it.
+- Open issues or follow-ups: the permission classifier refused restoring
+  `main`'s OCR sources into the worktree to time the cache-hit path on `main`,
+  so that comparison is missing; the change there is one `memset` per
+  fingerprint (about 100 KB per six-region cycle). Pixel copies in the
+  detector, the lookahead's `OwnedFrame` and ONNX Runtime stay unzeroed.
+
+## 2026-10-12 — SPG-10b Release gate parity in Lookahead (#47)
+
+- Decision / change: the background security review reported "fail-open
+  (sibling-path gate parity)" in `core/src/schedule/lookahead.cpp` with no
+  detail. Audit of every path that airs a frame or decides it is clean
+  (table in [scheduler.md](scheduler.md#one-gate-for-every-path-that-airs-a-frame)):
+  `release_due()` on the deadline and on buffer overflow applied the full
+  rule inline; everything else only feeds it. Two gaps found, both fixed:
+  (1) **Re-emit.** `hold_last_scanned` re-emitted the last clean frame after
+  checking only its segment. That frame airs again with the masks it had
+  when released, so a complete cycle that finished afterwards and whose boxes
+  reach it (held over it, or retroactive from `ts - retro`), or a result that
+  could not be applied, did not stop it being shown again unmasked, although
+  the same result fails or masks every buffered frame in that reach.
+  (2) **Result older than the size history.** A complete result from before
+  more than 64 resizes was dropped like an incomplete one, while a result
+  that fails to apply fails closed every frame it could have masked; frames of
+  later sizes that another cycle covered aired without its held boxes
+  (temporal hold broken, for example while a window is dragged and a cycle
+  stalls). Fix: one private `Lookahead::gate(frame, at)` decides
+  clean or the `FallbackReason` for both release paths; the re-emit candidate
+  is kept as a `FrameRecord`, is marked `apply_failed` by any later result in
+  its reach (or any result that cannot be applied, as buffered frames are),
+  and must pass `gate()` as of its own release; `fail_closed()` is shared by
+  apply failures and too-old results. Public API unchanged (SPG-11 drives
+  `Lookahead`). Decision: an invalidated candidate falls back to
+  `BlurSource` rather than searching for an older clean frame (fail closed,
+  simplest; an older frame is likelier still in reach). A result with no
+  detections does not invalidate the candidate (nothing to add to it).
+- Evidence (automated, dev Mac, macOS 26.5.2 arm64): new
+  `lookahead_test.cpp` cases (re-emit after a held result, after a retroactive
+  result, after a failed apply; an empty later result keeps the candidate;
+  63 vs 64 resizes with a cycle in flight) and the property-test extension
+  were run against `main`'s `lookahead.{hpp,cpp}` first: 4 test cases and 11
+  assertions failed, including the property oracle's new check that a
+  re-emitted frame covers every box that reaches it (seed 33: frame at 1200
+  re-emitted without the box of a cycle at 1467 within its retro window).
+  With the fix: `[schedule]` passes under AppleClang (42 cases, 1,603,171
+  assertions) and GCC 14 with `-Werror -Wsign-conversion` (core-only build).
+  Property totals (AppleClang): 27,796 clean, 197,204 fallback, 41,175
+  re-emits each checked against every reaching box (43,551 box checks),
+  5,742 re-emits refused, 14,727 `ApplyFailed` releases, 1,135 rejected and
+  121 too-old results. The oracle's old rule "fallback is BlurSource only
+  when no clean frame of the same segment exists" was replaced by "... or a
+  later result could have masked it"; every other assertion is unchanged or
+  stricter (a re-emit must now also cover every reaching box).
+- Eval delta: not measured. Nothing feeds the scheduler a pipeline until
+  SPG-11, and the agent sandbox refuses the eval command; see the PR's Check
+  log for the CI stage.
+- Open issues or follow-ups: `run_scan()` discards detections found by the
+  stages that finished when a later stage fails (for example faces found, text
+  detector threw); they are not held, so a frame covered by a later cycle
+  whose face detector flickers airs without them. Treating partial
+  detections as held boxes is a recall question for SPG-12/lane:policy.
+
+## 2026-10-12 — SPG-15c Intermittent plugin.loads abort on macOS CI (#44)
+
+- Root cause: a data race in the test, not in the plugin. The test's libobs
+  log handler appended every line to one global `std::string` with no lock.
+  libobs calls the log handler from whichever thread logs, also without a lock
+  (`util/base.c`, `blogva`). Since OBS 30, `obs_source_release()` hands
+  destruction to libobs's destroy-task thread (`obs_source_destroy_defer`),
+  which logs "private source ... destroyed" and, in this headless run,
+  `gs_*` "not in a graphics context" errors. Meanwhile the main thread logs
+  the next filter's creation. Two appends at once corrupted the string's heap
+  buffer, and libmalloc aborted.
+- Evidence: macOS crash reports (`~/Library/Logs/DiagnosticReports`) from a
+  local repro on `main` (cc5da96) all show the same stack:
+  `capture_log` -> `std::string::append` -> `__grow_by_and_replace` ->
+  `free`, ending in "BUG IN CLIENT OF LIBMALLOC: pointer being freed was not
+  allocated" (SIGABRT) or "not an allocated block" (SIGTRAP via `mfm_free`).
+  The thread was either `obs_source_destroy_defer` on libobs's task thread or
+  `filter_update` / `obs_shutdown` on the main thread. In every case the other
+  thread was logging at the same moment. The output "last seen" before CI's
+  abort was not where it happened: stdout to a pipe is fully buffered, and an
+  abort drops the unflushed tail. The CI log for run 38251187913 already shows
+  `spg-clamp-2` created and destroyed, with destroy-thread lines interleaved
+  among main-thread lines.
+- Reproduction (dev Mac, M4, Release build, 8 parallel workers, each with its
+  own config directory, so the two threads overlap more often): `main`
+  failed 73 of 2000 runs (13 SIGABRT, 60 SIGTRAP). With the fix, 0 of 2000
+  failed, then 0 of 5000 with 10 workers, and
+  `ctest -R plugin.loads --repeat until-fail:500` passed. Run serially, `main`
+  passed 300 of 300, which is why 30 local repeats never caught it.
+- Sanitizers (separate build directories with `-fsanitize=thread` and
+  `-fsanitize=address,undefined` on our code; CI flags unchanged): no reports
+  on `main` (TSan 3 runs, ASan+UBSan 50) or with the fix (TSan 20,
+  ASan+UBSan 100). TSan could not see this race. `std::string::append` is
+  compiled into the system libc++ dylib, so TSan does not instrument it, and
+  ASan only notices if the corruption happens during the run. TSan did check
+  the plugin's code running on the destroy thread (`filter_destroy`: registry
+  release and `FilterState` teardown, including `Secret`s freed to
+  `SecureHeap`) against the main thread and reported nothing.
+- Change: `plugin/tests/plugin_load_test.cpp` guards the capture with a
+  mutex, reads it under the lock after `obs_shutdown()` (which joins the
+  destroy-task thread), and adds a check that libobs logged from more than
+  one thread. That check fails if libobs stops deferring destruction, so
+  the reason for the lock stays visible. No plugin code changed. No check was
+  removed, skipped, retried or loosened.
+- Open issues or follow-ups: because destruction is deferred, a filter
+  released and then reloaded straight away with the same watch-list reference
+  (as `check_watchlist` and `check_broken_copy` do) can find the reference
+  still held and fork the file. The checks pass either way: the fork carries
+  the entries or the error. Not checked: whether OBS waits for the destroy
+  queue before it loads a scene collection, which would rule this out in
+  live use.
+
+## 2026-10-12 — SPG-14 Lookahead buffer, readback and GPU blur (#52)
+
+- Decision / change: the filter's `video_render` now runs the lookahead
+  pipeline ([plugin-render.md](plugin-render.md)). Once per video frame time
+  (however many views render the source): capture the target into a ring
+  slot (one `gs_texrender` per slot, rendered as
+  `obs_source_process_filter_begin` does), map the stage surface staged on
+  the previous tick, copy it into a pooled buffer and push it with that
+  frame's timestamp, stage this frame (scaled to fit 1920x1080, never up,
+  into the other of two stage surfaces) when the scheduler wants it, release
+  due frames, draw the newest. The decisions are an OBS-free library
+  (`plugin/src/pipeline/`: `Pipeline`, `FrameRing`, `ReadbackPool`,
+  `mask_levels`, `Reaper`); `plugin/src/render/` executes them with libobs
+  graphics and `plugin/data/effects/spg-mask.effect` (bilinear and point
+  sampling). Choices: (1) Blur is a box-filter chain of halvings; a mask
+  samples the level whose cells are at least a third of its shorter side
+  (8 px floor), the whole-source fallback cells of 1/16 of the shorter side
+  (16 px floor); regions are rounded outward to whole cells; Pixelate samples
+  the same level with point sampling. The output is composed in its own
+  texture with replace blending, so a mask replaces the pixels under it,
+  alpha included, then drawn like any filter output. (2) Fail closed
+  everywhere: a frame is drawn with only its rects masked only when released
+  `FallbackAction::None`; before the first release, while
+  `FilterState::policy` is empty, after a failed scheduler build, without a
+  texture, or when the effect fails to load, the source is covered whole
+  (blur, or solid fill per setting or when there is nothing to blur).
+  `HoldLastScanned` re-emits the last clean frame's texture with its masks,
+  kept in the ring. (3) A settings change builds a new scheduler in the
+  settings path (video or UI thread) and hands it over under a lock held
+  only to swap a pointer; the old scheduler drains with its own masks, and
+  new frames within the old hold of the switch are covered whole, since
+  their held detections were in the old tracker. A debug overlay toggle does
+  not restart it. (4) Resize and 0x0: nothing is reset; buffered frames of
+  the old size are drawn scaled with their masks; a 0x0 target draws
+  nothing, drops frames that come due unseen, and marks a discontinuity when
+  frames return. (5) Ring: `2 * max_buffered_frames + 2` slots (a draining
+  scheduler, the frame on screen, the last clean frame), textures created
+  lazily and idle ones beyond four freed; a frame without a slot is still
+  scheduled and drawn black. No byte budget: memory is what is buffered
+  (about 240 MB at 1080p60 and 500 ms); the plan's "shorter lookahead with a
+  warning" under a memory cap is a follow-up. (6) Unload: schedulers are
+  destroyed only on a reaper thread (their destructors wait for workers);
+  the plugin builds them with a one-hour `shutdown_timeout` so they join
+  rather than detach, and `obs_module_unload` joins the reaper, so no worker
+  runs module code after it returns. (7) Readback copy: `Scheduler::push`
+  gains an overload taking a `shared_ptr<const OwnedFrame>`, and
+  `OwnedFrame::adopt` wraps caller-owned pixels without copying; the
+  plugin's pool reuses buffers the workers drop (a minimal additive change
+  to lane:policy's core API). (8) Visible fallback: the whole-source cover
+  itself; the properties count frames aired masked-only and covered whole,
+  with the last reason; the log gets one line per reason change (at most
+  every 10 s, fixed names); the debug overlay draws green mask outlines and
+  a corner square coloured by reason, never text. (9) Audio: guidance only
+  (SPG-13 decision): a properties line tells the user to set Sync Offset to
+  the lookahead on the audio that belongs with the video; the filter changes
+  no other source. (10) Lookahead and hold are clamped again where the
+  scheduler config is built. (11) Not done: moving the watch-list reload off
+  the video thread (issue comment, "if feasible"): `load_or_fork` writes the
+  source's `obs_data` settings, which is not safe from another thread, the
+  state would need shared ownership, and PR #42 is changing the same
+  functions; it stays a follow-up. (12) The plugin does not load detection
+  models yet (`make_stages()` returns no detectors): every cycle fails with
+  `MissingStage` and every frame airs covered whole. Loading ONNX Runtime,
+  OpenCV and the models in the module is proposed as a follow-up ticket.
+- Evidence (automated, dev Mac, Apple M4, macOS 26.5.2, AppleClang):
+  `scripts/ci/run.sh setup`, `build` (plugin included, warnings as errors)
+  and `test` pass, 255/255 ctest tests, of which 14 new `plugin.pipeline.*`
+  cases and 2 new `unit.*` scheduler cases. A fake GPU and a synchronous
+  scheduler (`spg::Lookahead` on a `ManualClock` with a scan latency) check
+  on every tick that a frame drawn with only its masks was released clean
+  (or is that scheduler's re-emitted clean frame) and that every slot drawn
+  is still held: warm-up; retroactive and held masks from the first frame of
+  a face; readback mapped one tick late, credited by timestamp, alternating
+  surfaces; the three fallback modes; resize (old-size frames keep their
+  masks, held masks scaled); 0x0 (nothing drawn, buffered frames and masks
+  kept, one discontinuity); settings change (old frames drain with old
+  masks, the old hold is covered, the old scheduler is retired, not
+  destroyed); losing the policy; repeated renders of one frame time; capture
+  failure and a full ring; 40 seeded runs with failing cycles, random
+  latency, resizes, 0x0 ticks and restarts; plus ring, pool, readback size,
+  mask geometry (2000 seeded rects: the region covers the clipped rect) and
+  the reaper (destroys off the caller, joins on shutdown). Mutation checks:
+  11 mutations (fail open on unscanned frames, no settings-change cover,
+  readback credited to the pushed frame, no discontinuity after 0x0, old
+  generations never retired, re-emit of the unscanned frame, 0x0 dropping
+  buffered frames, no cover without a policy, masked frame without a
+  texture, mask regions rounded inward, mask cells not scaled) each failed
+  at least one test. Render-thread cost (hidden `[bench]` case: real
+  `spg::Scheduler`, two workers, 60 fps for 10 s, a 1920x1080 readback every
+  frame, a 15 ms detector returning 40 boxes; two runs): readback copy plus
+  `push` p50 405 to 440 us, p99 1.33 to 1.55 ms, max 1.65 ms; `release_due`
+  p50 25 to 30 us, p99 88 to 167 us, max 175 us; the pool allocated 2
+  buffers for 600 frames. That is CPU time without a GPU; map latency and
+  GPU cost are not measured. Not tested: the GPU code and the effect
+  (headless libobs in CI has no graphics context, so `plugin.loads` still
+  does not exercise the render path), loading in OBS, HDR sources (captured
+  as 8-bit BGRA). The live steps are in [live-check.md](live-check.md)
+  ("Render path").
+- Eval delta: not measured. No core pipeline behavior changed (the core
+  change is an additive overload), and the agent sandbox cannot run the eval
+  stage; the PR's Check log has the CI eval stage output.
+- Open issues or follow-ups: load detection models and ONNX Runtime in the
+  plugin (with packaging, SPG-17); run the live render checks (human);
+  SPG-16 measures readback size and cadence against the copy cost above
+  (about 0.4 ms per scanned 1080p frame) and GPU time; a VRAM budget with a
+  shorter effective lookahead and a warning; move the watch-list reload off
+  the video thread after #42; HDR capture; SPG-18 should confirm with
+  `scrub` that the blur cell sizes leave nothing readable.
+- Review fixes (security review on `f1f63d9`, "fail-open state drift" in the
+  render path): (1) a failed adoption used to drop the new generation and
+  keep the old scheduler running, so a policy that had just become empty
+  could keep airing frames masked under the old one; `Pipeline::adopt` now
+  has the strong guarantee and the new `PipelineHost` covers the frame solid
+  and retries the same generation next frame. (2) A failed scheduler build
+  covers every frame solid until a later hand-over succeeds (it used to rely
+  on a flag a repeated identical publish could skip). (3) Every plan names
+  the capture serial of its texture and the GPU side rechecks the slot
+  (`checked_kind`) right before drawing: a recycled, freed, failed or
+  resized slot draws solid. (4) A release that does not match the frame
+  buffered under its id is covered (`Cover::Inconsistent`). (5) An invalid
+  or non-Source mask rect blurs the whole frame instead of being skipped.
+  (6) A released frame repeats for at most 100 ms (`Cover::Stalled`).
+  (7) A frame-time gap over 200 ms (filter disabled, source not rendered) or
+  a step backwards marks a discontinuity and drops the re-emit anchor.
+  (8) Exceptions from GPU calls are caught inside the tick without leaking a
+  ring slot, and a repeated render of a failed frame time stays solid.
+  Evidence: 10 new `plugin.pipeline.*` cases (276/276 ctest tests pass on
+  the dev Mac); the harness now also checks on every tick that the GPU would
+  draw exactly the planned kind; 10 mutations (one per rule, plus losing the
+  spec on a failed adopt) each failed a test; the threaded hand-off race
+  case passed 20 repeated runs.
+- Review fixes (Greptile threads on `ceea871`, after merging `main` at
+  `cc5da96`): (1) after a settings change that shortens the lookahead, an
+  old generation's frame could air after a newer one's (a skipped render
+  left the new generation nothing due), so the picture jumped back; now,
+  once a newer generation has aired, older releases are dropped and that
+  generation is retired. (2) Live generations are capped at two (current
+  plus one draining, keeping the one on screen), so rapid settings changes
+  cannot pile up workers or ring slots. (3) The aired counters count the
+  plan each tick ends with, not every frame released in a tick. (4) A
+  released frame's slot is held by a scope guard, so a failed mask copy no
+  longer leaks it. (5) The reaper queue is linked through the schedulers
+  (no allocation) and a failed thread start leaves the scheduler queued
+  instead of destroying it on the render thread. (6) The GPU mask levels
+  are a fixed array and `draw` closes its texrender and blend state if
+  composing throws (`render()` is `noexcept`, so a throw used to terminate
+  OBS). Declined: making `push`/`release_due` lock-free. They take the
+  scheduler's lock for bookkeeping, and a worker holds it only to apply a
+  result, never during inference. This is the SPG-10 contract in
+  `scheduler.md`; its cost is measured above, and SPG-16 owns the p99.
+  Evidence: 5 new `plugin.pipeline.*` cases (290/290 ctest tests pass on
+  the dev Mac with `main` at `0425e86` merged; the pipeline suite passed 10
+  repeated runs); 5 mutations, one per fix (1) to (5), each failed a test.
+  The drop and the retire of older generations back each other up, so (1)
+  reverts both. The GPU change needs a graphics context and is
+  covered only by the live check.
+
+## 2026-10-12 — SPG-10c Hold detections from partial scan cycles (#51)
+
+- Decision / change: `run_scan()` returned an empty incomplete result on any
+  stage failure, so boxes found by the stages that had finished (faces, then
+  the text detector throws; text regions, then the recognizer or policy
+  throws) never reached the tracker. The failed frame blurred, but nothing
+  was held: if the face detector missed on the next cycle, frames that cycle
+  covered aired the face inside its hold (AGENTS.md temporal hold), and
+  buffered frames before it lost their retroactive rects. Fix: an incomplete
+  `ScanResult` now keeps the valid boxes found before the failure (table in
+  [scheduler.md](scheduler.md#partial-cycles)), and `Lookahead::complete()`
+  holds and retro-masks them like a complete result's, fails closed the same
+  way when they cannot be applied, and marks the re-emit candidate in their
+  reach, but sets `covered` only for a complete cycle. The gate
+  (`Lookahead::gate()`) is unchanged. `Scheduler` signatures are unchanged;
+  `ScanResult` gains one field, `detections_lost` (see the review follow-up
+  below).
+- Decisions (no one to ask; recall over precision, smallest change):
+  (1) A recognizer or policy failure keeps **every** region, including any
+  the policy judged safe before it threw: no text stage that finished
+  cleared them. (2) Malformed output (fails `validate()` or has the wrong
+  kind) is never held; its valid siblings in the same output are, since
+  holding a box only adds blur. A malformed box passed straight to
+  `complete()` still fails closed (`ApplyFailed`). (3) `run_scan()` still
+  stops at the first failure rather than running later stages to find more
+  boxes; a stage that throws may be under memory pressure, and running more
+  inference in a failed cycle delays the next one. (4) `MissingStage` runs
+  nothing, as before. (5) No new stats counter; a partial cycle counts in
+  `scans_failed` only.
+- Evidence (automated, dev Mac, macOS 26.5.2 arm64, Apple clang 21.0.0):
+  four new `lookahead_test.cpp` cases (face found, text stage throws, the
+  next cycles miss the face: frames 1000 .. 1200 stay masked, by retro
+  before 1040 and by hold after; on its own the failed cycle covers nothing;
+  what `run_scan()` keeps per failure point, including malformed output; a
+  partial result that cannot be applied fails closed; hold-last-scanned does
+  not re-emit a frame a partial result reaches) and the property-test
+  extension (failed cycles in 60% of scenes return a random subset of their
+  boxes; the oracle checks those boxes for retro and hold on every on-time
+  frame and every re-emit, never as coverage) were run against `main`'s
+  `scan.cpp` and `lookahead.cpp` first: 5 of 46 `[schedule]` cases and 26
+  assertions failed, including 7 frames released clean without the face
+  (1000 .. 1200) and the property oracle (seed 16: frame at 3052 without the
+  partial box of a cycle at 3030). With the fix: `[schedule]` passes (46
+  cases, 1,581,022 assertions); `scripts/ci/run.sh build` and `test` pass
+  (262/262, plugin included). Mutation: letting a partial cycle set
+  `covered` fails 3 cases, including the property oracle's coverage rule.
+  Property totals: 434 applied partial cycles, 77 partial results not
+  applied, 4,740 partial-box mask checks, 750 partial-box re-emit checks.
+  Oracle change: `spoiled` (when a re-emit is refused) now also counts a
+  partial result's boxes, which only permits more `BlurSource`; every other
+  assertion is unchanged or extended to partial boxes. GCC is not installed
+  on the dev Mac, so the GCC `-Werror` build is CI's ubuntu-24.04 job.
+- Eval delta: not measured locally; the agent sandbox refuses the eval
+  command. Nothing feeds the scheduler a real pipeline until SPG-11; see the
+  PR's Check log for the CI stage.
+- Review follow-up (Greptile, P1): an allocation failure while `run_scan()`
+  collected boxes a stage had returned (the face insert, the per-region
+  policy flags, appending regions) returned only what was collected, so
+  `complete()` held less than the cycle saw. `ScanResult::detections_lost`
+  now marks that case and `complete()` fails closed the boxes' whole window
+  (`ApplyFailed`, `ts - retro` to `ts + hold`). Tests: a sweep that fails
+  each allocation of one cycle in turn (`tests/unit/fail_alloc.cpp` replaces
+  `operator new` for `spg-unit-tests`) over three cycles (complete; the
+  recognizer throws, so every region is appended; malformed faces, so their
+  valid siblings are kept), reaching every collection site, and a
+  `complete()` case; all fail with the fix removed.
+- CI follow-up: the ubuntu-24.04 job failed the property test at seed 1444
+  (frame 67 released clean, "no complete cycle covers it"). libstdc++ and
+  libc++ implement `uniform_int_distribution`, `bernoulli_distribution` and
+  `std::shuffle` differently, so each platform runs different scenes for one
+  seed; replaying libstdc++'s algorithms on macOS reproduced it exactly. The
+  scheduler was right: that scene's one-off resize landed on a flapping frame
+  that toggled straight back, so the pushed size did not change, but the
+  oracle counted two resizes and a new segment. The oracle now counts a
+  resize only when the pushed size differs from the previous frame's (the
+  only thing the scheduler can see); its assertions are unchanged. All 1500
+  seeds pass under both libc++ and the replayed libstdc++ sequence.
+- Open issues or follow-ups: `native_secure_platform()` and
+  `SecureHeap::process()` (core/src/secure/secure_memory.cpp) allocate on
+  first use; the former is `noexcept`, so an allocation failure on the
+  first `Secret` of a process terminates instead of throwing. Pre-existing,
+  outside this ticket. The coverage-assumption risk in scheduler.md (content
+  that appears and disappears between cycles) is unchanged.
+
+## 2026-10-12 — SPG-14c VRAM budget for the lookahead ring (#55)
+
+- Decision / change: the lookahead ring has a VRAM budget, the plan section 7
+  item "expose the limit and fall back to a shorter lookahead with a visible
+  warning" ([plugin-render.md](plugin-render.md#vram-budget)). New setting
+  **Video memory for the lookahead** (`vram_budget_mb`). The plan gives no
+  number, so the default is 512 MiB, clamped to [64, 16384]. It holds the
+  default 500 ms at 1080p60 (34 frames, about 270 MiB) and up to 1016 ms
+  there. 2160p60 is shortened to 216 ms. A low budget only shortens the
+  lookahead, never weakens it. OBS-free math in
+  `plugin/src/pipeline/ring_budget.cpp`: a frame costs width x height x
+  `gs_get_format_bpp` of the ring's format (BGRA, 4 bytes) at the source's
+  base size now. A lookahead needs `floor(lookahead / interval) + 1`
+  frames plus 3 (the frame on screen, the last clean frame, one frame of
+  slack). The interval comes from `obs_get_video_info`. `fit_lookahead`
+  gives the longest lookahead that fits, in whole ms. `FilterRender`
+  fits it in `publish` and again in a new `video_tick` when the source
+  size or frame rate changes (a hidden source keeps its last fit). A
+  different result builds a new scheduler generation, handed over like
+  any settings change, so buffered frames still air with their masks.
+  The scheduler gets the shorter lookahead and a retro window clamped to
+  it; frames not scanned within it get the fallback as always. `Pipeline`
+  also enforces the budget per capture. It counts the bytes of every ring
+  texture it allocated (held or idle) at the size captured. A capture
+  past the budget frees idle textures first; if it still does not fit,
+  the frame gets no texture and is covered with a solid fill when
+  released (`Cover::NoTexture`, counted in `over_budget`). That covers
+  the time between a resize and the refitted generation, and the overlap
+  of two generations after a settings change, which the reserve
+  deliberately leaves out. A lower budget never takes a texture from a
+  buffered frame. The properties show a warning while the lookahead is
+  shortened. It gives the configured and actual lookahead, the frames
+  the budget holds and the size, and says to raise the budget or lower
+  the lookahead and to set Sync Offset to the shorter value. Refused
+  frames are counted in the same warning. The log gets one line per
+  change (shortened, shortened to another value, restored), with sizes
+  and durations only.
+- Not done: driver padding and the readback, mask-level and output
+  textures are not counted; each filter has its own budget. The default is
+  a judgment call, not measured against real GPUs. The live check
+  (step 11) is the evidence still to collect.
+- Evidence: 14 new `[budget]` cases (`plugin/tests/ring_budget_test.cpp` and
+  `pipeline_test.cpp`), including 5000 seeded fits checked to fit and to be
+  the longest that does. A budget of exactly `ring_frames_needed` refused
+  no frame over 200 ticks with HoldLastScanned re-emits. A resize to
+  1080p under a 720p budget, followed by the refitted generation, refused
+  nothing once the old generation drained, and frames aired masked. One
+  settings case and one load-test clamp pair were added; the load test's
+  known-keys list gains `vram_budget_mb`. `scripts/ci/run.sh build` (no
+  warnings) and `test`: 305/305 on the dev Mac. 5 mutations each failed
+  at least one `[budget]` case: no budget check, reserve 1, no idle trim,
+  budget not applied on adopt, fit one frame too long. The GPU side
+  (`gs_get_format_bpp`, `video_tick`) needs a graphics context and is
+  covered only by the live check.
+- Review fixes (PR #59, after merging `main` at `8d409b5`): (1) at the
+  budget, a capture into an idle slot counted that slot's bytes twice, so
+  every frame freed and recreated a texture on the graphics thread. The
+  check now subtracts the bytes of the slot `FrameRing::peek()` names and
+  frees the other idle textures before the warm one. (2) A refit in
+  `video_tick` that failed (allocation, a worker that cannot start)
+  covered the source until the next settings change, because the size was
+  recorded first and `publish_failed_` blocked later refits. `RefitSchedule`
+  now retries it once a second until one succeeds; a failed settings
+  change is still not retried with the old settings. (3) The longest-fit
+  property test checks one more millisecond, not one more frame. (4)
+  plugin-render.md says `gs_get_format_bpp` returns bits. 3 new cases
+  (`[budget]`); `scripts/ci/run.sh build` (no warnings) and `test`:
+  314/314 on the dev Mac. Mutations: counting the reused slot again and
+  freeing every idle texture each failed one of the new pipeline cases; a
+  fit 1 ms short failed the property test. The retry wiring in
+  `FilterRender::tick` needs libobs and is covered only by the live check.
+
+## 2026-10-12 — SPG-14b Detection models and ONNX Runtime in the plugin (#54)
+
+- Decision / change: `obs-spg` now opens the pinned YuNet, PP-OCR det and
+  PP-OCR rec models and runs them in each filter's scheduler
+  ([plugin-render.md](plugin-render.md), "Detection models"). New OBS-free
+  library `obs-spg-models` (`plugin/src/models/`): `locate_models` finds each
+  pinned file in the plugin's data directory (`models/`, for a packaged
+  build) and then `$SPG_CACHE_DIR/models` or `~/.cache/spg/models`
+  (`%USERPROFILE%` on Windows), as `scripts/fetch_models.py` does, and checks
+  its size and SHA-256 (pins generated from `models/manifest.json` at
+  configure time) on bytes read once into memory, which are then what ONNX
+  Runtime parses (new `runtime::ModelBytes` overloads of `Session::open` and
+  the three detectors' `open`), so a file swapped after the check is never
+  loaded; `load_models` opens and warms
+  up the three sessions through the spg-core wrapper; `make_stages` returns
+  the shared detectors, a recognizer adapter and an `EnginePolicy` built from
+  the filter's `PolicyConfig` (the same stages as `spg-cli`'s
+  `stages_models.cpp` on PR #49, written independently of it). `ModelHub`
+  loads once per module on its own thread, started by the first filter, and
+  calls every filter back when loading ends; each filter then rebuilds its
+  scheduler with the models (`FilterRender::models_changed`, under the
+  publish lock, so it never races a settings change). Choices: (1) Without
+  models (loading, missing, damaged, failed) a filter builds no scheduler
+  rather than one whose cycles fail with `MissingStage`: the frame is covered
+  whole (`Cover::NoDetection`) at once and nothing is read back or scanned.
+  (2) A file that is missing or fails its size or hash check is reported as
+  such and never handed to ONNX Runtime; one log line per module load names
+  the model and path, and the properties show a fixed message (plus the
+  model's manifest name). (3) One attempt per module load; the properties
+  say to restart OBS after fetching. (4) Loading starts with the first
+  filter, not at module load, so OBS without the filter pays nothing.
+  (5) ONNX Runtime ships next to the module: copied into
+  `obs-spg.plugin/Contents/Frameworks` with `@loader_path/../Frameworks` as
+  the module's only rpath (so the build tree loads the copy a package
+  ships), `onnxruntime.dll` beside `obs-spg.dll` (libobs adds the module's
+  directory to the DLL search path, ahead of the older copy in System32),
+  `libonnxruntime.so.1` beside `obs-spg.so` with `$ORIGIN`. OpenCV stays
+  static; on Linux `--exclude-libs,ALL` keeps the static libraries' symbols
+  (OpenCV, spg-core) out of the module's dynamic symbol table so they cannot
+  interpose another plugin's OpenCV. (6) Sessions use the wrapper's defaults
+  (CoreML first on macOS with CPU fallback, ORT's default thread count).
+  (7) The plugin now requires `SPG_WITH_DEPS=ON`.
+- Evidence: 8 new `plugin.models.*` cases (all OSes): FIPS 180-4 SHA-256
+  vectors in several chunkings; manifest pins; missing models reported and
+  stages without detectors failing every cycle with `MissingStage`; wrong
+  size, wrong bytes, a directory in a model's place, and search order (the
+  first directory holding a file wins); `ModelHub` loads on its own thread,
+  `start()` returns while the loader is blocked, listeners run once on the
+  loader thread, unsubscribed ones never, a throwing loader or Ready without
+  models ends Failed, shutdown waits for a load in progress; and with the
+  pinned models (CPU provider) `run_scan` on a synthetic 1280x720 frame
+  masks a drawn face and a line holding a made-up watch-list entry, leaves
+  an ordinary line unmasked, leaves the entry's line unmasked under a policy
+  without the entry, and still runs after the hub lets go of the models.
+  `plugin.loads` (macOS, Windows) now also waits for the models in the real
+  module and checks the properties say ready, one load log line, and that a
+  filter created before the models were ready rebuilt its scheduler with
+  them (log `'spg-early': scanning with the detection models`); new
+  `plugin.loads.no_models` (empty `SPG_CACHE_DIR`) checks the error status,
+  exactly one `detection models missing ... yunet` line, and no scheduler.
+  Mutation: dropping the models generation from the publish check (so the
+  loader's hand-over is skipped) failed `plugin.loads`. Dev Mac (Apple M4,
+  macOS 26.5.2): models loaded in the module in 260-293 ms on CoreML (warm
+  file cache); `scripts/ci/run.sh build` and `test` 305/305 passed with
+  `main` at `8d409b5` merged.
+- Eval delta: not run. The core pipeline is unchanged (plugin-only change),
+  `eval/run_eval.py` is not on `main` yet (PR #49), and the agent sandbox
+  refuses the eval stage.
+- Open issues or follow-ups: the live check ([live-check.md](live-check.md),
+  steps 2 to 5 and 13) is the only evidence that faces and watch-list text
+  are masked in OBS and how fast; ORT thread count and execution provider per
+  stage against OBS's own CPU and GPU use (SPG-16); packaging the models in
+  the plugin's data directory or documenting the fetch step for users
+  (SPG-17); another plugin that already loaded a different `onnxruntime.dll`
+  into OBS on Windows wins by module name (obs-backgroundremoval and
+  obs-localvocal share this problem); a retry button for a failed load.
+- Review follow-up (babysit, after merging `main` at `e2a3911`, SPG-14c):
+  the staff review's P2 (hash-then-reopen window) is closed by opening from
+  the verified bytes; Greptile's three findings are fixed: `ModelHub` takes a
+  reporter called once per load with fixed reasons for a throwing loader,
+  out of memory, Ready without models and a thread that cannot start (the
+  module logs it, so "the OBS log has the reason" holds); the loader's
+  hand-over calls `obs_source_update_properties` so an open properties view
+  stops saying "loading" (`plugin.loads` counts the signal; removing the
+  call failed it); and the lifetime case drops its snapshot so the stages
+  are the models' only owners, then checks the models die with the stages.
+  `models_changed` uses SPG-14c's rule: after a failed settings change it
+  rebuilds nothing. Building schedulers off the graphics thread is SPG-14d;
+  the model hand-over adds no model work to that path.
+
 ## 2026-10-12 — SPG-11 CPU compositor and spg-cli (#49)
 
 - Decision / change: `spg::compose()` and `fit_mask_rects()` in
@@ -1025,3 +1603,4 @@ Template:
   pipeline until SPG-14); GPU parity with this reference compositor is
   SPG-14's; whether the blur defeats OCR is SPG-18's. The `NOT RUN` mention
   in the human-owned autopilot skill is left for a human.
+

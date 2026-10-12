@@ -90,12 +90,16 @@ FrameId Scheduler::push(Timestamp t, Size source, const FrameView* readback) {
       copy = nullptr;  // no scan; the frame fails closed unless another cycle covers it
     }
   }
+  return push(t, source, std::move(copy));
+}
+
+FrameId Scheduler::push(Timestamp t, Size source, std::shared_ptr<const OwnedFrame> readback) {
   bool queued = false;
   FrameId id = 0;
   {
     const std::lock_guard lock(shared_->mutex);
     const std::uint64_t before = shared_->lookahead.stats().scans_queued;
-    id = shared_->lookahead.push(t, source, std::move(copy));
+    id = shared_->lookahead.push(t, source, std::move(readback));
     queued = shared_->lookahead.stats().scans_queued != before;
   }
   if (queued) {

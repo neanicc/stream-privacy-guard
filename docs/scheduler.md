@@ -8,7 +8,7 @@ fail-closed, retroactive-masking and temporal-hold invariants from
 
 | Piece | What it is |
 | --- | --- |
-| `run_scan()` | One detection cycle over one readback frame: faces, text regions, recognition, policy. Never throws; any exception, invalid output or missing detector for an enabled category makes the cycle incomplete. |
+| `run_scan()` | One detection cycle over one readback frame: faces, text regions, recognition, policy. Never throws; any exception, invalid output or missing detector for an enabled category makes the cycle incomplete, and an incomplete result still carries the valid boxes found before the failure ([partial cycles](#partial-cycles)). |
 | `Lookahead` | Single-threaded state machine: the frame ring, the bounded scan queue, cadence, coverage, retroactive masks, release and fallback. Tests and offline tools drive it directly with a `ManualClock`. |
 | `Scheduler` | `Lookahead` behind a mutex plus a pool of worker threads that call `run_scan()`. This is what the plugin (SPG-14) uses. |
 
@@ -28,10 +28,11 @@ these hold; otherwise it gets the fallback:
    a non-`std` throw), a detection that fails `validate()` or has the wrong
    kind, or a recognizer returning the wrong number of texts makes it
    incomplete. A frame whose cycle result could not be fully applied (an
-   allocation or tracker failure in `complete()`) fails closed
+   allocation or tracker failure in `complete()`, or a complete result from
+   before more resizes than the size history holds) fails closed
    (`FallbackReason::ApplyFailed`), as do the other frames that result could
-   have masked: buffered frames from `ts - retro` on, and frames pushed up to
-   `ts + hold`.
+   have masked: buffered frames from `ts - retro` on, frames pushed up to
+   `ts + hold`, and the frame `hold_last_scanned` would show again.
 2. That cycle scanned the **same content**: no resize and no
    `mark_discontinuity()` between the two frames.
 3. The release is no later than `t + lookahead + release_grace`. A later
@@ -41,6 +42,42 @@ these hold; otherwise it gets the fallback:
    `clock.now()` when pushed. Otherwise the clock and the frames do not share
    one `FrameClock` time base (the tracker's pruning compares them), so the
    frame is never scanned and fails closed.
+
+### One gate for every path that airs a frame
+
+`Lookahead::gate(frame, at)` is the only code that decides a frame may air
+clean; it checks rules 4, 1 (`apply_failed`, `covered`) and 3 in that order and
+returns the `FallbackReason`. Two paths air a frame, and both call it:
+
+| Path | What airs | Gate call |
+| --- | --- | --- |
+| `release_due()`, frame due at `t + lookahead` | the frame with its plan | `gate(frame, now)` |
+| `release_due()`, buffer over `max_buffered_frames` (early) | the oldest frame with its plan | `gate(frame, now)`; same rule, only earlier |
+| `hold_last_scanned` re-emit | the last clean frame again, as it was released | `gate(last_clean, when it was released)` |
+
+A re-emit is a release: it shows the old frame's pixels with the masks it had
+then. A complete cycle that finishes later and could have masked it (its
+boxes reach the frame retroactively, `ts - retro <= t`, or by hold,
+`t <= ts + hold`), or whose result cannot be applied, marks it
+`apply_failed`, exactly as it marks a buffered frame in that reach. It then
+fails the gate and the fallback blurs the source instead (SPG-10b). Before
+this, the re-emit checked only the segment, so a frame could be shown again
+without boxes held over it or found just after it.
+
+Every other path only feeds the gate: `push()` sets `bad_timestamp` (rule 4)
+and `apply_failed` for frames up to `ts + hold` of a failed result;
+`complete()` sets `covered` (rules 1 and 2, complete results only) or
+`apply_failed`; an incomplete result (whose boxes are still held, see
+[partial cycles](#partial-cycles)), a job dropped from a full queue or by
+`take_job()`, a cadence-skipped frame and a readback that matches no buffered
+frame never set `covered`, so their frames stay `NotScanned` unless another
+cycle covers them; a resize or
+`mark_discontinuity()` starts a segment so earlier cycles do not cover later
+frames. A result that lands after its frames were released (late
+`complete()`) cannot rescue them; it still reaches the tracker and, through
+the rule above, the re-emit candidate. `Scheduler`'s destructor drops a
+result that returns after stop and never releases another frame; nothing
+else drops, flushes or clears buffered frames.
 
 Detectors run their tiles serially with no deadline and the policy has no
 time bound, so nothing interrupts a stage. Deadlines are enforced at release:
@@ -67,13 +104,58 @@ previous frame (plan section 7), so `push(t, size, readback)` with
 `readback.timestamp == t_prev` queues a cycle on `t_prev`. A readback whose
 timestamp matches no buffered frame with a valid timestamp is not scanned.
 
+### Partial cycles
+
+A cycle can fail after some of its stages finished: faces found, then the text
+detector throws; text regions found, then the recognizer or the policy throws.
+The boxes found before the failure are real detections. Until SPG-10c
+`run_scan()` dropped them, so the failed frame blurred but the boxes never
+reached the tracker: if the face detector missed on the next cycle, frames
+that cycle covered aired the face inside its hold.
+
+`run_scan()` stops at the first failure and returns an incomplete result whose
+`detections` keep what was found before it:
+
+| Failure | Boxes kept |
+| --- | --- |
+| face detector throws | none (text never runs) |
+| face detector returns malformed output | its valid faces (text never runs) |
+| text detector throws | the faces |
+| text detector returns malformed output | the faces and its valid regions |
+| recognizer throws or returns the wrong count | the faces and every region |
+| policy throws on some region | the faces and every region, including any it judged safe before failing |
+| missing detector for an enabled category | none (nothing runs) |
+
+A box is kept only when it passes `validate()` and has the stage's kind; a
+non-finite, negative, wrong-space or wrong-kind box, or a bad score, is never
+held. A region that no finished text stage cleared is masked (recall over
+precision), as it is when no recognizer or policy is configured.
+
+`Lookahead::complete()` treats an incomplete result with boxes like a complete
+one for masking: the boxes enter the tracker (held for `hold`), become
+retroactive rects on buffered frames in `[ts - retro, ts)`, and mark the
+re-emit candidate in their reach. If they cannot be applied (tracker
+rejection, allocation failure, or a job from before more resizes than the size
+history holds) they fail closed exactly as a complete result's do
+(`ApplyFailed` from `ts - retro` to `ts + hold`). The one difference is
+coverage: an incomplete cycle never sets `covered`, so it never lets a frame
+air clean (rule 1). It counts in `scans_failed`, never in `scans_completed`.
+An incomplete result with no boxes changes nothing but `scans_failed`.
+
+If an allocation fails while `run_scan()` collects the boxes a stage returned
+(appending faces or regions, or the per-region policy flags), `detections`
+holds only part of what the cycle saw, and nothing can hold the rest. The
+result then sets `detections_lost`, and `complete()` fails closed exactly as
+for a result it cannot apply (`ApplyFailed` from `ts - retro` to `ts + hold`)
+instead of holding the partial list.
+
 ## Masks
 
 `MaskPlan.rects` for a frame at `t` is the union of:
 
 - `Tracker::masks(t)`: every detection seen in `[t - hold, t]`, with margin and
   constant-velocity prediction ([tracker.md](tracker.md));
-- **retroactive rects**: each box of a complete cycle at `ts` in `(t, t + retro]`
+- **retroactive rects**: each box of a cycle (complete, or partial) at `ts` in `(t, t + retro]`
   that finished while the frame was buffered, grown by the same margin and
   rounded outward to whole pixels. The tracker only covers frames at or after
   a detection, so this is what blurs a secret from its first frame.
@@ -95,7 +177,11 @@ scaled margin, as `Tracker::rescale` does for boxes held before the resize.
 A retroactive rect on a frame of another size is the hull of the box and its
 scaling grown in that size, and of the grown mask scaled.
 The cycle does not count as a scan of new-size frames (rule 2). Up to 64
-resizes are remembered; a result from before that is treated as incomplete.
+resizes are remembered. A complete result from before that cannot be scaled,
+so it fails closed like any result that cannot be applied
+(`FallbackReason::ApplyFailed` for frames from `ts - retro` on and pushed up to
+`ts + hold`). Until SPG-10b it was dropped like an incomplete one, so frames of
+later sizes that another cycle covered aired without its held boxes.
 
 ## Fallback modes
 
@@ -103,7 +189,7 @@ resizes are remembered; a result from before that is treated as incomplete.
 | --- | --- |
 | `blur_source` (default) | `BlurSource` |
 | `solid_fill` | `SolidFill` |
-| `hold_last_scanned` | `HoldLastScanned` with `reemit` = the last frame released clean in the same segment; `BlurSource` when there is none (start, after a resize or a discontinuity). The plugin shows that frame again exactly as it released it. |
+| `hold_last_scanned` | `HoldLastScanned` with `reemit` = the last frame released clean in the same segment, if it still passes the gate; `BlurSource` when there is none (start, after a resize or a discontinuity) or when a cycle that finished after its release could have masked it. The plugin shows that frame again exactly as it released it. |
 
 ## Degenerate configs
 
@@ -126,8 +212,12 @@ cadence wants a scan. That copy allocates and copies one readback on the
 render thread per queued scan (every frame at the default `scan_interval` of
 0), and `release_due` waits for the mutex while a worker applies a result,
 whose cost grows with detections times buffered frames. Neither waits on
-inference, but SPG-16 must measure the p99 of the render-facing calls; a
-pooled readback buffer would remove the allocation. The queue holds at most `queue_capacity` jobs; a new job
+inference, but SPG-16 must measure the p99 of the render-facing calls. The
+plugin (SPG-14) avoids that allocation: it copies the mapped stage surface
+into a pooled buffer, wraps it with `OwnedFrame::adopt` (no copy; the
+buffer returns to the pool when the worker drops the frame) and calls the
+`push` overload that takes a `shared_ptr<const OwnedFrame>`
+([plugin-render.md](plugin-render.md)). The queue holds at most `queue_capacity` jobs; a new job
 pushes out the oldest, and workers take the newest. The clock is read from
 worker threads (the tracker prunes on update), so it must be thread-safe
 (`SteadyClock` is; `ManualClock` is not).
@@ -180,8 +270,12 @@ Offline, `spg-cli` (SPG-11) drives `Lookahead` directly: push, take a job,
 ## Evidence
 
 `tests/unit/lookahead_test.cpp` (deterministic cases),
-`tests/unit/lookahead_property_test.cpp` (1500 seeded scenes) and
-`tests/unit/scheduler_test.cpp` (real threads). See the SPG-10 entry in
-[agent-log.md](agent-log.md). None of this is synthetic-eval or live evidence;
+`tests/unit/lookahead_property_test.cpp` (1500 seeded scenes; its oracle also
+checks every re-emitted frame against every box that could reach it, and its
+scenes include results the tracker rejects, a source that changes size
+faster than the size history, and failed cycles that return partial boxes,
+which the oracle checks for retro and hold like a complete cycle's but never
+counts as coverage) and `tests/unit/scheduler_test.cpp` (real threads). See
+the SPG-10, SPG-10b and SPG-10c entries in [agent-log.md](agent-log.md). None of this is synthetic-eval or live evidence;
 cadence, worker count and the fail-closed rate on real detectors are for
 `spg-cli bench` (SPG-11/16) to measure.

@@ -7,8 +7,10 @@
 // caller's order, falls back to CPU unless told not to, warms up before it is
 // returned, and reports every failure as a RuntimeError with a code and a
 // message naming the model, the provider and what went wrong. Models are read
-// from local files only; nothing here touches the network.
+// from local files, or from bytes the caller already read and checked;
+// nothing here touches the network.
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -124,12 +126,23 @@ struct ProviderAttempt {
   std::string detail;  // why it was skipped or failed; empty when selected
 };
 
+// A model already in memory: for a caller that checked the bytes (size,
+// SHA-256) and must not let ONNX Runtime read the file again, where it could
+// have been replaced since. `path` only names the model in errors and
+// model_path(); the file is not read. The bytes need to outlive open() only.
+struct ModelBytes {
+  std::filesystem::path path;
+  std::span<const std::byte> bytes;
+};
+
 class Session {
  public:
   // Throws RuntimeError: ModelNotFound, ModelLoadFailed, ProviderUnavailable or
   // InvalidInput (bad warmup shapes, or `env` was moved from).
   [[nodiscard]] static Session open(Environment& env, const std::filesystem::path& model,
                                     const SessionOptions& options = {});
+  // The same from memory. Empty or unparsable bytes are ModelLoadFailed.
+  [[nodiscard]] static Session open(Environment& env, const ModelBytes& model, const SessionOptions& options = {});
 
   ~Session();
   Session(const Session&) = delete;
@@ -164,6 +177,10 @@ class Session {
 
  private:
   explicit Session(std::unique_ptr<Impl> impl);
+  // Both open()s: `bytes` when set, else the file at `model`.
+  [[nodiscard]] static Session open_from(Environment& env, const std::filesystem::path& model,
+                                         const std::optional<std::span<const std::byte>>& bytes,
+                                         const SessionOptions& options);
   std::unique_ptr<Impl> impl_;
 };
 

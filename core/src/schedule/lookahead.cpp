@@ -16,8 +16,8 @@ namespace spg {
 
 namespace {
 
-// Source sizes remembered for rescaling late results. A job older than this
-// many resizes is treated as incomplete.
+// Source sizes remembered for rescaling late results. A complete result from
+// a job older than this many resizes cannot be rescaled and fails closed.
 constexpr std::size_t kMaxSizeHistory = 64;
 
 const SchedulerConfig& validated(const SchedulerConfig& config) {
@@ -187,30 +187,61 @@ void Lookahead::complete(const ScanJob& job, const ScanResult& result) {
     throw ContractError("lookahead: complete() for a job that is not in flight");
   }
   in_flight_.erase(it);
-  if (!result.complete || job.size_epoch < first_epoch_) {
+  if (result.detections_lost) {
+    // The cycle found boxes it could not return: nothing can hold or
+    // retro-mask what is missing, so every frame they could have masked
+    // fails closed.
+    fail_closed(job);
+    return;
+  }
+  // An incomplete cycle covers no frame, but the boxes its finished stages
+  // found are still held and masked retroactively (a partial cycle), so a
+  // later cycle that misses them cannot air them inside the hold.
+  if (!result.complete && result.detections.empty()) {
     ++stats_.scans_failed;
+    return;
+  }
+  if (job.size_epoch < first_epoch_) {
+    // From before more resizes than the size history holds: its boxes cannot
+    // be scaled to the current size. Dropping them would let frames another
+    // cycle covers air without boxes held over them.
+    fail_closed(job);
     return;
   }
   try {
     apply(job, result);
   } catch (...) {
     // Part of the result may be missing from the tracker or from frames an
-    // earlier cycle already covered. Fail closed every frame it could have
-    // masked: retroactively from ts - retro, and held up to ts + hold.
-    const Timestamp from = job.frame_time - config_.retro;
-    for (FrameRecord& frame : frames_) {
-      if (frame.t >= from) {
-        frame.apply_failed = true;
-      }
-    }
-    const Timestamp until = job.frame_time + config_.tracker.hold;
-    if (!apply_failed_until_.has_value() || *apply_failed_until_ < until) {
-      apply_failed_until_ = until;
-    }
-    ++stats_.scans_failed;
+    // earlier cycle already covered.
+    fail_closed(job);
     return;
   }
-  ++stats_.scans_completed;
+  if (result.complete) {
+    ++stats_.scans_completed;
+  } else {
+    ++stats_.scans_failed;
+  }
+}
+
+void Lookahead::fail_closed(const ScanJob& job) noexcept {
+  // Every frame the result could have masked: retroactively from ts - retro,
+  // and held up to ts + hold.
+  const Timestamp from = job.frame_time - config_.retro;
+  for (FrameRecord& frame : frames_) {
+    if (frame.t >= from) {
+      frame.apply_failed = true;
+    }
+  }
+  // The frame HoldLastScanned would show again is older than every buffered
+  // frame; it gets the same test.
+  if (last_clean_.has_value() && last_clean_->t >= from) {
+    last_clean_->apply_failed = true;
+  }
+  const Timestamp until = job.frame_time + config_.tracker.hold;
+  if (!apply_failed_until_.has_value() || *apply_failed_until_ < until) {
+    apply_failed_until_ = until;
+  }
+  ++stats_.scans_failed;
 }
 
 void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
@@ -255,9 +286,18 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
         add_retro(frame, r);
       }
     }
-    if (frame.segment == job.segment) {
+    // Only a complete cycle is a scan; a partial one only adds masks.
+    if (result.complete && frame.segment == job.segment) {
       frame.covered = true;
     }
+  }
+
+  // The last clean frame has aired and cannot gain these boxes. If it is in
+  // their reach (retroactive from ts - retro, held up to ts + hold, as for a
+  // buffered frame) it may not be shown again.
+  if (last_clean_.has_value() && !result.detections.empty() && last_clean_->t >= from &&
+      last_clean_->t <= job.frame_time + config_.tracker.hold) {
+    last_clean_->apply_failed = true;
   }
 }
 
@@ -278,13 +318,32 @@ void Lookahead::add_retro(FrameRecord& frame, const Rect& rect) const {
   }
 }
 
+FallbackReason Lookahead::gate(const FrameRecord& frame, Timestamp at) const noexcept {
+  if (frame.bad_timestamp) {
+    return FallbackReason::BadTimestamp;
+  }
+  if (frame.apply_failed) {
+    return FallbackReason::ApplyFailed;
+  }
+  if (!frame.covered) {
+    return FallbackReason::NotScanned;
+  }
+  if (at > frame.t + config_.lookahead + config_.release_grace) {
+    return FallbackReason::LateRelease;
+  }
+  return FallbackReason::None;
+}
+
 FallbackAction Lookahead::fallback_action(const FrameRecord& frame, FrameId& reemit) const noexcept {
   switch (config_.fallback) {
     case FallbackMode::SolidFill:
       return FallbackAction::SolidFill;
     case FallbackMode::HoldLastScanned:
-      if (last_clean_.has_value() && last_clean_segment_ == frame.segment) {
-        reemit = *last_clean_;
+      // Showing a frame again is a release: it must pass the same gate, as of
+      // when its masks were composed, with what has been learned since.
+      if (last_clean_.has_value() && last_clean_->segment == frame.segment &&
+          gate(*last_clean_, last_clean_at_) == FallbackReason::None) {
+        reemit = last_clean_->id;
         return FallbackAction::HoldLastScanned;
       }
       return FallbackAction::BlurSource;
@@ -297,7 +356,7 @@ FallbackAction Lookahead::fallback_action(const FrameRecord& frame, FrameId& ree
 void Lookahead::release_due(std::vector<ReleasedFrame>& out) {
   const Timestamp now = clock_->now();
   while (!frames_.empty()) {
-    const FrameRecord& frame = frames_.front();
+    FrameRecord& frame = frames_.front();
     const bool over = frames_.size() > config_.max_buffered_frames;
     if (!over && now < frame.due) {
       break;
@@ -316,28 +375,24 @@ void Lookahead::release_due(std::vector<ReleasedFrame>& out) {
       released.plan.rects.push_back(MaskRect{Box{rect, Space::Source}, config_.mask_style});
     }
 
-    if (frame.bad_timestamp) {
-      released.reason = FallbackReason::BadTimestamp;
-    } else if (frame.apply_failed) {
-      released.reason = FallbackReason::ApplyFailed;
-    } else if (!frame.covered) {
-      released.reason = FallbackReason::NotScanned;
-    } else if (now > frame.t + config_.lookahead + config_.release_grace) {
-      released.reason = FallbackReason::LateRelease;
-    }
-    if (released.reason != FallbackReason::None) {
+    released.reason = gate(frame, now);
+    const bool clean = released.reason == FallbackReason::None;
+    if (!clean) {
       released.plan.fallback = true;
       released.action = fallback_action(frame, released.reemit);
-      ++stats_.frames_failed_closed;
+    }
+    out.push_back(std::move(released));
+    // State changes only once the frame is out.
+    if (clean) {
+      last_clean_ = std::move(frame);
+      last_clean_at_ = now;
     } else {
-      last_clean_ = frame.id;
-      last_clean_segment_ = frame.segment;
+      ++stats_.frames_failed_closed;
     }
     if (over) {
       ++stats_.early_releases;
     }
     ++stats_.frames_released;
-    out.push_back(std::move(released));
     frames_.pop_front();
   }
 }

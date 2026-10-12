@@ -98,7 +98,9 @@ struct ReleasedFrame {
   FallbackAction action = FallbackAction::None;
   FallbackReason reason = FallbackReason::None;
   // For HoldLastScanned: the last frame released with action None in the same
-  // source size and content. Never set otherwise.
+  // source size and content, which still passes the release gate: no complete
+  // cycle that finished after it was released could have masked it. Never set
+  // otherwise.
   FrameId reemit = 0;
 };
 
@@ -127,11 +129,21 @@ struct SchedulerStats {
 //   * Hold: plan rects include Tracker::masks(t), so a detection stays masked
 //     for the hold; a resize or a late cycle only adds coverage, and a box
 //     from before a resize keeps its scaled margin.
-//   * A complete cycle whose result cannot be fully applied (an allocation
-//     or tracker failure) fails closed every frame it could have masked:
-//     buffered frames from ts - retro on, and frames pushed up to ts + hold.
+//   * Partial cycles: the detections of an incomplete result (found by the
+//     stages that finished before a failure) are held and masked
+//     retroactively like a complete cycle's, but the cycle covers no frame.
+//   * A cycle whose detections cannot be fully applied (an allocation
+//     or tracker failure, a result from before more resizes than the size
+//     history holds, or a scan that lost some of the boxes it found) fails
+//     closed every frame it could have masked: buffered
+//     frames from ts - retro on, frames pushed up to ts + hold, and the frame
+//     HoldLastScanned would show again.
 //   * Frames are released once each, in push order, never before
 //     t + lookahead unless the buffer is over max_buffered_frames.
+//   * One gate: a released frame and a re-emitted one (HoldLastScanned) pass
+//     the same check. A frame shown again is the frame as it was released, so
+//     a complete cycle that finishes later and could have masked it (or whose
+//     result cannot be applied) makes it ineligible; the fallback blurs.
 //
 // Not thread-safe. The Clock must share the frames' FrameClock time base.
 class Lookahead {
@@ -161,8 +173,13 @@ class Lookahead {
   // frames fail closed unless another cycle covers them.
   [[nodiscard]] std::optional<ScanJob> take_job() noexcept;
 
-  // Applies a finished job. An incomplete result covers nothing. Throws
-  // ContractError for a job that was not taken or was already completed.
+  // Applies a finished job. An incomplete result covers nothing, but its
+  // detections are held and masked retroactively; a complete result, or an
+  // incomplete one with detections, that cannot be applied fails closed what
+  // it could have masked, as does one whose detections were lost
+  // (ScanResult::detections_lost).
+  // Throws ContractError for a job that was not taken or was already
+  // completed.
   void complete(const ScanJob& job, const ScanResult& result);
 
   // Appends every frame due by clock.now() (and any over the buffer limit),
@@ -196,7 +213,17 @@ class Lookahead {
 
   [[nodiscard]] const FrameRecord* find_frame(Timestamp t) const noexcept;
   void apply(const ScanJob& job, const ScanResult& result);
+  // A result that cannot be applied (complete, or partial with detections)
+  // or that lost detections: fails closed every frame it could have masked
+  // (buffered from ts - retro on, pushed up to ts + hold, and the frame
+  // HoldLastScanned would re-emit).
+  void fail_closed(const ScanJob& job) noexcept;
   void add_retro(FrameRecord& frame, const Rect& rect) const;
+  // The release gate (docs/scheduler.md, "Release rule"), the only place that
+  // decides a frame may air clean: None, or why it gets the fallback. `at` is
+  // when its masks are composed: now for a release, the original release for
+  // a re-emit (its masks were fixed then).
+  [[nodiscard]] FallbackReason gate(const FrameRecord& frame, Timestamp at) const noexcept;
   [[nodiscard]] FallbackAction fallback_action(const FrameRecord& frame, FrameId& reemit) const noexcept;
 
   const Clock* clock_;
@@ -217,9 +244,11 @@ class Lookahead {
   std::optional<Timestamp> apply_failed_until_;
   FrameId next_frame_ = 1;
   std::uint64_t next_job_ = 1;
-  // Last frame released with FallbackAction::None, for HoldLastScanned.
-  std::optional<FrameId> last_clean_;
-  std::uint64_t last_clean_segment_ = 0;
+  // Last frame released with FallbackAction::None, for HoldLastScanned, and
+  // when it was released. Later results mark it (apply_failed) when they
+  // could have masked it, so it fails the gate and is not shown again.
+  std::optional<FrameRecord> last_clean_;
+  Timestamp last_clean_at_{};
   SchedulerStats stats_;
   std::vector<Box> masks_buffer_;
 };

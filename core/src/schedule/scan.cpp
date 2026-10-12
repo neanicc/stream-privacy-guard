@@ -7,6 +7,7 @@
 #include <exception>
 #include <iterator>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "spg/error.hpp"
@@ -44,21 +45,41 @@ std::size_t rows(PixelFormat format, std::size_t plane, std::uint32_t height) no
 }
 
 // Validates detector output; false fails the cycle.
-bool valid_output(const std::vector<Detection>& detections, DetectionKind kind) noexcept {
+bool valid_one(const Detection& d, DetectionKind kind) noexcept {
   try {
-    for (const Detection& d : detections) {
-      validate(d);
-      if (d.kind != kind) {
-        return false;
-      }
-    }
-    return true;
+    validate(d);
+    return d.kind == kind;
   } catch (...) {
     return false;
   }
 }
+bool valid_output(const std::vector<Detection>& detections, DetectionKind kind) noexcept {
+  return std::all_of(detections.begin(), detections.end(),
+                     [kind](const Detection& d) { return valid_one(d, kind); });
+}
 
-ScanResult failed(ScanFailure failure) {
+// Appends the detections of `found` that are valid on their own. Called for
+// output that failed valid_output(): a malformed box is never held, but its
+// valid siblings are still boxes to mask (recall over precision).
+void keep_valid(std::vector<Detection>& out, const std::vector<Detection>& found, DetectionKind kind) {
+  for (const Detection& d : found) {
+    if (valid_one(d, kind)) {
+      out.push_back(d);
+    }
+  }
+}
+
+// An incomplete cycle. `result.detections` keeps what the stages that ran
+// found before the failure: the scheduler holds them without counting the
+// cycle as a scan (docs/scheduler.md, "Partial cycles").
+// Callers move `result` in, so returning it from run_scan() cannot throw.
+ScanResult failed(ScanResult result, ScanFailure failure) noexcept {
+  result.complete = false;
+  result.failure = failure;
+  return result;
+}
+
+ScanResult failed(ScanFailure failure) noexcept {
   ScanResult result;
   result.failure = failure;
   return result;
@@ -91,6 +112,17 @@ std::shared_ptr<const OwnedFrame> OwnedFrame::copy(const FrameView& frame) {
   return owned;
 }
 
+std::shared_ptr<const OwnedFrame> OwnedFrame::adopt(const FrameView& frame, std::shared_ptr<const void> owner) {
+  validate(frame);
+  if (owner == nullptr) {
+    throw ContractError("scan: OwnedFrame::adopt needs an owner");
+  }
+  std::shared_ptr<OwnedFrame> owned(new OwnedFrame());
+  owned->owner_ = std::move(owner);
+  owned->view_ = frame;
+  return owned;
+}
+
 ScanResult run_scan(const ScanStages& stages, const ScanJob& job, const ScanLimits& limits) noexcept {
   if (job.readback == nullptr) {
     return failed(ScanFailure::InvalidOutput);
@@ -109,10 +141,11 @@ ScanResult run_scan(const ScanStages& stages, const ScanJob& job, const ScanLimi
       try {
         faces = stages.faces->detect(frame, job.source);
       } catch (...) {
-        return failed(ScanFailure::FaceDetector);
+        return failed(std::move(result), ScanFailure::FaceDetector);
       }
       if (!valid_output(faces, DetectionKind::Face)) {
-        return failed(ScanFailure::InvalidOutput);
+        keep_valid(result.detections, faces, DetectionKind::Face);
+        return failed(std::move(result), ScanFailure::InvalidOutput);
       }
       result.detections.insert(result.detections.end(), faces.begin(), faces.end());
     }
@@ -122,42 +155,55 @@ ScanResult run_scan(const ScanStages& stages, const ScanJob& job, const ScanLimi
       try {
         regions = stages.text->detect(frame, job.source);
       } catch (...) {
-        return failed(ScanFailure::TextDetector);
+        return failed(std::move(result), ScanFailure::TextDetector);
       }
       if (!valid_output(regions, DetectionKind::TextRegion)) {
-        return failed(ScanFailure::InvalidOutput);
+        keep_valid(result.detections, regions, DetectionKind::TextRegion);
+        return failed(std::move(result), ScanFailure::InvalidOutput);
       }
       if (stages.recognizer == nullptr || stages.policy == nullptr) {
         // Nothing can clear these regions: mask them all (recall over precision).
         result.detections.insert(result.detections.end(), regions.begin(), regions.end());
       } else if (!regions.empty()) {
+        // From here on a failure masks every region: none was cleared by a
+        // text stage that finished.
+        const auto mask_all = [&](ScanFailure failure) {
+          result.detections.insert(result.detections.end(), regions.begin(), regions.end());
+          return failed(std::move(result), failure);
+        };
         std::vector<Secret> texts;
         try {
           texts = stages.recognizer->recognize(frame, job.source, regions);
         } catch (...) {
-          return failed(ScanFailure::Recognizer);
+          return mask_all(ScanFailure::Recognizer);
         }
         if (texts.size() != regions.size()) {
-          return failed(ScanFailure::InvalidOutput);
+          return mask_all(ScanFailure::InvalidOutput);
         }
+        std::vector<bool> masked(regions.size(), false);
         for (std::size_t i = 0; i < regions.size(); ++i) {
-          bool mask = texts[i].size() > limits.max_text_bytes;
-          if (!mask) {
+          masked[i] = texts[i].size() > limits.max_text_bytes;
+          if (!masked[i]) {
             try {
-              mask = stages.policy->evaluate(texts[i]).sensitive();
+              masked[i] = stages.policy->evaluate(texts[i]).sensitive();
             } catch (...) {
-              return failed(ScanFailure::Policy);
+              return mask_all(ScanFailure::Policy);
             }
           }
-          if (mask) {
+        }
+        for (std::size_t i = 0; i < regions.size(); ++i) {
+          if (masked[i]) {
             result.detections.push_back(regions[i]);
           }
         }
       }
     }
   } catch (...) {
-    // Allocation failure while collecting results.
-    return failed(ScanFailure::InvalidOutput);
+    // Allocation failure while collecting the boxes a stage returned: some
+    // are missing from `detections`, so the scheduler must fail closed
+    // their whole window (retro and hold) rather than hold only what is here.
+    result.detections_lost = true;
+    return failed(std::move(result), ScanFailure::InvalidOutput);
   }
   result.complete = true;
   return result;

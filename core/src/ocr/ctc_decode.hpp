@@ -12,8 +12,9 @@
 // low score (its text_score 0.5 cut): a misread secret still goes to the
 // policy, which decides (recall over precision).
 //
-// Decoded text is secret-adjacent: it is returned as spg::Secret and never
-// appears in an error message. Errors name sizes, steps and classes only.
+// Decoded text is secret-adjacent: it is built in SecureText (protected,
+// wiped memory), returned as spg::Secret and never appears in an error
+// message. Errors name sizes, steps and classes only.
 
 #include <cstddef>
 #include <span>
@@ -23,8 +24,22 @@
 #include <vector>
 
 #include "spg/secret.hpp"
+#include "spg/secure_memory.hpp"
 
 namespace spg::ocr {
+
+// Recognized text while the recognizer builds it (SPG-15d): bytes in
+// SecureHeap::process(), kept out of crash dumps where the OS allows and
+// zeroed when released, a reallocation's old buffer included. A vector rather
+// than SecureString because a std::basic_string keeps short text inside the
+// string object (its short-string buffer), which may sit on the stack; a
+// vector keeps every byte in the heap block.
+using SecureText = std::vector<char, SecureAllocator<char>>;
+
+// The bytes of `text` as a view, for Secret::copy_of() and matching code.
+[[nodiscard]] inline std::string_view view(const SecureText& text) noexcept {
+  return {text.data(), text.size()};
+}
 
 // Thrown when model output is malformed (wrong size, a value that is not a
 // finite probability) or the alphabet is unusable. The caller fails the frame
@@ -61,10 +76,10 @@ struct CtcStats {
 // Greedy-decodes one sequence: `probs` holds `steps` rows of alphabet.size()
 // probabilities, row-major. Appends the text to `text` and returns its stats.
 // Throws DecodeError when the size does not match or any value is not a
-// finite number in [0, 1] (a small rounding tolerance is allowed); `text` is
-// unchanged then.
+// finite number in [0, 1] (a small rounding tolerance is allowed); `text`
+// then holds what it held before, and any bytes appended are zeroed first.
 CtcStats ctc_greedy_decode(std::span<const float> probs, std::size_t steps, const Alphabet& alphabet,
-                           std::string& text);
+                           SecureText& text);
 
 // Convenience form for tests and callers that decode one sequence: the text as
 // a Secret and the mean probability of its characters (0 when empty).

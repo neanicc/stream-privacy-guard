@@ -15,8 +15,11 @@
 // zeros (mid gray) to the batch width, at least min_width. Crops of a batch
 // are sorted by width first, as RapidOCR sorts by aspect ratio.
 //
-// Recognized text is secret-adjacent: it lives in spg::Secret, is never
-// logged, and never appears in an error. No OBS, no globals, no logging;
+// Recognized text is secret-adjacent: it is built in SecureText buffers and
+// returned in spg::Secret, both protected memory that is zeroed when released
+// (SPG-15d; what stays outside it is in docs/policy.md, "Recognized text in
+// memory"). It is never logged and never appears in an error. The model's
+// output probabilities are zeroed once decoded. No OBS, no globals, no logging;
 // nothing here touches the network or the disk except opening the model file.
 
 #include <cstddef>
@@ -112,6 +115,10 @@ class TextRecognizer {
   // session cannot be created and TextRecognizerError when the model or config
   // is not usable.
   [[nodiscard]] static TextRecognizer open(runtime::Environment& env, const std::filesystem::path& model,
+                                           const TextRecognizerConfig& config = {},
+                                           runtime::SessionOptions options = {});
+  // The same from bytes already read and checked (runtime::ModelBytes).
+  [[nodiscard]] static TextRecognizer open(runtime::Environment& env, const runtime::ModelBytes& model,
                                            const TextRecognizerConfig& config = {},
                                            runtime::SessionOptions options = {});
 

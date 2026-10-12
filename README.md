@@ -11,10 +11,14 @@ to every buffered frame, and when the pipeline cannot keep up it fails closed by
 blurring the whole source. Some things will still get through; the eval in this
 repo measures how often.
 
-> Status: pre-alpha. The detection pipeline runs offline in `spg-cli` on PNG
-> sequences, and the synthetic eval scores it, but the OBS filter does not use
-> it yet: the filter covers the whole source (fails closed) instead of blurring
-> regions. Nothing here protects a stream today.
+> Status: pre-alpha. The build foundation exists (`spg-core`, `spg-cli`, tests
+> and pinned dependencies). The detection pipeline runs offline in `spg-cli` on
+> PNG sequences, and the synthetic eval scores it. The OBS filter loads the
+> pinned detection models (`scripts/fetch_models.py` puts them in
+> `~/.cache/spg/models`) to blur detected faces and sensitive text; without them
+> it covers the whole source (fails closed). It has not been checked in a live
+> OBS session yet, and its recall on real content is not measured: do not rely
+> on it for a stream.
 
 ## Quickstart (developers)
 

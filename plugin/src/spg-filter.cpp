@@ -3,13 +3,17 @@
 #include <graphics/vec4.h>
 #include <obs-module.h>
 
+#include "model_loading.hpp"
 #include "plugin-support.hpp"
+#include "render/filter_render.hpp"
 #include "settings/watchlist_store.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -39,14 +43,17 @@ enum class Notice : std::uint8_t {
 struct FilterState {
   obs_source_t *context = nullptr;
   std::filesystem::path watchlist_dir;  // fixed at create
+  // Readback, lookahead ring, scheduler and blur (SPG-14). Set at create;
+  // null only if that failed, and then every frame gets an opaque fill.
+  std::unique_ptr<FilterRender> render;
 
   std::mutex mutex;  // guards everything below
   FilterSettings settings;
   std::string ref;
   StoreError store_error = StoreError::NoConfigDir;
   std::vector<Secret> watchlist;
-  // Set only when detection could run with these settings. SPG-10/14 hand it
-  // to the pipeline; until then the filter fails closed regardless.
+  // Set only when detection could run with these settings; handed to
+  // `render`, which covers the whole source while it is empty.
   std::optional<PolicyConfig> policy;
   FilterIssue issue = FilterIssue::WatchlistStorage;
   // True once `policy` and `issue` match the fields above; an update that
@@ -104,6 +111,7 @@ FilterSettings read_settings(obs_data_t *settings) {
   RawFilterSettings raw;
   raw.lookahead_ms = obs_data_get_int(settings, kLookaheadKey);
   raw.hold_ms = obs_data_get_int(settings, kHoldKey);
+  raw.vram_budget_mb = obs_data_get_int(settings, kVramBudgetKey);
   raw.categories = CategorySet{};
   for (const Category category : kAllCategories) {
     if (obs_data_get_bool(settings, category_key(category).c_str())) {
@@ -117,6 +125,7 @@ FilterSettings read_settings(obs_data_t *settings) {
   const FilterSettings clean = sanitize(raw);
   set_int_if_changed(settings, kLookaheadKey, clean.lookahead_ms);
   set_int_if_changed(settings, kHoldKey, clean.hold_ms);
+  set_int_if_changed(settings, kVramBudgetKey, clean.vram_budget_mb);
   set_string_if_changed(settings, kSensitivityKey, to_string(clean.sensitivity));
   set_string_if_changed(settings, kFallbackKey, spg::to_string(clean.fallback));
   return clean;
@@ -164,6 +173,15 @@ WatchlistSnapshot snapshot(FilterState &state) {
   return {state.ref, state.store_error, state.watchlist};
 }
 
+// Hands the current policy (or none) to the render side. Caller holds
+// state.mutex; the render thread never takes it.
+void publish_render_locked(FilterState &state) noexcept {
+  if (state.render != nullptr) {
+    state.render->set_debug_overlay(state.settings.debug_overlay);
+    state.render->publish(state.policy, state.settings.fallback, state.settings.vram_budget_mb);
+  }
+}
+
 // Caller holds state.mutex.
 void rebuild_policy_locked(FilterState &state) {
   state.policy_current = false;
@@ -178,6 +196,7 @@ void rebuild_policy_locked(FilterState &state) {
     log(LOG_WARNING, "detection off, covering the whole source: %s", issue_name(state.issue));
   }
   state.policy_current = true;
+  publish_render_locked(state);
 }
 
 WatchlistRefRegistry &ref_registry() {
@@ -335,6 +354,7 @@ void filter_update(void *data, obs_data_t *settings) {
     state->policy.reset();
     state->issue = FilterIssue::InvalidConfig;
     state->policy_current = false;
+    publish_render_locked(*state);
   }
 }
 
@@ -349,6 +369,11 @@ void *filter_create(obs_data_t *settings, obs_source_t *source) {
     state->watchlist_dir = watchlist_directory();
   } catch (...) {
     state->watchlist_dir.clear();  // NoConfigDir: fail closed
+  }
+  try {
+    state->render = std::make_unique<FilterRender>(source);
+  } catch (...) {
+    state->render.reset();  // video_render draws an opaque fill
   }
   filter_update(state, settings);
   return state;
@@ -385,6 +410,7 @@ void filter_get_defaults(obs_data_t *settings) {
   obs_data_set_default_string(settings, kSensitivityKey, to_string(Sensitivity::Standard).data());
   obs_data_set_default_int(settings, kLookaheadKey, kDefaultLookaheadMs);
   obs_data_set_default_int(settings, kHoldKey, kDefaultHoldMs);
+  obs_data_set_default_int(settings, kVramBudgetKey, kDefaultVramBudgetMb);
   obs_data_set_default_string(settings, kFallbackKey, spg::to_string(FallbackMode::BlurSource).data());
   obs_data_set_default_bool(settings, kDebugOverlayKey, false);
   obs_data_set_default_int(settings, kWatchlistCountKey, 0);
@@ -619,6 +645,76 @@ void add_watchlist_group(obs_properties_t *props, FilterState *state) {
   obs_properties_add_group(props, "watchlist_group", text("SPG.Watchlist"), OBS_GROUP_NORMAL, group);
 }
 
+// Whether the detection models are loaded (module-wide). Fixed texts plus the
+// manifest name of a model at fault; paths and errors go to the log.
+void add_models_status(obs_properties_t *props) {
+  const ModelHub::Snapshot models = module_models().snapshot();
+  const char *key = nullptr;
+  obs_text_info_type type = OBS_TEXT_INFO_ERROR;
+  switch (models.report.status) {
+    case ModelStatus::Idle:
+    case ModelStatus::Loading:
+      key = "SPG.Models.Loading";
+      type = OBS_TEXT_INFO_WARNING;
+      break;
+    case ModelStatus::Ready:
+      key = "SPG.Models.Ready";
+      type = OBS_TEXT_INFO_NORMAL;
+      break;
+    case ModelStatus::Missing:
+      key = "SPG.Models.Missing";
+      break;
+    case ModelStatus::Corrupt:
+      key = "SPG.Models.Corrupt";
+      break;
+    case ModelStatus::Failed:
+      key = "SPG.Models.Failed";
+      break;
+  }
+  if (key == nullptr) {
+    return;
+  }
+  std::string line = text(key);
+  if (!models.report.model.empty()) {
+    line += " (" + models.report.model + ")";
+  }
+  add_info(props, kModelsKey, line.c_str(), type);
+}
+
+// What has aired so far: counts and a fixed reason name, never frame content.
+void add_render_status(obs_properties_t *props, const FilterState &state) {
+  if (state.render == nullptr) {
+    return;
+  }
+  const RenderStatus status = state.render->status();
+  std::string line = std::string(text("SPG.Render.Aired")) + " " + std::to_string(status.clean) + " " +
+                     text("SPG.Render.Masked") + ", " + std::to_string(status.covered) + " " +
+                     text("SPG.Render.Covered");
+  if (status.covered > 0) {
+    line += std::string(" ") + text("SPG.Render.Last") + " " + cover_name(status.last_cover) + ".";
+  }
+  add_info(props, kRenderStatusKey, line.c_str(), status.covered > 0 ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
+
+  // The VRAM budget (docs/plugin-render.md): a shortened lookahead, and
+  // frames that got no ring texture within the budget.
+  std::string budget;
+  const LookaheadFit &fit = status.fit;
+  if (fit.shortened) {
+    const auto ms = [](Duration d) { return std::to_string(std::chrono::floor<std::chrono::milliseconds>(d).count()); };
+    budget = std::string(text("SPG.Budget.Shortened")) + " " + ms(fit.requested) + " ms " + text("SPG.Budget.To") +
+             " " + ms(fit.lookahead) + " ms, " + text("SPG.Budget.Holds") + " " + std::to_string(fit.budget_frames) +
+             " " + text("SPG.Budget.FramesOf") + " " + std::to_string(fit.frame.width) + "x" +
+             std::to_string(fit.frame.height) + " (" + std::to_string(fit.budget_bytes / kBytesPerMiB) + " MiB). " +
+             text("SPG.Budget.Advice");
+  }
+  if (status.over_budget > 0) {
+    budget += (budget.empty() ? "" : " ") + std::to_string(status.over_budget) + " " + text("SPG.Budget.Refused");
+  }
+  if (!budget.empty()) {
+    add_info(props, kBudgetStatusKey, budget.c_str(), OBS_TEXT_INFO_WARNING);
+  }
+}
+
 obs_properties_t *filter_get_properties(void *data) {
   auto *state = static_cast<FilterState *>(data);
   obs_properties_t *props = obs_properties_create();
@@ -633,6 +729,12 @@ obs_properties_t *filter_get_properties(void *data) {
       add_info(props, kIssueKey, text("SPG.Issue.NoCategories"), OBS_TEXT_INFO_ERROR);
     } else if (issue == FilterIssue::InvalidConfig) {
       add_info(props, kIssueKey, text("SPG.Issue.InvalidConfig"), OBS_TEXT_INFO_ERROR);
+    }
+    try {
+      add_models_status(props);
+      add_render_status(props, *state);
+    } catch (...) {
+      // Allocation failure: no status line.
     }
   }
 
@@ -665,6 +767,13 @@ obs_properties_t *filter_get_properties(void *data) {
                                                             static_cast<int>(kMaxLookaheadMs), 50);
   obs_property_int_set_suffix(lookahead, " ms");
   obs_property_set_long_description(lookahead, text("SPG.Lookahead.Help"));
+  obs_property_t *budget = obs_properties_add_int(props, kVramBudgetKey, text("SPG.VramBudget"),
+                                                  static_cast<int>(kMinVramBudgetMb),
+                                                  static_cast<int>(kMaxVramBudgetMb), 64);
+  obs_property_int_set_suffix(budget, " MiB");
+  obs_property_set_long_description(budget, text("SPG.VramBudget.Help"));
+  // The filter delays video only; a filter cannot delay audio (SPG-13 spike).
+  add_info(props, kAudioKey, text("SPG.Audio"), OBS_TEXT_INFO_WARNING);
   obs_property_t *hold = obs_properties_add_int_slider(props, kHoldKey, text("SPG.Hold"), static_cast<int>(kMinHoldMs),
                                                        static_cast<int>(kMaxHoldMs), 50);
   obs_property_int_set_suffix(hold, " ms");
@@ -683,11 +792,15 @@ obs_properties_t *filter_get_properties(void *data) {
   return props;
 }
 
-// Fail closed: draw an opaque fill the size of the source instead of the
-// source itself. The target is never rendered, so no unscanned pixel reaches
-// the preview, a recording or the stream.
+// The render side draws each frame (docs/plugin-render.md). Without it, fail
+// closed: an opaque fill the size of the source, and the target is never
+// drawn, so no unscanned pixel reaches the preview, a recording or the stream.
 void filter_video_render(void *data, gs_effect_t * /*effect*/) {
   const auto *state = static_cast<const FilterState *>(data);
+  if (state->render != nullptr) {
+    state->render->render();
+    return;
+  }
   obs_source_t *target = obs_filter_get_target(state->context);
   const uint32_t width = target != nullptr ? obs_source_get_base_width(target) : 0;
   const uint32_t height = target != nullptr ? obs_source_get_base_height(target) : 0;
@@ -700,6 +813,15 @@ void filter_video_render(void *data, gs_effect_t * /*effect*/) {
   gs_effect_set_vec4(gs_effect_get_param_by_name(solid, "color"), &color);
   while (gs_effect_loop(solid, "Solid")) {
     gs_draw_sprite(nullptr, 0, width, height);
+  }
+}
+
+// Video thread, before rendering: refits the lookahead to the VRAM budget
+// after a resize (a new scheduler generation, never on the render path).
+void filter_video_tick(void *data, float /*seconds*/) {
+  const auto *state = static_cast<const FilterState *>(data);
+  if (state->render != nullptr) {
+    state->render->tick();
   }
 }
 
@@ -716,6 +838,7 @@ obs_source_info make_filter_info() noexcept {
   info.get_defaults = filter_get_defaults;
   info.get_properties = filter_get_properties;
   info.video_render = filter_video_render;
+  info.video_tick = filter_video_tick;
   return info;
 }
 
