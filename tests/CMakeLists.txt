@@ -15,6 +15,9 @@ add_executable(spg-unit-tests
   unit/contracts_test.cpp
   unit/geometry_test.cpp
   unit/json_test.cpp
+  unit/policy_pii_test.cpp
+  unit/policy_sentinel_test.cpp
+  unit/policy_test.cpp
   unit/version_test.cpp)
 target_link_libraries(spg-unit-tests PRIVATE spg::core Catch2::Catch2WithMain)
 target_compile_definitions(spg-unit-tests PRIVATE
