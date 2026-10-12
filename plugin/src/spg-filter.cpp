@@ -6,6 +6,7 @@
 #include "plugin-support.hpp"
 #include "settings/watchlist_store.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -47,6 +48,9 @@ struct FilterState {
   // to the pipeline; until then the filter fails closed regardless.
   std::optional<PolicyConfig> policy;
   FilterIssue issue = FilterIssue::WatchlistStorage;
+  // True once `policy` and `issue` match the fields above; an update that
+  // changes none of them skips the rebuild.
+  bool policy_current = false;
   Notice notice = Notice::None;
 };
 
@@ -135,6 +139,7 @@ WatchlistSnapshot snapshot(FilterState &state) {
 
 // Caller holds state.mutex.
 void rebuild_policy_locked(FilterState &state) {
+  state.policy_current = false;
   const FilterIssue before = state.issue;
   if (state.store_error != StoreError::None) {
     state.policy.reset();
@@ -145,6 +150,12 @@ void rebuild_policy_locked(FilterState &state) {
   if (state.issue != before && state.issue != FilterIssue::None) {
     log(LOG_WARNING, "detection off, covering the whole source: %s", issue_name(state.issue));
   }
+  state.policy_current = true;
+}
+
+WatchlistRefRegistry &ref_registry() {
+  static WatchlistRefRegistry registry;
+  return registry;
 }
 
 // The watch-list reference in the settings, created for a new filter.
@@ -162,7 +173,10 @@ std::string settings_ref(obs_data_t *settings) {
 }
 
 // Writes `next` and, when that succeeds, makes it the filter's watch-list.
-// `replace_ref` installs it even under a new reference (Remove all entries).
+// `replace_ref` installs it even under a new reference (Remove all entries)
+// and releases the old one. Returns false when the write failed, or when an
+// update switched the filter to another watch-list in the meantime (the list
+// written is then not this filter's, so nothing is installed).
 bool save_watchlist(FilterState &state, obs_data_t *settings, WatchlistSnapshot next, bool replace_ref) {
   const StoreError error = WatchlistStore{state.watchlist_dir, next.ref}.save(next.entries);
   if (error != StoreError::None) {
@@ -172,11 +186,15 @@ bool save_watchlist(FilterState &state, obs_data_t *settings, WatchlistSnapshot 
   const std::size_t count = next.entries.size();
   {
     const std::lock_guard lock{state.mutex};
-    if (replace_ref || state.ref == next.ref) {
-      state.ref = std::move(next.ref);
-      state.watchlist = std::move(next.entries);
-      state.store_error = StoreError::None;
+    if (!replace_ref && state.ref != next.ref) {
+      return false;
     }
+    if (state.ref != next.ref) {
+      ref_registry().release(state.ref);
+    }
+    state.ref = std::move(next.ref);
+    state.watchlist = std::move(next.entries);
+    state.store_error = StoreError::None;
   }
   obs_data_set_int(settings, kWatchlistCountKey, static_cast<long long>(count));
   log(LOG_INFO, "watch-list saved: %zu entries", count);
@@ -205,14 +223,11 @@ const char *filter_get_name(void * /*type_data*/) {
   return text("SPG.FilterName");
 }
 
-WatchlistRefRegistry &ref_registry() {
-  static WatchlistRefRegistry registry;
-  return registry;
-}
-
-// Reads the watch-list for `ref`. A reference another live filter holds means
-// this filter is a copy: it gets a new reference and its own copy of the file
-// (written in `ref`'s place in the settings). Runs without the state mutex.
+// Reads the watch-list for `ref` and claims `ref` for this filter. A reference
+// another live filter holds means this filter is a copy: it gets a new
+// reference and its own copy of the file (written in `ref`'s place in the
+// settings). On return `ref` is claimed; after an exception nothing new is
+// held. Runs without the state mutex.
 WatchlistLoad load_or_fork(const FilterState &state, obs_data_t *settings, std::string &ref) {
   const long long expected = obs_data_get_int(settings, kWatchlistCountKey);
   WatchlistLoad loaded = WatchlistStore{state.watchlist_dir, ref}.load(expected);
@@ -221,24 +236,37 @@ WatchlistLoad load_or_fork(const FilterState &state, obs_data_t *settings, std::
   }
   std::string fork = new_watchlist_ref();
   static_cast<void>(ref_registry().claim(fork));  // fresh: never held
-  if (loaded.error == StoreError::None) {
-    loaded.error = WatchlistStore{state.watchlist_dir, fork}.save(loaded.entries);
-    if (loaded.error != StoreError::None) {
-      loaded.entries.clear();
+  try {
+    if (loaded.error == StoreError::None) {
+      loaded.error = WatchlistStore{state.watchlist_dir, fork}.save(loaded.entries);
+      if (loaded.error != StoreError::None) {
+        loaded.entries.clear();
+      }
     }
+    if (loaded.error != StoreError::None) {
+      // A storage error carries over to the copy, which fails closed like its
+      // original. The copy has no file of its own, so record one as expected:
+      // a reload then reports it missing instead of reading the absent file as
+      // a new, empty watch-list. Remove all entries is the way back.
+      obs_data_set_int(settings, kWatchlistCountKey, std::max(expected, 1LL));
+    }
+    obs_data_set_string(settings, kWatchlistRefKey, fork.c_str());
+    log(LOG_INFO, "copied filter: watch-list forked to its own file");
+  } catch (...) {
+    ref_registry().release(fork);
+    throw;
   }
-  // A storage error carries over to the copy, which fails closed like its original.
   ref = std::move(fork);
-  obs_data_set_string(settings, kWatchlistRefKey, ref.c_str());
-  log(LOG_INFO, "copied filter: watch-list forked to its own file");
   return loaded;
 }
 
 void filter_update(void *data, obs_data_t *settings) {
   auto *state = static_cast<FilterState *>(data);
+  std::string ref;
+  bool claimed = false;  // `ref` is held for this filter but not installed yet
   try {
     const FilterSettings clean = read_settings(settings);
-    std::string ref = settings_ref(settings);
+    ref = settings_ref(settings);
     bool reload = false;
     {
       const std::lock_guard lock{state->mutex};
@@ -248,6 +276,7 @@ void filter_update(void *data, obs_data_t *settings) {
     std::optional<WatchlistLoad> loaded;
     if (reload) {
       loaded = load_or_fork(*state, settings, ref);
+      claimed = true;
       if (loaded->error == StoreError::None) {
         set_int_if_changed(settings, kWatchlistCountKey, static_cast<long long>(loaded->entries.size()));
         log(LOG_INFO, "watch-list loaded: %zu entries", loaded->entries.size());
@@ -256,21 +285,29 @@ void filter_update(void *data, obs_data_t *settings) {
       }
     }
     const std::lock_guard lock{state->mutex};
-    state->settings = clean;
     if (loaded) {
       if (state->ref != ref) {
         ref_registry().release(state->ref);
       }
+      claimed = false;
       state->ref = std::move(ref);
       state->store_error = loaded->error;
       state->watchlist = std::move(loaded->entries);
+    } else if (state->policy_current && clean == state->settings) {
+      return;  // same settings and watch-list: the policy is already built
     }
+    state->settings = clean;
     rebuild_policy_locked(*state);
   } catch (...) {
-    // Allocation failure: drop the policy so detection stays off (fail closed).
+    // Allocation failure: drop the policy so detection stays off (fail closed),
+    // and give back a reference this update claimed but did not install.
+    if (claimed) {
+      ref_registry().release(ref);
+    }
     const std::lock_guard lock{state->mutex};
     state->policy.reset();
     state->issue = FilterIssue::InvalidConfig;
+    state->policy_current = false;
   }
 }
 
@@ -387,8 +424,9 @@ bool watchlist_remove_clicked(obs_properties_t * /*props*/, obs_property_t * /*p
   return true;
 }
 
-// Also the way out of a storage error: writes an empty watch-list, under a new
-// reference when the old one was malformed.
+// Also the way out of a storage error: writes an empty watch-list over the
+// old file, or under a new reference when the old one is malformed or its
+// file cannot be replaced (a directory or a foreign file in its place).
 bool watchlist_clear_clicked(obs_properties_t * /*props*/, obs_property_t * /*property*/, void *data) {
   auto *state = static_cast<FilterState *>(data);
   if (state == nullptr) {
@@ -397,15 +435,24 @@ bool watchlist_clear_clicked(obs_properties_t * /*props*/, obs_property_t * /*pr
   obs_data_t *settings = obs_source_get_settings(state->context);
   try {
     WatchlistSnapshot next = snapshot(*state);
-    if (!is_valid_watchlist_ref(next.ref)) {
+    const bool broken = next.error != StoreError::None;
+    next.entries.clear();
+    bool saved = is_valid_watchlist_ref(next.ref) && save_watchlist(*state, settings, next, true);
+    if (!saved && broken) {
       next.ref = new_watchlist_ref();
       static_cast<void>(ref_registry().claim(next.ref));  // fresh: never held
+      try {
+        saved = save_watchlist(*state, settings, next, true);
+      } catch (...) {
+        ref_registry().release(next.ref);
+        throw;
+      }
+      if (!saved) {
+        ref_registry().release(next.ref);
+      }
     }
-    next.entries.clear();
-    const std::string ref = next.ref;
-    const bool saved = save_watchlist(*state, settings, std::move(next), true);
     if (saved) {
-      obs_data_set_string(settings, kWatchlistRefKey, ref.c_str());
+      obs_data_set_string(settings, kWatchlistRefKey, next.ref.c_str());
     }
     obs_data_set_int(settings, kWatchlistSelectedKey, 0);
     finish_action(*state, saved ? Notice::Cleared : Notice::SaveFailed);

@@ -47,10 +47,20 @@ for open question 4, entries never go into filter settings:
 - The masked field `watchlist_new_entry` is moved into the file by Add and is
   erased from the settings in the filter's `save` callback, which OBS calls
   just before writing the scene collection, so an entry typed but never added
-  is not saved there either.
+  is not saved there either. OBS hands that callback the live settings, so a
+  scene collection save (including an autosave) while the user is still
+  typing clears the field: the entry has to be typed again. That is the
+  intended trade: an unsent entry is dropped rather than written to disk.
 - A filter copied in OBS (Duplicate, Copy and Paste Filters) arrives with its
   original's reference. A reference held by another live filter is forked: the
   copy gets a new reference and its own copy of the file.
+- The file is read when a filter is created (on the thread that creates it)
+  and when `update` sees a different reference in the settings. libobs runs a
+  video filter's `update` deferred on the video thread, so a reference changed
+  from outside (a script, obs-websocket) is read there: one file of at most
+  about 128 KiB, plus a synced copy when that reference is held by another
+  filter. OBS's own image source reads its file the same way. The render
+  callback never reads files or takes the filter's lock.
 
 ## Failure handling
 
@@ -64,9 +74,12 @@ whole source (fail closed), with an error in the properties:
 | Malformed `watchlist_ref` (never turned into a path) | Fail closed |
 | Unreadable, not a regular file, corrupt or over the limits | Fail closed |
 | No absolute OBS config directory | Fail closed |
+| A copy of a filter whose watch-list failed to load | Fail closed; the copy has no file, so it records one as expected (`watchlist_count` at least 1) and reports it missing after a reload |
 
 While the store is broken, Add and Remove are disabled; **Remove all entries**
-writes a new empty list (under a new reference if the old one was malformed).
+writes a new empty list over the old file, or under a new reference when the
+old one is malformed or its file cannot be replaced (for example a directory in
+its place). The old reference is released either way.
 
 ## Secrecy
 

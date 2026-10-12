@@ -564,3 +564,15 @@ Template:
   dump exclusion is still open. Windows relies on the profile ACL rather than
   setting one. SPG-14 must read `FilterState::policy`/`issue` and keep the
   whole-source fallback whenever no PolicyConfig is set.
+- Review fixes (Greptile and staff review on `706e941`): (1) a copy of a
+  filter whose watch-list failed to load now records its file as expected
+  (`watchlist_count` at least 1), so after a reload it reports Missing instead
+  of reading the absent file as a healthy empty list. (2) Remove all entries
+  falls back to a new reference when the old file cannot be replaced (a
+  directory in its place) and releases the old reference; `update` releases a
+  claimed reference it failed to install. (3) `update` skips the policy
+  rebuild when neither the settings nor the watch-list changed. Declined:
+  moving the reference-change reload off the video thread (bounded single
+  file read, only on an external reference change; documented in
+  `docs/settings.md`). Mutation checks: reverting (1) failed 2 `plugin.loads`
+  checks, reverting the fallback in (2) failed 4, dropping the release failed 1.

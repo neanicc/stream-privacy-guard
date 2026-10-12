@@ -270,6 +270,81 @@ void check_storage_errors() {
   }
 }
 
+std::string settings_ref_of(obs_source_t *source) {
+  obs_data_t *settings = obs_source_get_settings(source);
+  std::string ref = obs_data_get_string(settings, plugin::kWatchlistRefKey);
+  obs_data_release(settings);
+  return ref;
+}
+
+obs_source_t *filter_with_ref(const char *name, const std::string &ref) {
+  obs_data_t *settings = obs_data_create();
+  obs_data_set_string(settings, plugin::kWatchlistRefKey, ref.c_str());
+  obs_source_t *source = obs_source_create(plugin::kFilterId, name, settings, nullptr);
+  obs_data_release(settings);
+  return source;
+}
+
+// A copy of a filter whose watch-list cannot be read stays broken after a
+// reload, even when the scene file records no entries (an older backup): its
+// missing file must not read as a new, empty watch-list.
+void check_broken_copy(const fs::path &watchlist_dir) {
+  const std::string ref = plugin::new_watchlist_ref();
+  {
+    std::ofstream out(watchlist_dir / (ref + ".txt"), std::ios::binary);
+    out << "not a watch-list\n";
+  }
+  obs_source_t *original = filter_with_ref("spg-corrupt", ref);  // watchlist_count stays 0
+  check(original != nullptr, "a filter with a corrupt watch-list is created");
+  if (original == nullptr) {
+    return;
+  }
+  check(watchlist_info_type(original) == OBS_TEXT_INFO_ERROR, "a corrupt watch-list is shown as an error");
+  obs_source_t *copy = obs_source_duplicate(original, "spg-corrupt-copy", false);
+  check(copy != nullptr, "a filter with a corrupt watch-list can be duplicated");
+  if (copy != nullptr) {
+    check(watchlist_info_type(copy) == OBS_TEXT_INFO_ERROR, "the copy of a corrupt watch-list is an error");
+    obs_data_t *saved = obs_save_source(copy);
+    obs_source_release(copy);
+    obs_source_t *reloaded = obs_load_source(saved);
+    obs_data_release(saved);
+    check(reloaded != nullptr, "the copy loads back from saved data");
+    if (reloaded != nullptr) {
+      check(watchlist_info_type(reloaded) == OBS_TEXT_INFO_ERROR, "the reloaded copy still fails closed");
+      check(!add_enabled(reloaded), "Add stays disabled on the reloaded copy");
+      click(reloaded, plugin::kWatchlistClearKey);
+      check(watchlist_info_type(reloaded) == OBS_TEXT_INFO_NORMAL, "Remove all entries recovers the copy");
+      obs_source_release(reloaded);
+    }
+  }
+  obs_source_release(original);
+}
+
+// "Remove all entries" recovers even when the file cannot be replaced: a
+// directory in its place gets the filter a new reference, and the old one is
+// released.
+void check_unreplaceable_file(const fs::path &watchlist_dir) {
+  const std::string ref = plugin::new_watchlist_ref();
+  fs::create_directories(watchlist_dir / (ref + ".txt"));
+  obs_source_t *source = filter_with_ref("spg-dir-in-place", ref);
+  check(source != nullptr, "a filter whose watch-list path is a directory is created");
+  if (source == nullptr) {
+    return;
+  }
+  check(watchlist_info_type(source) == OBS_TEXT_INFO_ERROR, "a directory in the file's place is an error");
+  click(source, plugin::kWatchlistClearKey);
+  check(watchlist_info_type(source) == OBS_TEXT_INFO_NORMAL, "Remove all entries recovers under a new reference");
+  check(add_enabled(source), "Add works again after recovery");
+  const std::string fresh = settings_ref_of(source);
+  check(plugin::is_valid_watchlist_ref(fresh) && fresh != ref, "the settings hold the new reference");
+
+  // The old reference was released: a filter that names it is not forked.
+  obs_source_t *other = filter_with_ref("spg-dir-in-place-2", ref);
+  check(other != nullptr && settings_ref_of(other) == ref, "Remove all entries releases the old reference");
+  obs_source_release(other);
+  obs_source_release(source);
+}
+
 void run_filter_checks(obs_module_t *module) {
   char *dir = obs_module_get_config_path(module, plugin::kWatchlistDirName);
   const fs::path watchlist_dir = plugin::path_from_utf8(dir);
@@ -277,6 +352,8 @@ void run_filter_checks(obs_module_t *module) {
   check_clamping();
   check_watchlist(watchlist_dir);
   check_storage_errors();
+  check_broken_copy(watchlist_dir);
+  check_unreplaceable_file(watchlist_dir);
 
   // Nothing outside the watch-list directory holds watch-list text.
   std::error_code ec;
