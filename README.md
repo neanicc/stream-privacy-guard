@@ -23,7 +23,7 @@ Supported hosts: Linux x64, macOS on Apple Silicon, Windows x64. From Git Bash
 on Windows:
 
 ```sh
-bash scripts/ci/run.sh setup   # fetch pinned ONNX Runtime, OpenCV and ccache, SHA-256 verified
+bash scripts/ci/run.sh setup   # fetch pinned ONNX Runtime, OpenCV, ccache and models, SHA-256 verified
 bash scripts/ci/run.sh build   # configure and build into build/ (Release, warnings as errors)
 bash scripts/ci/run.sh test    # run all tests with ctest
 build/cli/spg-cli --version                 # Linux and macOS
@@ -36,6 +36,10 @@ does not match. An unpacked dependency is trusted once its `.spg-fetch.json`
 marker matches the manifest; delete `$SPG_CACHE_DIR/deps/<name>/` to force a
 fresh unpack. Catch2 is fetched by CMake, also pinned by hash. ccache from the
 manifest is used automatically and keeps its cache in `$SPG_CACHE_DIR/ccache`.
+The ONNX models in [models/manifest.json](models/manifest.json) (YuNet, PP-OCR
+detection and recognition) go to `$SPG_CACHE_DIR/models/` the same way, through
+`scripts/fetch_models.py`; `--verify` rechecks the cache without downloading.
+Weights never enter Git, and nothing downloads them at runtime.
 To build without ONNX Runtime and OpenCV, configure with `-DSPG_WITH_DEPS=OFF`.
 [docs/ci.md](docs/ci.md) describes the CI checks these commands mirror.
 
