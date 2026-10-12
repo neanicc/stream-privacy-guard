@@ -27,6 +27,14 @@ outside the manifest: Catch2 is fetched by CMake `FetchContent` at configure
 time, pinned by URL and SHA-256 in `tests/CMakeLists.txt`, so the first
 configure needs network access.
 
+Plugin coverage differs by OS. `plugin.loads` (headless libobs: module load,
+filter registration, locale, defaults, property types) runs on macOS and
+Windows only; on Linux the Ubuntu `libobs.so` needs system FFmpeg, PulseAudio
+and Wayland libraries the pins do not provide, so the Linux job proves the
+module builds, links and exports its entry points (`plugin.exports`) and
+nothing more (#27). No job renders through the filter: the fail-closed fill in
+`video_render` is checked only by live OBS ([live check](live-check.md)).
+
 Dependencies, models and the ccache cache (`~/.cache/spg/ccache`) are cached in
 `~/.cache/spg` keyed on the manifests and `CMakeLists.txt`.
 Action references are pinned to commit SHAs.
