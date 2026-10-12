@@ -34,7 +34,7 @@ endif()
 # spg-cli behavior --------------------------------------------------------------
 add_test(NAME cli.version COMMAND spg-cli --version)
 set_tests_properties(cli.version PROPERTIES
-  PASS_REGULAR_EXPRESSION "^spg-cli ${PROJECT_VERSION}\n$")
+  PASS_REGULAR_EXPRESSION "^spg-cli ${PROJECT_VERSION}\r?\n$")
 add_test(NAME cli.help COMMAND spg-cli --help)
 set_tests_properties(cli.help PROPERTIES PASS_REGULAR_EXPRESSION "usage: spg-cli")
 # Unimplemented and unknown commands must exit non-zero.

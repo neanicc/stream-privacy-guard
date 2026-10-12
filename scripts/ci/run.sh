@@ -54,8 +54,26 @@ case "$stage" in
     case "$(uname -s)" in
       MINGW*|MSYS*|CYGWIN*)
         # Git Bash on Windows: Ninja here would pick MinGW gcc, which cannot link
-        # MSVC-built ONNX Runtime or libobs. Use Visual Studio.
-        generator_args=(-G "Visual Studio 17 2022" -A x64)
+        # MSVC-built ONNX Runtime or libobs. Use the newest installed Visual
+        # Studio (runner images move between 2022 and 2026); SPG_CMAKE_GENERATOR
+        # overrides the choice.
+        generator="${SPG_CMAKE_GENERATOR:-}"
+        if [[ -z "$generator" ]]; then
+          # vswhere's documented fixed location.
+          vswhere="$(cygpath -u "C:/Program Files (x86)")/Microsoft Visual Studio/Installer/vswhere.exe"
+          vs_major=""
+          if [[ -x "$vswhere" ]]; then
+            vs_major="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+              -property installationVersion | tr -d '\r' | cut -d. -f1)"
+          fi
+          case "$vs_major" in
+            18) generator="Visual Studio 18 2026" ;;
+            17) generator="Visual Studio 17 2022" ;;
+            *) echo "::error::build: no Visual Studio with C++ tools found (vswhere: '${vs_major}')." >&2; exit 1 ;;
+          esac
+        fi
+        echo "build: using CMake generator '$generator'"
+        generator_args=(-G "$generator" -A x64)
         # CMake is a native Windows program; hand it C:/... rather than /c/...
         cache_dir="$(cygpath -m "$SPG_CACHE_DIR")" ;;
       *)
