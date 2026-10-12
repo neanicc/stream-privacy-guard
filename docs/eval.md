@@ -34,15 +34,107 @@ The scorer prints one line per metric with its threshold, then exactly one of
 required for the current mode to have run. A missing suite is a failure, not a
 skip, in `--local` mode.
 
+## Scoring rules
+
+These settle what the metric definitions leave open. The scorer is
+`eval/spg_eval/scoring.py`.
+
+- Mask plans pair with ground truth by `timestamp_ns`. A frame without a plan,
+  a plan without a frame, or two plans for one timestamp make the input
+  unscorable, which prints `THRESHOLDS: FAIL`. A missing frame is never
+  scored as blurred or as clean.
+- An instance is visible on a frame when its visibility is above 0 and its
+  box, clipped to the frame, has area. Coverage is measured on that clipped box
+  against the union of the plan's rects clipped to the frame.
+- Pair recalls count visible (frame, instance) pairs: `watchlist`, every
+  `pii:*` kind together, and `face`. Per-kind PII recalls are reported in
+  `report.json` without limits. `decoy_blur_rate` also counts visible pairs.
+- A frame is clean when its ground truth lists no sensitive instance at all,
+  visible or not. The generators list every planted item on every frame of its
+  sequence (visibility 0 while it cannot show), so clean frames come only from
+  clean sequences and a mask held over an item that just faded or scrolled away
+  is not charged to the clean-frame budget.
+- A limit whose metric has no data (no clean frames, no watch-list items) fails.
+- `p95_detection_latency_ms` is the nearest-rank 95th percentile of per-cycle
+  latencies that a realtime run supplies; `fail_closed_frame_rate` counts plans
+  with `fallback: true`.
+- Every key in a `[suite.*]` table other than `required_in`, `resolution` and
+  `fps` must be `<metric>_min` or `<metric>_max` for a metric the scorer
+  computes; anything else is an error, so a typo cannot silently drop a limit.
+- Output lines and `report.*` hold metric values and counts only, never the
+  text of a planted item.
+
+## Generated suites
+
+`eval/generate.py` writes a suite as:
+
+```
+<suite>/suite.json                 index: suite, seed, profile, fps (60), sequences
+<suite>/policy.json                schema-1 policy config with the suite's synthetic watch-list
+<suite>/<seq>/frames/000000.png    RGB frames in Source pixels
+<suite>/<seq>/ground_truth.jsonl   one ground-truth document per frame (docs/contracts.md)
+<plans>/<seq>/mask_plans.jsonl     one mask plan per frame, written by the pipeline
+```
+
+- **Text.** Five templates, each with its own motion: a chat panel that
+  scrolls, a notification toast that slides in and fades out, a browser address
+  bar where a string is typed (partial reveal), an account window that fades in
+  or stays static, and a game HUD over a panning scene that fades in and out.
+  Sequences alternate 1080p and 720p and every fourth is clean (filler text and
+  decoys only). Half of the planted secrets are watch-list entries. Profiles:
+  `ci` is 10 sequences of 40 frames, `full` 30 of 90.
+- **Faces.** Crops of the pinned dataset pasted as webcam-style overlays (face
+  height 40 to 320 px at 1080p, one to three per frame, static or drifting, some
+  fading in) on generated desktop and game backgrounds. Every fourth sequence has
+  no faces. Profiles: `ci` 6 x 30 frames, `full` 24 x 60.
+- **Boxes.** An item's box is its full box clipped to the panel it is drawn in
+  and to the frame, since nothing outside those can show. Partial reveal does
+  not shrink the box. Visibility is opacity x revealed fraction x the share of
+  the box left after clipping.
+- **Synthetic content.** Watch-list entries are invented names, a street
+  address and a handle. PII uses reserved or fictional ranges (example.com
+  emails, 555-01xx phones in NANP 3-3-4 or E.164 form, Luhn-valid cards on a
+  test BIN, documentation IP ranges, token-shaped strings). Decoys are near
+  misses a correct policy must not blur: watch-list look-alikes beyond the
+  default fuzzy limits, Luhn-invalid cards, phones with an invalid area code,
+  version strings with octets above 255, handles, short token prefixes, dates
+  and times. `eval/spg_eval/synth.py` states the rules.
+- **Text rendering** uses Pillow's bundled Aileron Regular font (CC0). Pillow
+  is pinned per interpreter and platform in `eval/pydeps.json` and fetched into
+  `$SPG_CACHE_DIR` with its SHA-256 checked; nothing is installed into Python.
+- **Faces dataset.** LFW, pinned with its license under `datasets` in
+  `models/manifest.json` and fetched on first use of the faces suite into
+  `$SPG_CACHE_DIR/deps/dataset-lfw/`. LFW has no per-image face box; its images
+  are face detections enlarged 2.2 times and centered, so the pinned
+  `face_box` is the central 114 px square of the 250 px image. The generated
+  frames show real people: they stay in the local output directory.
+
 ## Sanity checks the scorer must keep passing
 
 - A pipeline that blurs nothing fails every recall threshold.
 - A pipeline that blurs every frame entirely fails `clean_frame_blur_area_max`.
+- A pipeline that masks exactly the visible sensitive boxes passes, which shows
+  the limits can be met on the generated suites.
 - Re-running the generator with the same seed produces byte-identical ground truth.
 
-## Commands (available after SPG-03 and SPG-11)
+`tests/scripts/test_scorer.py` and `tests/scripts/test_generators.py` (ctest
+`scoring.*`) check these, and `run_eval.py` repeats the first three on every
+suite it generates before it scores a pipeline.
+
+## Commands
 
 ```sh
 scripts/ci/run.sh eval            # CI mode: text suite only
 scripts/ci/run.sh eval --local    # all suites, required for acceptance
+
+eval/generate.py text --out eval-out/text --profile ci           # one suite
+eval/score.py --mode ci --suite text=eval-out/text               # plans in the suite directory
+eval/score.py --mode ci --suite text=eval-out/text --reference noop
 ```
+
+`run.sh eval` calls `eval/run_eval.py`, which generates the suites for the
+mode, runs the sanity checks, then runs the pipeline and scores it. Until
+SPG-11 provides `spg-cli run`, `run_pipeline()` in that file raises and the
+driver prints `THRESHOLDS: NOT RUN`, which passes in CI mode and fails in local
+mode. SPG-11 plugs the pipeline in there; SPG-16 supplies the realtime suite's
+latencies.
