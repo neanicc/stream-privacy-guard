@@ -369,3 +369,64 @@ Template:
   SPG-03's generator should emit NANP-valid phones (area code and exchange
   2-9, 3-3-4 grouping) or the scorer will count misses this validator rejects
   by design; postcodes and non-US address forms are not detected.
+
+## 2026-10-12 — SPG-15 Settings and watch-list storage (#PR)
+
+- Decision / change: plan question 4 resolved with the recommended default.
+  Watch-list entries never enter OBS filter settings (saved in plain text in
+  the scene collection): settings keep `watchlist_ref` (32 random hex digits)
+  and `watchlist_count`, and the entries live in
+  `<OBS config>/plugin_config/obs-spg/watchlists/<ref>.txt`, `0600` in a `0700`
+  directory on macOS/Linux (tightened again on load), the per-user `%APPDATA%`
+  ACL on Windows; written to a user-only temporary file, synced (POSIX) and
+  renamed. OS keychain stays a later option. Properties per plan section 7
+  (`docs/settings.md`): masked entry (OBS password field) with Add, a numbered
+  entry list with Remove selected and Remove all; category checkboxes;
+  sensitivity (`standard` = spg-core fuzzy defaults, `high` = 3 edits, 0.3,
+  partials from 5; no preset below the defaults; placeholders for SPG-12);
+  lookahead, hold, fallback (no fail-open choice), debug overlay (off). Other
+  choices: (1) clamps for values from scene files are written back to the
+  settings: lookahead [100, 2000] ms, hold [250, 10000] ms (floors raise unsafe
+  values; ceilings are safe and bound VRAM); unknown sensitivity or fallback
+  names become the defaults. SPG-08b (#28) is choosing spg-core floors in
+  parallel; if its floors are higher, the plugin constants must rise to match,
+  and until then spg-core's rejection fails closed. (2) Fail closed on storage:
+  a missing file while `watchlist_count` > 0, a malformed reference (never
+  turned into a path), an unreadable or corrupt file, no absolute config
+  directory, all categories off, or a config spg-core rejects all drop the
+  PolicyConfig and show an error; Add/Remove are refused until Remove all
+  writes a new empty list. (3) The masked field is moved into the file by Add
+  and erased in the `save` callback, which libobs calls just before
+  `obs_save_source` serializes settings, so a typed-but-unadded entry is not
+  saved either. (4) A filter duplicated in OBS arrives with its original's
+  reference; a process-wide registry forks the copy to its own file, so
+  removing an entry from the copy cannot remove it from the original after a
+  restart. (5) Video filters' `update` runs deferred on the video thread
+  (libobs `obs_source_update`), so no file I/O runs while the filter mutex is
+  held; the file is read only on create or a reference change. Limits: 256
+  entries of 256 bytes. Settings logic is an OBS-free static library
+  (`obs-spg-settings`) so it is tested on Linux too.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang):
+  `scripts/ci/run.sh build` and `test` pass, 119/119 ctest tests (14 new
+  `plugin.settings.*` cases plus an extended `plugin.loads`). Unit cases cover
+  clamping (0, negative, LLONG_MIN/MAX), unknown names, the PolicyConfig
+  mapping, references, entry checks, file format round trip and every rejection,
+  user-only modes after each save and after a loosened file, and a sentinel run
+  with std streams captured. `plugin.loads` (headless libobs, macOS and Windows
+  only) creates filters, clamps scene-file values, presses Add/Remove/Remove
+  all through `obs_property_button_clicked`, duplicates and reloads a filter,
+  and checks the captured libobs log, `obs_save_source` JSON and every file
+  outside the watch-list directory for sentinel fragments. Mutation checks:
+  dropping the `save`-callback erase failed 2 `plugin.loads` checks; logging
+  the entry on Add failed the log check; creating the file `0644` failed the
+  unit and `plugin.loads` mode checks (the unit test first passed because it
+  only checked after a load had tightened the mode; fixed).
+- Eval delta: none; no pipeline stage reads these settings yet (SPG-10/14).
+- Open issues or follow-ups: live check in OBS on the dev Mac (human): the
+  masked field, buttons and refresh in the real properties view, and that a
+  saved scene collection holds no entry text. Watch-list files of deleted
+  filters stay on disk (OBS gives no reliable delete-vs-undo signal). Entries
+  sit in process memory and, if typed, in OBS's in-memory undo stack; crash
+  dump exclusion is still open. Windows relies on the profile ACL rather than
+  setting one. SPG-14 must read `FilterState::policy`/`issue` and keep the
+  whole-source fallback whenever no PolicyConfig is set.

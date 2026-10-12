@@ -1,24 +1,70 @@
 // plugin.loads: start a headless libobs (no video, no UI), load the obs-spg
-// module the way OBS does and check what it registers.
+// module the way OBS does and check what it registers. Then create filters
+// and drive their settings and watch-list buttons the way the OBS properties
+// view does, capturing every libobs log line, to check clamping, fail-closed
+// storage errors, and that watch-list text never reaches the log or the saved
+// scene collection data (SPG-15). All entries are synthetic.
 //
-//   obs-spg-load-test <module binary> <module data directory>
+//   obs-spg-load-test <module binary> <module data directory> <config directory>
 
 #include <obs.h>
 
+#include "settings/watchlist_store.hpp"
 #include "spg-filter.hpp"
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
+namespace fs = std::filesystem;
+namespace plugin = spg::plugin;
+
 int failures = 0;
+std::string captured_log;
+
+// Synthetic watch-list entries and fragments of them (raw and as spg-core
+// folds them) that must never appear in a log or in saved settings. The
+// digits are not a fragment: a log line can hold them by chance (an address).
+constexpr const char *kSentinel = "Qorvexian Blathermoor 7319";
+constexpr const char *kTypedOnly = "Wyndlequist Pellinore";
+constexpr const char *kFragments[] = {"Qorvexian",   "qorvexian",   "qorvexlan", "Blathermoor", "lathermo",
+                                      "Wyndlequist", "wyndlequlst", "Pellinore", "pellinore"};
 
 void check(bool ok, const char *what) {
   std::printf("%s: %s\n", ok ? "ok  " : "FAIL", what);
   if (!ok) {
     ++failures;
+  }
+}
+
+bool contains_secret(std::string_view text) {
+  for (const char *fragment : kFragments) {
+    if (text.find(fragment) != std::string_view::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Captures every libobs log line, the plugin's included, and echoes it.
+void capture_log(int /*level*/, const char *format, va_list args, void * /*param*/) {
+  char line[4096];
+  va_list copy;
+  va_copy(copy, args);
+  const int written = std::vsnprintf(line, sizeof(line), format, copy);
+  va_end(copy);
+  if (written >= 0) {
+    captured_log += line;
+    captured_log += '\n';
+    std::printf("log: %s\n", line);
   }
 }
 
@@ -32,16 +78,229 @@ bool is_filter_type(const char *wanted) {
   return false;
 }
 
+std::string read_file(const fs::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// Clicks a button the way the properties view does: with the source as object.
+bool click(obs_source_t *source, const char *key) {
+  obs_properties_t *props = obs_source_properties(source);
+  const bool refreshed = obs_property_button_clicked(obs_properties_get(props, key), source);
+  obs_properties_destroy(props);
+  return refreshed;
+}
+
+obs_text_info_type watchlist_info_type(obs_source_t *source) {
+  obs_properties_t *props = obs_source_properties(source);
+  const obs_text_info_type type = obs_property_text_info_type(obs_properties_get(props, plugin::kWatchlistInfoKey));
+  obs_properties_destroy(props);
+  return type;
+}
+
+bool add_enabled(obs_source_t *source) {
+  obs_properties_t *props = obs_source_properties(source);
+  const bool enabled = obs_property_enabled(obs_properties_get(props, plugin::kWatchlistAddKey));
+  obs_properties_destroy(props);
+  return enabled;
+}
+
+std::string saved_json(obs_source_t *source) {
+  obs_data_t *saved = obs_save_source(source);
+  std::string json = obs_data_get_json(saved);
+  obs_data_release(saved);
+  return json;
+}
+
+// Values from a scene file are clamped and written back; a new filter gets a
+// watch-list reference.
+void check_clamping() {
+  obs_data_t *settings = obs_data_create();
+  obs_data_set_int(settings, plugin::kLookaheadKey, 0);
+  obs_data_set_int(settings, plugin::kHoldKey, 9999999);
+  obs_data_set_string(settings, plugin::kFallbackKey, "show_unscanned");
+  obs_data_set_string(settings, plugin::kSensitivityKey, "lenient");
+  obs_source_t *source = obs_source_create(plugin::kFilterId, "spg-clamp", settings, nullptr);
+  obs_data_release(settings);
+  check(source != nullptr, "filter source is created");
+  if (source == nullptr) {
+    return;
+  }
+  obs_data_t *applied = obs_source_get_settings(source);
+  check(obs_data_get_int(applied, plugin::kLookaheadKey) == plugin::kMinLookaheadMs,
+        "lookahead 0 from a scene file is raised to the floor");
+  check(obs_data_get_int(applied, plugin::kHoldKey) == plugin::kMaxHoldMs, "an oversized hold is capped");
+  check(std::string_view{obs_data_get_string(applied, plugin::kFallbackKey)} == "blur_source",
+        "an unknown fallback becomes blur_source");
+  check(std::string_view{obs_data_get_string(applied, plugin::kSensitivityKey)} == "standard",
+        "an unknown sensitivity becomes standard");
+  check(plugin::is_valid_watchlist_ref(obs_data_get_string(applied, plugin::kWatchlistRefKey)),
+        "a new filter gets a watch-list reference");
+  obs_data_release(applied);
+  obs_source_release(source);
+
+  // obs_source_update defers a video filter's update to the next video tick,
+  // which a headless libobs never runs, so each case is a new filter.
+  settings = obs_data_create();
+  obs_data_set_int(settings, plugin::kLookaheadKey, 999999);
+  obs_data_set_int(settings, plugin::kHoldKey, -5);
+  source = obs_source_create(plugin::kFilterId, "spg-clamp-2", settings, nullptr);
+  obs_data_release(settings);
+  check(source != nullptr, "second filter source is created");
+  if (source == nullptr) {
+    return;
+  }
+  applied = obs_source_get_settings(source);
+  check(obs_data_get_int(applied, plugin::kLookaheadKey) == plugin::kMaxLookaheadMs,
+        "an oversized lookahead is capped");
+  check(obs_data_get_int(applied, plugin::kHoldKey) == plugin::kMinHoldMs, "a negative hold is raised to the floor");
+  obs_data_release(applied);
+  obs_source_release(source);
+}
+
+void check_watchlist(const fs::path &watchlist_dir) {
+  obs_source_t *source = obs_source_create(plugin::kFilterId, "spg-watchlist", nullptr, nullptr);
+  check(source != nullptr, "filter source is created without settings");
+  if (source == nullptr) {
+    return;
+  }
+  obs_data_t *settings = obs_source_get_settings(source);
+  const std::string ref = obs_data_get_string(settings, plugin::kWatchlistRefKey);
+  const fs::path file = watchlist_dir / (ref + ".txt");
+  check(watchlist_info_type(source) == OBS_TEXT_INFO_NORMAL, "an empty watch-list is not an error");
+
+  // Type an entry into the masked field and press Add.
+  obs_data_set_string(settings, plugin::kWatchlistNewEntryKey, kSentinel);
+  check(click(source, plugin::kWatchlistAddKey), "Add asks OBS to refresh the properties");
+  check(!obs_data_has_user_value(settings, plugin::kWatchlistNewEntryKey), "Add clears the masked field");
+  check(obs_data_get_int(settings, plugin::kWatchlistCountKey) == 1, "the settings record one entry");
+  check(read_file(file).find(kSentinel) != std::string::npos, "the entry is in the watch-list file");
+#ifndef _WIN32
+  constexpr fs::perms kOthers = fs::perms::group_all | fs::perms::others_all;
+  check((fs::status(file).permissions() & kOthers) == fs::perms::none, "the watch-list file is user-only");
+#endif
+
+  obs_data_set_string(settings, plugin::kWatchlistNewEntryKey, "qorvexian  BLATHERMOOR 7319");
+  click(source, plugin::kWatchlistAddKey);
+  check(obs_data_get_int(settings, plugin::kWatchlistCountKey) == 1, "a duplicate entry is not added");
+
+  // An entry typed but never added must not be saved in the scene collection.
+  obs_data_set_string(settings, plugin::kWatchlistNewEntryKey, kTypedOnly);
+  const std::string json = saved_json(source);
+  check(!contains_secret(json), "saved scene collection data holds no watch-list text");
+  check(json.find(ref) != std::string::npos, "saved scene collection data holds the reference");
+  check(!contains_secret(obs_data_get_json(settings)), "saving erased the unsent masked entry");
+
+  // The entry list shows numbers only.
+  obs_properties_t *props = obs_source_properties(source);
+  obs_property_t *list = obs_properties_get(props, plugin::kWatchlistSelectedKey);
+  check(obs_property_list_item_count(list) == 1, "the entry list has one item");
+  check(!contains_secret(obs_property_list_item_name(list, 0)), "the entry list shows no entry text");
+  obs_properties_destroy(props);
+
+  obs_data_set_int(settings, plugin::kWatchlistSelectedKey, 0);
+  click(source, plugin::kWatchlistRemoveKey);
+  check(obs_data_get_int(settings, plugin::kWatchlistCountKey) == 0, "Remove deletes the entry");
+  check(read_file(file).find(kSentinel) == std::string::npos, "the removed entry is gone from the file");
+
+  // Add it back so the file has an entry.
+  obs_data_set_string(settings, plugin::kWatchlistNewEntryKey, kSentinel);
+  click(source, plugin::kWatchlistAddKey);
+
+  // A duplicated filter forks its own watch-list file: emptying the copy
+  // leaves the original's entries alone.
+  obs_source_t *copy = obs_source_duplicate(source, "spg-watchlist-copy", false);
+  check(copy != nullptr, "the filter can be duplicated");
+  if (copy != nullptr) {
+    obs_data_t *copy_settings = obs_source_get_settings(copy);
+    const std::string copy_ref = obs_data_get_string(copy_settings, plugin::kWatchlistRefKey);
+    check(plugin::is_valid_watchlist_ref(copy_ref) && copy_ref != ref, "the copy gets its own reference");
+    check(obs_data_get_int(copy_settings, plugin::kWatchlistCountKey) == 1, "the copy starts with the same entries");
+    obs_data_release(copy_settings);
+    click(copy, plugin::kWatchlistClearKey);
+    check(read_file(file).find(kSentinel) != std::string::npos, "emptying the copy keeps the original's file");
+    obs_source_release(copy);
+  }
+
+  // Reload from saved scene collection data.
+  obs_data_t *saved = obs_save_source(source);
+  obs_data_release(settings);
+  obs_source_release(source);
+
+  obs_source_t *loaded = obs_load_source(saved);
+  obs_data_release(saved);
+  check(loaded != nullptr, "the filter loads back from saved data");
+  if (loaded != nullptr) {
+    check(watchlist_info_type(loaded) == OBS_TEXT_INFO_NORMAL, "the reloaded filter finds its watch-list");
+    obs_source_release(loaded);
+  }
+}
+
+// A watch-list that cannot be read turns detection off and shows an error;
+// "Remove all entries" is the way back.
+void check_storage_errors() {
+  obs_data_t *settings = obs_data_create();
+  obs_data_set_string(settings, plugin::kWatchlistRefKey, plugin::new_watchlist_ref().c_str());
+  obs_data_set_int(settings, plugin::kWatchlistCountKey, 2);  // a scene file moved without its watch-list
+  obs_source_t *missing = obs_source_create(plugin::kFilterId, "spg-missing", settings, nullptr);
+  obs_data_release(settings);
+  check(missing != nullptr, "a filter with a missing watch-list is created");
+  if (missing != nullptr) {
+    check(watchlist_info_type(missing) == OBS_TEXT_INFO_ERROR, "a missing watch-list is shown as an error");
+    check(!add_enabled(missing), "Add is disabled while the watch-list is broken");
+    click(missing, plugin::kWatchlistClearKey);
+    check(watchlist_info_type(missing) == OBS_TEXT_INFO_NORMAL, "Remove all entries starts a new watch-list");
+    check(add_enabled(missing), "Add works again");
+    obs_source_release(missing);
+  }
+
+  settings = obs_data_create();
+  obs_data_set_string(settings, plugin::kWatchlistRefKey, "../../escape");
+  obs_source_t *bad = obs_source_create(plugin::kFilterId, "spg-bad-ref", settings, nullptr);
+  obs_data_release(settings);
+  check(bad != nullptr, "a filter with a malformed reference is created");
+  if (bad != nullptr) {
+    check(watchlist_info_type(bad) == OBS_TEXT_INFO_ERROR, "a malformed reference is shown as an error");
+    click(bad, plugin::kWatchlistClearKey);
+    obs_data_t *fixed = obs_source_get_settings(bad);
+    check(plugin::is_valid_watchlist_ref(obs_data_get_string(fixed, plugin::kWatchlistRefKey)),
+          "Remove all entries replaces a malformed reference");
+    obs_data_release(fixed);
+    obs_source_release(bad);
+  }
+}
+
+void run_filter_checks(obs_module_t *module) {
+  char *dir = obs_module_get_config_path(module, plugin::kWatchlistDirName);
+  const fs::path watchlist_dir = plugin::path_from_utf8(dir);
+  bfree(dir);
+  check_clamping();
+  check_watchlist(watchlist_dir);
+  check_storage_errors();
+
+  // Nothing outside the watch-list directory holds watch-list text.
+  std::error_code ec;
+  for (const auto &item : fs::recursive_directory_iterator(watchlist_dir.parent_path().parent_path(), ec)) {
+    if (item.is_regular_file() && item.path().parent_path() != watchlist_dir) {
+      check(!contains_secret(read_file(item.path())), "no watch-list text outside the watch-list files");
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 3) {
-    std::fprintf(stderr, "usage: %s <module binary> <module data directory>\n", argv[0]);
+  if (argc != 4) {
+    std::fprintf(stderr, "usage: %s <module binary> <module data directory> <config directory>\n", argv[0]);
     return 2;
   }
-  namespace plugin = spg::plugin;
+  const fs::path config_dir = plugin::path_from_utf8(argv[3]);
+  std::error_code ec;
+  fs::remove_all(config_dir, ec);
+  fs::create_directories(config_dir);
 
-  if (!obs_startup("en-US", nullptr, nullptr)) {
+  base_set_log_handler(capture_log, nullptr);
+  if (!obs_startup("en-US", argv[3], nullptr)) {
     std::fprintf(stderr, "FAIL: obs_startup\n");
     return 1;
   }
@@ -66,8 +325,13 @@ int main(int argc, char **argv) {
     if (defaults != nullptr) {
       check(obs_data_get_int(defaults, plugin::kLookaheadKey) == plugin::kDefaultLookaheadMs,
             "lookahead defaults to 500 ms");
-      check(obs_data_get_int(defaults, plugin::kHoldKey) == plugin::kDefaultHoldMs,
-            "hold defaults to 750 ms");
+      check(obs_data_get_int(defaults, plugin::kHoldKey) == plugin::kDefaultHoldMs, "hold defaults to 750 ms");
+      check(std::string_view{obs_data_get_string(defaults, plugin::kFallbackKey)} == "blur_source",
+            "fallback defaults to blur_source");
+      check(!obs_data_get_bool(defaults, plugin::kDebugOverlayKey), "debug overlay defaults to off");
+      for (const spg::Category category : spg::kAllCategories) {
+        check(obs_data_get_bool(defaults, plugin::category_key(category).c_str()), "every category defaults to on");
+      }
       obs_data_release(defaults);
     }
 
@@ -81,12 +345,38 @@ int main(int argc, char **argv) {
       obs_property_t *lookahead = obs_properties_get(props, plugin::kLookaheadKey);
       check(lookahead != nullptr && obs_property_get_type(lookahead) == OBS_PROPERTY_INT,
             "lookahead is an integer property");
-      check(obs_properties_get(props, plugin::kHoldKey) != nullptr, "hold property exists");
+      check(obs_property_int_min(lookahead) == plugin::kMinLookaheadMs &&
+                obs_property_int_max(lookahead) == plugin::kMaxLookaheadMs,
+            "lookahead slider matches the clamp range");
+      obs_property_t *hold = obs_properties_get(props, plugin::kHoldKey);
+      check(hold != nullptr && obs_property_int_min(hold) == plugin::kMinHoldMs &&
+                obs_property_int_max(hold) == plugin::kMaxHoldMs,
+            "hold slider matches the clamp range");
+      obs_property_t *entry = obs_properties_get(props, plugin::kWatchlistNewEntryKey);
+      check(entry != nullptr && obs_property_get_type(entry) == OBS_PROPERTY_TEXT &&
+                obs_property_text_type(entry) == OBS_TEXT_PASSWORD,
+            "watch-list entry is a masked (password) field");
+      for (const spg::Category category : spg::kAllCategories) {
+        check(obs_properties_get(props, plugin::category_key(category).c_str()) != nullptr,
+              "every category has a checkbox");
+      }
+      for (const char *key : {plugin::kSensitivityKey, plugin::kFallbackKey, plugin::kDebugOverlayKey,
+                              plugin::kWatchlistAddKey, plugin::kWatchlistSelectedKey, plugin::kWatchlistRemoveKey,
+                              plugin::kWatchlistClearKey}) {
+        check(obs_properties_get(props, key) != nullptr, key);
+      }
       obs_properties_destroy(props);
     }
+
+    run_filter_checks(module);
   }
 
   obs_shutdown();
+  base_set_log_handler(nullptr, nullptr);
+
+  check(!contains_secret(captured_log), "no watch-list text in the libobs log");
+  check(captured_log.find("[obs-spg] watch-list saved") != std::string::npos,
+        "the log capture saw the plugin's own lines");
   std::printf("%d failure(s)\n", failures);
   return failures == 0 ? 0 : 1;
 }
