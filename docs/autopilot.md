@@ -21,7 +21,7 @@ spawns subagents that each implement or repair one PR in their own git worktree.
 Required:
 
 1. **Tools:** `claude update`, then `brew install gh cmake`. Check
-   `python3 --version` is 3.11 or newer (`brew install python@3.12` if not). You
+   `python3 --version` is 3.12 or newer (`brew install python@3.12` if not). You
    need Xcode or its command line tools for the compiler.
 2. **GitHub login:** `gh auth login`, then `gh auth refresh -s workflow`. The first
    push includes CI files, and GitHub rejects that over HTTPS without this permission.
