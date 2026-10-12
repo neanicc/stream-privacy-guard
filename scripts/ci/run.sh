@@ -8,7 +8,9 @@
 #   scripts/ci/run.sh eval [--local]   setup + build, then run eval suites and score them
 #                                      against eval/thresholds.toml
 #
-# setup fetches the archives pinned in deps/manifest.json (SHA-256 verified);
+# setup fetches the archives pinned in deps/manifest.json (SHA-256 verified)
+# and, for the OBS plugin, builds libobs from the pinned OBS sources on macOS and
+# Windows (build-aux/build_libobs.py; cached after the first run);
 # build configures CMake against them and uses the pinned ccache; test runs
 # ctest, which fails when no tests are registered. A stage whose inputs do not
 # exist yet reports that and succeeds; once they exist it must do its real work.
@@ -30,17 +32,63 @@ has_build() { [[ -f CMakeLists.txt ]]; }
 # Windows runners expose `python`, not always `python3`.
 py="$(command -v python3 || command -v python || true)"
 
+# The OBS plugin (plugin/) builds by default and CI always builds it. Set
+# SPG_BUILD_PLUGIN=0 to skip its inputs (libobs, obs-deps) in setup and build.
+build_plugin="${SPG_BUILD_PLUGIN:-1}"
+case "$build_plugin" in
+  1|ON|on|true) build_plugin=1 ;;
+  0|OFF|off|false) build_plugin=0 ;;
+  *) echo "::error::SPG_BUILD_PLUGIN must be 0 or 1 (got '$build_plugin')." >&2; exit 2 ;;
+esac
+
+is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+
+# Git Bash on Windows: Ninja there would pick MinGW gcc, which cannot link
+# MSVC-built ONNX Runtime or libobs. Use the newest installed Visual Studio
+# (runner images move between 2022 and 2026); SPG_CMAKE_GENERATOR overrides.
+windows_generator() {
+  if [[ -n "${SPG_CMAKE_GENERATOR:-}" ]]; then
+    echo "$SPG_CMAKE_GENERATOR"
+    return
+  fi
+  # vswhere's documented fixed location.
+  local vswhere vs_major=""
+  vswhere="$(cygpath -u "C:/Program Files (x86)")/Microsoft Visual Studio/Installer/vswhere.exe"
+  if [[ -x "$vswhere" ]]; then
+    vs_major="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+      -property installationVersion | tr -d '\r' | cut -d. -f1)"
+  fi
+  case "$vs_major" in
+    18) echo "Visual Studio 18 2026" ;;
+    17) echo "Visual Studio 17 2022" ;;
+    *) echo "::error::no Visual Studio with C++ tools found (vswhere: '${vs_major}')." >&2; return 1 ;;
+  esac
+}
+
 case "$stage" in
   setup)
     if ! has_build; then
       echo "::notice::setup: no CMakeLists.txt yet (SPG-01 not landed)."
       exit 0
     fi
+    fetch_args=(--cache "$SPG_CACHE_DIR")
+    if [[ "$build_plugin" == 0 ]]; then fetch_args+=(--skip-group plugin); fi
     if [[ -f scripts/fetch_deps.py ]]; then
-      "$py" scripts/fetch_deps.py --cache "$SPG_CACHE_DIR"
+      "$py" scripts/fetch_deps.py "${fetch_args[@]}"
     fi
     if [[ -f scripts/fetch_models.py ]]; then
       "$py" scripts/fetch_models.py --cache "$SPG_CACHE_DIR"
+    fi
+    # libobs for the plugin: built from the pinned OBS sources on macOS and
+    # Windows (cached in $SPG_CACHE_DIR/deps/libobs); Linux uses the pinned
+    # official Ubuntu package that fetch_deps.py unpacked.
+    if [[ "$build_plugin" == 1 ]]; then
+      libobs_args=(--cache "$SPG_CACHE_DIR")
+      if is_windows; then
+        generator="$(windows_generator)"
+        libobs_args=(--cache "$(cygpath -m "$SPG_CACHE_DIR")" --generator "$generator")
+      fi
+      "$py" build-aux/build_libobs.py "${libobs_args[@]}"
     fi
     ;;
 
@@ -51,34 +99,17 @@ case "$stage" in
     fi
     generator_args=()
     cache_dir="$SPG_CACHE_DIR"
-    case "$(uname -s)" in
-      MINGW*|MSYS*|CYGWIN*)
-        # Git Bash on Windows: Ninja here would pick MinGW gcc, which cannot link
-        # MSVC-built ONNX Runtime or libobs. Use the newest installed Visual
-        # Studio (runner images move between 2022 and 2026); SPG_CMAKE_GENERATOR
-        # overrides the choice.
-        generator="${SPG_CMAKE_GENERATOR:-}"
-        if [[ -z "$generator" ]]; then
-          # vswhere's documented fixed location.
-          vswhere="$(cygpath -u "C:/Program Files (x86)")/Microsoft Visual Studio/Installer/vswhere.exe"
-          vs_major=""
-          if [[ -x "$vswhere" ]]; then
-            vs_major="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
-              -property installationVersion | tr -d '\r' | cut -d. -f1)"
-          fi
-          case "$vs_major" in
-            18) generator="Visual Studio 18 2026" ;;
-            17) generator="Visual Studio 17 2022" ;;
-            *) echo "::error::build: no Visual Studio with C++ tools found (vswhere: '${vs_major}')." >&2; exit 1 ;;
-          esac
-        fi
-        echo "build: using CMake generator '$generator'"
-        generator_args=(-G "$generator" -A x64)
-        # CMake is a native Windows program; hand it C:/... rather than /c/...
-        cache_dir="$(cygpath -m "$SPG_CACHE_DIR")" ;;
-      *)
-        if command -v ninja >/dev/null 2>&1; then generator_args=(-G Ninja); fi ;;
-    esac
+    if is_windows; then
+      generator="$(windows_generator)"
+      echo "build: using CMake generator '$generator'"
+      generator_args=(-G "$generator" -A x64)
+      # CMake is a native Windows program; hand it C:/... rather than /c/...
+      cache_dir="$(cygpath -m "$SPG_CACHE_DIR")"
+    elif command -v ninja >/dev/null 2>&1; then
+      generator_args=(-G Ninja)
+    fi
+    plugin_flag=OFF
+    if [[ "$build_plugin" == 1 ]]; then plugin_flag=ON; fi
     # ccache (pinned in deps/manifest.json) keeps its cache under $SPG_CACHE_DIR,
     # which CI restores between runs. CMakeLists.txt decides whether to use it.
     export CCACHE_DIR="${CCACHE_DIR:-$SPG_CACHE_DIR/ccache}"
@@ -86,7 +117,7 @@ case "$stage" in
     export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-500M}"
     # The +-expansion keeps bash 3.2 (macOS /bin/bash) happy under set -u.
     cmake -S . -B "$build_dir" ${generator_args[@]+"${generator_args[@]}"} \
-      -DCMAKE_BUILD_TYPE=Release -DSPG_CACHE_DIR="$cache_dir"
+      -DCMAKE_BUILD_TYPE=Release -DSPG_CACHE_DIR="$cache_dir" -DSPG_BUILD_PLUGIN="$plugin_flag"
     ccache_bin="$(sed -n 's/^SPG_CCACHE_PROGRAM:FILEPATH=//p' "$build_dir/CMakeCache.txt")"
     if [[ -n "$ccache_bin" && "$ccache_bin" != *NOTFOUND ]]; then
       "$ccache_bin" --zero-stats >/dev/null

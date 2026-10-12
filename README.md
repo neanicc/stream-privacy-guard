@@ -12,8 +12,9 @@ blurring the whole source. Some things will still get through; the eval in this
 repo measures how often.
 
 > Status: pre-alpha. The build foundation exists (`spg-core`, `spg-cli`, tests
-> and pinned dependencies); the detection pipeline and the OBS plugin do not yet.
-> Nothing here protects a stream today.
+> and pinned dependencies), and an OBS plugin shell registers the filter, but
+> the detection pipeline does not exist yet: the filter covers the whole source
+> (fails closed) instead of blurring regions. Nothing here protects a stream today.
 
 ## Quickstart (developers)
 
@@ -41,6 +42,11 @@ detection and recognition) go to `$SPG_CACHE_DIR/models/` the same way, through
 `scripts/fetch_models.py`; `--verify` rechecks the cache without downloading.
 Weights never enter Git, and nothing downloads them at runtime.
 To build without ONNX Runtime and OpenCV, configure with `-DSPG_WITH_DEPS=OFF`.
+The OBS plugin (`plugin/`, module `obs-spg`) builds by default: `setup` unpacks
+the official OBS 32.1.2 Ubuntu package on Linux and, on macOS and Windows, builds
+libobs once from the pinned OBS sources (Xcode or Visual Studio, a few minutes;
+cached in `$SPG_CACHE_DIR/deps/libobs`). Set `SPG_BUILD_PLUGIN=0` for `setup`
+and `build` to skip it.
 [docs/ci.md](docs/ci.md) describes the CI checks these commands mirror.
 
 ## How it works

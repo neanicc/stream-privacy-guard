@@ -14,8 +14,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# spg-core is linked into the OBS plugin, a shared module.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(SPG_BUILD_TESTS "Build unit and integration tests" ON)
+option(SPG_BUILD_PLUGIN "Build the OBS plugin (obs-spg); needs libobs from scripts/ci/run.sh setup" OFF)
 option(SPG_WITH_DEPS "Use the prebuilt ONNX Runtime and OpenCV pinned in deps/manifest.json" ON)
 option(SPG_USE_CCACHE "Use ccache (from deps/manifest.json or PATH) when available" ON)
 
@@ -33,4 +36,9 @@ add_subdirectory(cli)
 if(SPG_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# After enable_testing() so the plugin's own tests register.
+if(SPG_BUILD_PLUGIN)
+  add_subdirectory(plugin)
 endif()
