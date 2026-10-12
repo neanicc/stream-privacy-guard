@@ -196,7 +196,7 @@ Template:
   committed fixtures in `tests/fixtures/contracts/` to keep the Python side in
   step with the C++ parser.
 
-## 2026-10-12 — SPG-08 Policy engine (#PR)
+## 2026-10-12 — SPG-08 Policy engine (#30)
 
 - Decision / change: `spg::PolicyEngine` (`core/include/spg/policy.hpp`,
   `core/src/policy/`) turns recognized text into a `Verdict` of reason codes;
