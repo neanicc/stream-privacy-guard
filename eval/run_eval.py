@@ -62,25 +62,32 @@ def _timing_line(name: str, timing: dict) -> str:
     stages = timing.get("stages", {})
     parts = [f"{stage} p50 {stages[stage]['p50_ms']:.1f} ms" for stage in ("cycle", "text_detect", "face_detect")
              if stage in stages]
+    late = f", {timing['late_frames']} late" if timing.get("late_frames") else ""
     return (f"pipeline: {name} {timing['frames']} frames, {timing['fail_closed_frames']} fail-closed, "
-            f"{timing['padding_frames']} padding; " + ", ".join(parts))
+            f"{timing['padding_frames']} padding{late}; " + ", ".join(parts))
 
 
-def run_pipeline(build_dir: Path, suite_dir: Path, plans_dir: Path) -> dict:
+def run_pipeline(build_dir: Path, suite_dir: Path, plans_dir: Path, cache: Path) -> dict:
     """Run spg-cli on every sequence in suite_dir, writing <plans_dir>/<seq>/mask_plans.jsonl.
 
     `spg-cli eval` reads the suite's frames, policy.json and fps from
     suite.json and drives the scheduler offline (simulated time, fixed cycle
-    length; docs/cli.md). Returns its timing report.
+    length; docs/cli.md), with the models from `cache`. Returns its timing
+    report.
     """
     timing = plans_dir / "timing.json"
     _run([str(find_cli(build_dir)), "eval", "--suite", str(suite_dir), "--plans", str(plans_dir),
-          "--timing", str(timing)])
+          "--timing", str(timing), "--cache", str(cache)])
     return json.loads(timing.read_text(encoding="utf-8"))
 
 
-def run_realtime(build_dir: Path, source_dir: Path, plans_dir: Path, spec: dict) -> tuple[scoring.SuiteRun, dict]:
-    """Replay source_dir's sequences at spec's resolution and fps on the wall clock.
+def run_realtime(build_dir: Path, source_dir: Path, plans_dir: Path, spec: dict,
+                 cache: Path) -> tuple[scoring.SuiteRun, dict]:
+    """Replay source_dir's sequences at spec's resolution and fps on the wall clock, with the models from `cache`.
+
+    A frame the replay could not feed on time keeps its due timestamp in
+    spg-cli, so the delay counts in its latency and fail-closed frames
+    (docs/cli.md); the late count is printed with the timing line.
 
     Returns the realtime suite run (those sequences' ground truth, the
     realtime plans and the per-cycle latencies) and the bench report.
@@ -91,7 +98,7 @@ def run_realtime(build_dir: Path, source_dir: Path, plans_dir: Path, spec: dict)
                                  f"{index.get('fps')} fps")
     report_path = plans_dir / "bench.json"
     command = [str(find_cli(build_dir)), "bench", "--realtime", "--suite", str(source_dir), "--plans", str(plans_dir),
-               "--report", str(report_path)]
+               "--report", str(report_path), "--cache", str(cache)]
     if "resolution" in spec:
         command += ["--resolution", str(spec["resolution"])]
     _run(command)
@@ -154,14 +161,15 @@ def main(argv: list[str]) -> int:
             # Plans left by an earlier run must never be scored as this run's output.
             plans_dir = args.out / "plans" / name
             shutil.rmtree(plans_dir, ignore_errors=True)
-            timing = run_pipeline(args.build_dir, suite_dir, plans_dir)
+            timing = run_pipeline(args.build_dir, suite_dir, plans_dir, args.cache)
             lines.append(_timing_line(name, timing))
             runs[name] = suite.load_run(suite_dir, plans_dir)
         realtime = thresholds["suite"].get("realtime")
         if realtime is not None and args.mode in realtime["required_in"]:
             plans_dir = args.out / "plans" / "realtime"
             shutil.rmtree(plans_dir, ignore_errors=True)
-            runs["realtime"], bench = run_realtime(args.build_dir, suite_dirs[REALTIME_SOURCE], plans_dir, realtime)
+            runs["realtime"], bench = run_realtime(args.build_dir, suite_dirs[REALTIME_SOURCE], plans_dir, realtime,
+                                                   args.cache)
             lines.append(_timing_line("realtime", bench))
         print("\n".join(line for line in lines if line.startswith("pipeline:")))
         report = scoring.evaluate(thresholds, runs, args.mode)

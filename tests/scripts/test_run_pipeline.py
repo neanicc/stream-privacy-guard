@@ -64,10 +64,12 @@ def fake_generate_suite(name: str, out: Path, seed: int, profile: str, cache: Pa
 class FakeCli:
     """Stands in for spg-cli eval / bench --realtime: writes plans and a timing report."""
 
-    def __init__(self, pipeline: str = "oracle", latency_ms: float = 120.0, exit_code: int = 0) -> None:
+    def __init__(self, pipeline: str = "oracle", latency_ms: float = 120.0, exit_code: int = 0,
+                 late_frames: int = 0) -> None:
         self.pipeline = pipeline
         self.latency_ms = latency_ms
         self.exit_code = exit_code
+        self.late_frames = late_frames
         self.commands: list[list[str]] = []
 
     def __call__(self, command: list[str]) -> None:
@@ -85,6 +87,8 @@ class FakeCli:
                   "stages": {"cycle": {"p50_ms": 150.0}, "text_detect": {"p50_ms": 120.0}},
                   "sequences": [{"name": name} for name in truth],
                   "latencies_ms": [self.latency_ms] * 20}
+        if command[1] == "bench":
+            report["late_frames"] = self.late_frames
         key = "--timing" if command[1] == "eval" else "--report"
         Path(arg[key]).write_text(json.dumps(report))
 
@@ -153,6 +157,21 @@ class DriverTests(unittest.TestCase):
         self.assertTrue(realtime["run"])
         self.assertEqual(realtime["metrics"]["p95_detection_latency_ms"]["value"], 120.0)
         self.assertEqual(realtime["metrics"]["fail_closed_frame_rate"]["value"], 0.0)
+
+    def test_every_cli_call_uses_the_chosen_cache(self) -> None:
+        # Models fetched into a custom cache must be the ones spg-cli opens.
+        cli = FakeCli("oracle")
+        self.run_driver("local", cli)
+        self.assertEqual([c[1] for c in cli.commands], ["eval", "eval", "bench"])
+        for command in cli.commands:
+            with self.subTest(command[1]):
+                self.assertIn("--cache", command)
+                self.assertEqual(Path(command[command.index("--cache") + 1]).name, "cache")
+
+    def test_realtime_line_reports_late_frames(self) -> None:
+        cli = FakeCli("oracle", late_frames=3)
+        _, stdout, _ = self.run_driver("local", cli)
+        self.assertIn("pipeline: realtime 20 frames, 0 fail-closed, 30 padding, 3 late;", stdout)
 
     def test_local_mode_fails_slow_detection(self) -> None:
         code, stdout, report = self.run_driver("local", FakeCli("oracle", latency_ms=900.0))

@@ -41,8 +41,12 @@ policy's lookahead, retro window, hold, margin and fallback.
 - **Realtime** (`bench --realtime`): `spg::Scheduler` with worker threads and
   `SteadyClock`. A decoder thread keeps up to 16 frames ready; the feed pushes
   one frame every `1/fps` s and releases due frames, as the plugin's render
-  callback will. Frames pushed more than one period late (decoding fell
-  behind) are counted as `late_frames`.
+  callback will. Each frame is stamped with the time it was due, not the
+  time it was pushed: a live source keeps its pace, so when decoding falls
+  behind, the delay is spent from the frame's lookahead and counted in its
+  detection latency (and fail-closed frames) rather than slowing the feed
+  the workers see. Frames pushed more than one period late are counted as
+  `late_frames`, which `eval/run_eval.py` prints with the realtime line.
 - **Padding.** After the last frame both keep pushing copies of it until every
   real frame is released. A live source keeps producing frames; without them
   the last `retro` of every sequence could never be covered by a later scan
@@ -52,8 +56,9 @@ policy's lookahead, retro window, hold, margin and fallback.
   (scale 1 scans the full frame). SPG-14 decides the plugin's readback size;
   the CLI default must follow it.
 - Detection latency per cycle: from its frame's timestamp to its end (the
-  simulated end, or in realtime the end of the cycle's last stage call; the
-  apply under the scheduler's lock is not included).
+  simulated end, or in realtime the end of the cycle's last stage call,
+  policy calls included; the apply under the scheduler's lock is not
+  included).
 
 ## Stage timing
 
@@ -78,7 +83,10 @@ BGRA pixels. It is the reference the GPU effect (SPG-14) must match or exceed.
   mixing only pixels of the same rect; pixelate uses blocks of
   `max(8, 0.25 * shorter side)`; solid fill is black. A blur or pixelate
   rect under 2 px on a side is filled instead, since a 1x1 blur or block
-  returns the pixel unchanged. Alpha is left alone.
+  returns the pixel unchanged. Blur and pixelate mix alpha with the colour
+  channels and a filled pixel is opaque, so a source whose content is in its
+  alpha (black text on a transparent background) is hidden too, as the GPU
+  effect does ([plugin-render.md](plugin-render.md)).
 - `BlurSource`: the whole frame blurred. `SolidFill`: the whole frame filled.
   `HoldLastScanned` is the caller's job (show the re-emitted frame; the CLI
   keeps the last clean composed frame); drawn by `compose()` it blurs the
@@ -87,7 +95,8 @@ BGRA pixels. It is the reference the GPU effect (SPG-14) must match or exceed.
 - Rect capacity: `kMaskRectCapacity` = 64 rects per frame. The GPU effect
   draws a fixed array, so every plan is fitted with `fit_mask_rects()` before
   it is drawn or written: rects inside another are dropped, then the pair
-  whose hull adds the least area merges until 64 remain (stronger style wins).
+  whose hull adds the least area beyond their union (overlap counted once)
+  merges until 64 remain (stronger style wins).
   Every input rect stays inside some output rect, so fitting only adds blur.
   The scheduler's `max_retro_rects` (64) and the tracker's
   `max_rects_per_track` (8, so eight tracks fit unmerged) are capped at the
@@ -108,8 +117,8 @@ without the project's warning flags. The pipeline commands need the
 
 `tests/unit/compose_test.cpp` (`unit.*`, `[compose]`): fitting never loses
 coverage (200 seeded scenes up to 300 rects), pixels outside the rects never
-change, alpha never changes, detail inside is gone, fallbacks cover the whole
-frame. `tests/unit/cli_test.cpp` (`cli.*`): the simulated driver against
+change, detail inside is gone, in colour and in alpha, fallbacks cover the
+whole frame. `tests/unit/cli_test.cpp` (`cli.*`): the simulated driver against
 scripted stages (timestamps, retroactive coverage from the first frame,
 padding, determinism with a fixed cycle, fail closed on slow, throwing or
 missing stages, capacity), the realtime driver, and `run`, `eval` and `bench`

@@ -1598,9 +1598,21 @@ Template:
   pixelate rect under 2 px on a side was drawn unchanged (a 1x1 box blur or
   block is the pixel itself); such rects are now filled, with a unit case for
   1x1, 1xN and Nx1 rects in both styles. P3 (prefetch thread and
-  `StageTimes`) declined: `StageTimes::add` takes its mutex.
-- Open issues or follow-ups: live OBS not tested (the plugin does not use the
-  pipeline until SPG-14); GPU parity with this reference compositor is
-  SPG-14's; whether the blur defeats OCR is SPG-18's. The `NOT RUN` mention
+  `StageTimes`) declined: `StageTimes::add` takes its mutex. (3) Greptile,
+  after merging main (SPG-10b/10c/14/14b/14c, #65): the compositor left alpha
+  untouched, so black text on a transparent background stayed readable
+  through its alpha after any mask or fallback; blur and pixelate now mix
+  alpha too and a fill is opaque, as the GPU effect already does
+  ([plugin-render.md](plugin-render.md)). `fit_mask_rects()` counted the
+  overlap of two rects twice and could merge an overlapping pair over a
+  pair whose hull adds nothing; the cost is now the hull minus their union.
+  The realtime feed stamped a frame when decoding let it in, so a stalled
+  decoder slowed the feed instead of showing as latency; frames now keep
+  their due time. Policy calls now end the realtime cycle in the latency
+  log, and `run_eval.py` passes its `--cache` to `spg-cli` and prints the
+  realtime late-frame count. Each has a unit or driver test.
+- Open issues or follow-ups: live OBS not tested; the plugin (SPG-14) draws
+  with its GPU effect, not this compositor, and GPU parity with this
+  reference is SPG-14's; whether the blur defeats OCR is SPG-18's. The `NOT RUN` mention
   in the human-owned autopilot skill is left for a human.
 
