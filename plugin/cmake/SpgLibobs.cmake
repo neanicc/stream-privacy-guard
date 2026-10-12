@@ -48,8 +48,9 @@ elseif(SPG_PLATFORM STREQUAL "macos-arm64" OR SPG_PLATFORM STREQUAL "windows-x64
   if(APPLE)
     set(libobs_DIR "${SPG_LIBOBS_PREFIX}/Frameworks/libobs.framework/Resources/cmake" CACHE PATH "libobs CMake package (pinned)" FORCE)
   else()
-    set(libobs_DIR "${SPG_LIBOBS_PREFIX}/lib/cmake/libobs" CACHE PATH "libobs CMake package (pinned)" FORCE)
-    set(w32-pthreads_DIR "${SPG_LIBOBS_PREFIX}/lib/cmake/w32-pthreads" CACHE PATH "w32-pthreads CMake package (pinned)" FORCE)
+    # OBS installs every package config of its Windows Development component flat in <prefix>/cmake.
+    set(libobs_DIR "${SPG_LIBOBS_PREFIX}/cmake" CACHE PATH "libobs CMake package (pinned)" FORCE)
+    set(w32-pthreads_DIR "${SPG_LIBOBS_PREFIX}/cmake" CACHE PATH "w32-pthreads CMake package (pinned)" FORCE)
   endif()
 else()
   message(FATAL_ERROR "SPG_BUILD_PLUGIN: no libobs for ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}; "
