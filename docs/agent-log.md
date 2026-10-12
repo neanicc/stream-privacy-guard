@@ -736,3 +736,20 @@ Template:
   Not verified anywhere: that WER leaves the regions out of a real crash
   dump on Windows, or that a Linux core file omits them (the `dd` flag is
   checked, not a core file).
+- Review fixes (Greptile and staff review on `40e98ad`): (1) the store reads
+  the watch-list through one descriptor to end of file, capped one byte past
+  the size limit, instead of trusting an earlier `file_size()`; a file that
+  grew between the two could be cut at a line end and load as a shorter
+  list. (2) Add rejects a field a script set to the empty string instead of
+  falling back to text typed earlier. (3) Size classes now reach 16 KiB
+  (eleven classes), so `evaluate()`'s temporaries for a line of up to 4096
+  code points reuse shared blocks with no system call, and a large block's
+  map, exclude, lock and their undo calls run outside the heap's mutex.
+  (4) `docs/policy.md` records that `std::bad_alloc` from the engine must
+  make the caller apply the fallback. (5) `append_utf8` is shared with
+  `to_utf8` (templated over the string type). Mutation checks: restoring
+  the old Add fallback failed 2 `plugin.loads` checks; mapping a large
+  region under the lock failed the new lock-scope unit case (after its 5 s
+  wait, no hang). The read race itself is not reproducible without a hook
+  between stat and open; the new case reads a ~127 KB list across every
+  buffer growth.

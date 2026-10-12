@@ -63,14 +63,18 @@ struct SecureHeapStats {
 };
 
 // A small thread-safe allocator over protected regions. Requests up to
-// kMaxSmallBlock bytes come from fixed size classes (16 to 4096 bytes) carved
-// out of shared regions of kRegionBytes; larger ones get a region of their
-// own, unmapped when released. Shared regions are kept for reuse until the heap
-// is destroyed; their free blocks are zero.
+// kMaxSmallBlock bytes come from fixed size classes (16 bytes to 16 KiB) carved
+// out of shared regions of kRegionBytes, so the policy engine's per-call
+// temporaries (a folded line of up to 4096 code points) reuse blocks without a
+// system call. Larger requests get a region of their own, unmapped when
+// released; the map, exclude, lock and their undo calls for such a region run
+// outside the heap's mutex, so they never stall another thread's small
+// allocation. Shared regions are kept for reuse until the heap is destroyed;
+// their free blocks are zero.
 class SecureHeap {
  public:
   static constexpr std::size_t kAlignment = 16;
-  static constexpr std::size_t kMaxSmallBlock = 4096;
+  static constexpr std::size_t kMaxSmallBlock = std::size_t{16} * 1024;
   static constexpr std::size_t kRegionBytes = std::size_t{64} * 1024;
 
   explicit SecureHeap(SecureMemoryPlatform& platform);
@@ -99,7 +103,7 @@ class SecureHeap {
   [[nodiscard]] static SecureHeap& process();
 
  private:
-  static constexpr std::size_t kClasses = 9;  // 16 << 0 .. 16 << 8
+  static constexpr std::size_t kClasses = 11;  // 16 << 0 .. 16 << 10
 
   struct Region {
     unsigned char* base = nullptr;
@@ -108,8 +112,12 @@ class SecureHeap {
     bool locked = false;
   };
 
-  [[nodiscard]] Region map_region(std::size_t bytes);  // caller holds mutex_
-  void release_region(const Region& region) noexcept;  // caller holds mutex_
+  // Maps, excludes and locks a region. Touches no member but platform_, so it
+  // runs with or without mutex_ held. Throws std::bad_alloc.
+  [[nodiscard]] Region new_region(std::size_t bytes);
+  // Unlocks, includes and unmaps a region; with or without mutex_ held.
+  void release_region(const Region& region) noexcept;
+  [[nodiscard]] void* allocate_large(std::size_t bytes);
   void wiped(const unsigned char* block, std::size_t bytes) const noexcept;
 
   SecureMemoryPlatform& platform_;

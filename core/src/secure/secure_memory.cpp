@@ -167,8 +167,7 @@ SecureHeap& SecureHeap::process() {
   return *heap;
 }
 
-SecureHeap::Region SecureHeap::map_region(std::size_t bytes) {
-  regions_.reserve(regions_.size() + 1);  // may throw; nothing is mapped yet
+SecureHeap::Region SecureHeap::new_region(std::size_t bytes) {
   Region region;
   region.bytes = bytes;
   region.base = static_cast<unsigned char*>(platform_.map(bytes));
@@ -177,7 +176,6 @@ SecureHeap::Region SecureHeap::map_region(std::size_t bytes) {
   }
   region.excluded = platform_.exclude_from_dumps(region.base, bytes);
   region.locked = platform_.lock(region.base, bytes);
-  regions_.push_back(region);
   return region;
 }
 
@@ -191,22 +189,38 @@ void SecureHeap::release_region(const Region& region) noexcept {
   platform_.unmap(region.base, region.bytes);
 }
 
+// The system calls for a large block run without mutex_: only registering the
+// region in regions_ needs it.
+void* SecureHeap::allocate_large(std::size_t bytes) {
+  const std::size_t page = std::max<std::size_t>(platform_.page_size(), kAlignment);
+  if (bytes > std::numeric_limits<std::size_t>::max() - page) {
+    throw std::bad_alloc();
+  }
+  const Region region = new_region(round_up(bytes, page));
+  try {
+    const std::lock_guard lock{mutex_};
+    regions_.push_back(region);
+    ++live_blocks_;
+  } catch (...) {
+    release_region(region);  // still zero: nothing was handed out
+    throw;
+  }
+  return region.base;
+}
+
 void* SecureHeap::allocate(std::size_t bytes) {
   bytes = std::max<std::size_t>(bytes, 1);
-  const std::lock_guard lock{mutex_};
-  const std::size_t page = std::max<std::size_t>(platform_.page_size(), kAlignment);
   if (bytes > kMaxSmallBlock) {
-    if (bytes > std::numeric_limits<std::size_t>::max() - page) {
-      throw std::bad_alloc();
-    }
-    const Region region = map_region(round_up(bytes, page));
-    ++live_blocks_;
-    return region.base;
+    return allocate_large(bytes);
   }
+  const std::lock_guard lock{mutex_};
   const std::size_t index = size_class(bytes);
   if (free_lists_[index] == nullptr) {
     const std::size_t block = class_bytes(index);
-    const Region region = map_region(round_up(kRegionBytes, page));
+    const std::size_t page = std::max<std::size_t>(platform_.page_size(), kAlignment);
+    regions_.reserve(regions_.size() + 1);  // may throw; nothing is mapped yet
+    const Region region = new_region(round_up(std::max(kRegionBytes, block), page));
+    regions_.push_back(region);
     // Thread the new blocks onto the free list, lowest address first.
     void* next = nullptr;
     for (std::size_t i = region.bytes / block; i-- > 0;) {
@@ -228,21 +242,28 @@ void SecureHeap::deallocate(void* block, std::size_t bytes) noexcept {
     return;
   }
   bytes = std::max<std::size_t>(bytes, 1);
-  const std::lock_guard lock{mutex_};
-  --live_blocks_;
   if (bytes > kMaxSmallBlock) {
-    const auto found = std::find_if(regions_.begin(), regions_.end(),
-                                    [block](const Region& region) { return region.base == block; });
-    if (found == regions_.end()) {
-      return;  // not ours; never happens through SecureAllocator or Secret
+    Region region;
+    {
+      const std::lock_guard lock{mutex_};
+      --live_blocks_;
+      const auto found = std::find_if(regions_.begin(), regions_.end(),
+                                      [block](const Region& r) { return r.base == block; });
+      if (found == regions_.end()) {
+        return;  // not ours; never happens through SecureAllocator or Secret
+      }
+      region = *found;
+      regions_.erase(found);
+      // The region is no longer in regions_, so no other thread can reach it;
+      // wiping under the lock keeps the observer call serialized.
+      secure_wipe(region.base, region.bytes);
+      wiped(region.base, region.bytes);
     }
-    const Region region = *found;
-    regions_.erase(found);
-    secure_wipe(region.base, region.bytes);
-    wiped(region.base, region.bytes);
     release_region(region);
     return;
   }
+  const std::lock_guard lock{mutex_};
+  --live_blocks_;
   const std::size_t index = size_class(bytes);
   auto* const bytes_ptr = static_cast<unsigned char*>(block);
   secure_wipe(bytes_ptr, class_bytes(index));

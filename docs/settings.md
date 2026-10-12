@@ -117,7 +117,9 @@ user types and the field keeps showing the dots. libobs also runs the callback
 whenever the properties are built (`obs_source_properties` applies the
 settings), which resets `pending_entry` to the empty field a rebuilt view
 shows: Add never adds text the field no longer shows. Add takes the text from
-the settings if a script left it there, otherwise from `pending_entry`.
+the settings if a script left it there, otherwise from `pending_entry`; a
+field a script set to the empty string counts as empty, so Add rejects it
+rather than adding text typed earlier.
 
 Other undo paths: deleting a filter or pasting filters stores
 `obs_save_source` output, which runs the `save` callback first; resetting a
@@ -142,8 +144,9 @@ an entry that spg-core or the plugin makes lives in `SecureHeap`
 (`core/include/spg/secure_memory.hpp`):
 
 - Regions are page-aligned anonymous mappings (`mmap`, `VirtualAlloc`). Blocks
-  up to 4 KiB come from size classes in shared 64 KiB regions; larger ones get
-  a region of their own.
+  up to 16 KiB (a folded line of 4096 code points) come from size classes in
+  shared 64 KiB regions, kept for reuse; larger ones get a region of their
+  own, mapped and unmapped outside the heap's lock.
 - Each region is excluded from crash dumps where the OS has a call for it,
   before any block in it is used: `madvise(MADV_DONTDUMP)` on Linux,
   `WerRegisterExcludedMemoryBlock` on Windows. macOS has none.

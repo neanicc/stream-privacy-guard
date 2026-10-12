@@ -23,8 +23,9 @@ Every check first folds the text:
   is not full NFKC, and characters outside those blocks pass through.
 - Zero-width characters (U+200B..U+200D, U+2060, U+FEFF) and soft hyphens are
   deleted; control characters and Unicode whitespace become one space.
-- A malformed UTF-8 byte becomes U+FFFD, which separates words. Evaluation never
-  throws on recognized text.
+- A malformed UTF-8 byte becomes U+FFFD, which separates words. No text makes
+  evaluation throw; only running out of protected memory does (see
+  [Secrecy](#secrecy)).
 
 ## Watch-list matching
 
@@ -89,3 +90,15 @@ typed entry), are in [settings.md](settings.md#watch-list-text-in-memory).
 `evaluate()` costs O(entries × entry length × text length) per call, with up to
 three passes per entry, and has no length cap of its own. It is meant for a
 worker thread; the OCR stage that calls it should bound the text it passes in.
+Its temporaries for a line of up to 4096 code points reuse blocks of the
+shared heap, so after warm-up a call makes no system call and holds the heap's
+lock only to take and return blocks; a longer line maps a region of its own
+per temporary (outside the lock).
+
+**Requirement on callers (SPG-10 scheduler, SPG-07 OCR stage):** the
+`PolicyEngine` constructor and `evaluate()` throw `std::bad_alloc` when
+`SecureHeap` cannot map a region (`mmap` or `VirtualAlloc` failed, for
+example at `vm.max_map_count`). `mlock` and dump exclusion are best effort;
+mapping is not. The caller must catch it and treat the frame as not scanned,
+so the configured fallback applies (default: blur the whole source). An
+exception from the policy stage must never let an unscanned frame through.

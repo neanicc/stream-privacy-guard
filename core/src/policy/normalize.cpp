@@ -139,27 +139,13 @@ SecureU32String matching_form(std::u32string_view folded) {
   return out;
 }
 
-// append_utf8 (contracts/utf8.hpp) for a SecureString: the bytes never pass
-// through an ordinary std::string.
+// UTF-8 straight into a SecureString: the bytes never pass through an
+// ordinary std::string.
 SecureString to_utf8(std::u32string_view text) {
   SecureString out;
   out.reserve(text.size());
   for (const char32_t cp : text) {
-    if (cp < 0x80) {
-      out.push_back(static_cast<char>(cp));
-    } else if (cp < 0x800) {
-      out.push_back(static_cast<char>(0xC0U | (cp >> 6U)));
-      out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
-    } else if (cp < 0x10000) {
-      out.push_back(static_cast<char>(0xE0U | (cp >> 12U)));
-      out.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU)));
-      out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
-    } else {
-      out.push_back(static_cast<char>(0xF0U | (cp >> 18U)));
-      out.push_back(static_cast<char>(0x80U | ((cp >> 12U) & 0x3FU)));
-      out.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU)));
-      out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
-    }
+    append_utf8(out, cp);
   }
   return out;
 }

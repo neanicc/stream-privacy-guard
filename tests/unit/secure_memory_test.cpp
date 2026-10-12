@@ -5,6 +5,8 @@
 // offers: on Linux /proc/self/smaps must show the "dd" (do not dump) flag on
 // the mapping that holds a Secret's text. All text here is synthetic.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -12,7 +14,9 @@
 #include <new>
 #include <sstream>
 #include <string>
+#include <functional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -43,9 +47,14 @@ class RecordingPlatform final : public spg::SecureMemoryPlatform {
   bool map_fails = false;
   std::vector<Call> mapped, unmapped, excluded, included, locked, unlocked;
   std::vector<std::string> order;  // "map", "exclude", "lock", "unlock", "include", "unmap"
+  // Runs inside map() and unmap(), with the region's size.
+  std::function<void(std::size_t)> on_map, on_unmap;
 
   [[nodiscard]] std::size_t page_size() const noexcept override { return kPage; }
   [[nodiscard]] void* map(std::size_t bytes) noexcept override {
+    if (on_map) {
+      on_map(bytes);
+    }
     if (map_fails) {
       return nullptr;
     }
@@ -58,6 +67,9 @@ class RecordingPlatform final : public spg::SecureMemoryPlatform {
     return region;
   }
   void unmap(void* region, std::size_t bytes) noexcept override {
+    if (on_unmap) {
+      on_unmap(bytes);
+    }
     unmapped.push_back({region, bytes});
     order.emplace_back("unmap");
     ::operator delete(region, std::align_val_t{kPage});
@@ -204,7 +216,7 @@ TEST_CASE("a large block gets its own region, wiped and released when freed", "[
   REQUIRE(platform.mapped.size() == 1);
   const Call region = platform.mapped.front();
   CHECK(region.region == block);
-  CHECK(region.bytes == 2 * RecordingPlatform::kPage);
+  CHECK(region.bytes == (size / RecordingPlatform::kPage + 1) * RecordingPlatform::kPage);
   CHECK(platform.excluded == std::vector<Call>{region});
 
   std::fill(block, block + size, static_cast<unsigned char>('q'));
@@ -218,6 +230,75 @@ TEST_CASE("a large block gets its own region, wiped and released when freed", "[
   CHECK(platform.unmapped == std::vector<Call>{region});
   CHECK(platform.included == std::vector<Call>{region});
   CHECK(heap.stats().regions == 0);
+}
+
+TEST_CASE("a folded line of 4096 code points reuses a shared block", "[secure]") {
+  // The policy engine folds each recognized line into a SecureU32String; a
+  // 4096-character line is 16 KiB. Repeated calls must not map anything new.
+  RecordingPlatform platform;
+  spg::SecureHeap heap{platform};
+  constexpr std::size_t kLine = 4096 * sizeof(char32_t);
+  static_assert(kLine == spg::SecureHeap::kMaxSmallBlock);
+  void* first = heap.allocate(kLine);
+  REQUIRE(platform.mapped.size() == 1);
+  CHECK(platform.mapped.front().bytes == spg::SecureHeap::kRegionBytes);
+  CHECK(inside(first, platform.mapped.front()));
+  heap.deallocate(first, kLine);
+  for (int i = 0; i < 100; ++i) {
+    void* again = heap.allocate(kLine);
+    CHECK(again == first);
+    heap.deallocate(again, kLine);
+  }
+  CHECK(platform.mapped.size() == 1);
+  CHECK(platform.unmapped.empty());
+  CHECK(heap.stats().live_blocks == 0);
+}
+
+TEST_CASE("a large block's system calls run outside the heap's lock", "[secure]") {
+  // While the heap maps or unmaps a large region, another thread's small
+  // allocation must still go through (it has a free block, so it needs no
+  // system call of its own).
+  RecordingPlatform platform;
+  spg::SecureHeap heap{platform};
+  heap.deallocate(heap.allocate(8), 8);
+
+  std::thread other;
+  std::atomic<bool> other_done{false};
+  bool ran_during_call = false;
+  const auto small_allocation_meanwhile = [&](std::size_t bytes) {
+    if (bytes <= spg::SecureHeap::kRegionBytes || other.joinable()) {
+      return;  // a shared region, or already started
+    }
+    other_done = false;
+    other = std::thread([&heap, &other_done] {
+      heap.deallocate(heap.allocate(8), 8);
+      other_done = true;
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!other_done && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    ran_during_call = other_done;
+  };
+  constexpr std::size_t kLarge = 2 * spg::SecureHeap::kRegionBytes;
+
+  platform.on_map = small_allocation_meanwhile;
+  void* block = heap.allocate(kLarge);
+  if (other.joinable()) {
+    other.join();  // only after allocate() returned, so a held lock cannot hang the test
+  }
+  CHECK(ran_during_call);
+  platform.on_map = nullptr;
+
+  ran_during_call = false;
+  platform.on_unmap = small_allocation_meanwhile;
+  heap.deallocate(block, kLarge);
+  if (other.joinable()) {
+    other.join();
+  }
+  CHECK(ran_during_call);
+  platform.on_unmap = nullptr;
+  CHECK(heap.stats().live_blocks == 0);
 }
 
 TEST_CASE("the heap keeps working when the platform refuses exclusion or locking", "[secure]") {

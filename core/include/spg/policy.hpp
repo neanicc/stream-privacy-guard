@@ -62,6 +62,10 @@ class PolicyEngine {
   CategorySet categories_;
   FuzzyLimits fuzzy_;
   // Normalized entries, in protected memory like the Secrets they come from.
+  // The vector's own buffer is on SecureAllocator too, so a short entry held
+  // in a string's inline (short-string) buffer is covered here. evaluate()'s
+  // temporaries are local objects: their inline buffers sit on the worker's
+  // stack (docs/settings.md, "Watch-list text in memory").
   std::vector<SecureU32String, SecureAllocator<SecureU32String>> watchlist_;
 };
 
