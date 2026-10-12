@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -54,15 +55,35 @@ SessionOptions cpu_only() {
   return options;
 }
 
-// The first default provider this build offers, else CPU: what open() must pick.
-Provider expected_default_provider() {
+// With default options, open() tries the platform defaults in order, then CPU,
+// and keeps the first provider that loads and warms up. A provider listed in
+// the build can still fail on a given machine (no GPU, driver error), so this
+// checks the recorded attempts rather than assuming the first listed works:
+// every attempt before the selected one failed with a reason, the selected one
+// is last, and providers missing from the build were skipped as such.
+void check_default_selection(const Session& session) {
+  std::vector<Provider> order = spg::runtime::default_providers();
+  order.push_back(Provider::Cpu);
   const auto available = spg::runtime::available_providers();
-  for (const Provider provider : spg::runtime::default_providers()) {
-    if (contains(available, provider)) {
-      return provider;
+  const auto& attempts = session.attempts();
+  REQUIRE_FALSE(attempts.empty());
+  REQUIRE(attempts.size() <= order.size());
+  for (std::size_t i = 0; i < attempts.size(); ++i) {
+    const bool last = i + 1 == attempts.size();
+    CHECK(attempts[i].provider == order[i]);
+    CHECK(attempts[i].selected == last);
+    CHECK(attempts[i].detail.empty() == last);
+    if (!contains(available, attempts[i].provider)) {
+      CHECK_THAT(attempts[i].detail, ContainsSubstring("not in this ONNX Runtime build"));
     }
   }
-  return Provider::Cpu;
+  CHECK(attempts.back().provider == session.provider());
+#if defined(__APPLE__)
+  // The pinned osx-arm64 package ships CoreML and it runs on the dev Mac and
+  // the hosted macOS runners; landing on CPU here means the CoreML
+  // configuration broke, which a fallback must not hide.
+  CHECK(session.provider() == Provider::CoreMl);
+#endif
 }
 
 std::vector<float> doubled(const Session& session, const std::vector<float>& values,
@@ -138,10 +159,7 @@ TEST_CASE("A static model warms up and runs on CPU", "[runtime]") {
 TEST_CASE("Default options pick the platform provider and compute the same result", "[runtime]") {
   const Session session = Session::open(shared_env(), fixture("scale_static.onnx"));
 
-  CHECK(session.provider() == expected_default_provider());
-  REQUIRE_FALSE(session.attempts().empty());
-  CHECK(session.attempts().back().selected);
-  CHECK(session.attempts().back().provider == session.provider());
+  check_default_selection(session);
 
   const std::vector<float> input{0.5F, 1.5F, -3.0F, 4.0F, 8.0F, 16.0F};
   CHECK(doubled(session, input, {2, 3}) == times_two(input));
@@ -233,6 +251,36 @@ TEST_CASE("Dynamic inputs need explicit warmup shapes", "[runtime]") {
     });
     CHECK_THAT(message, ContainsSubstring("[1, 5]"));
   }
+  SECTION("a huge shape is rejected before any buffer is allocated") {
+    // Allocating 1e10 floats (40 GB) first would hang or abort, not throw.
+    options.warmup_shapes = {{100000, 100000}};
+    const std::string message = error_of(ErrorCode::InvalidInput, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("scale_static.onnx"), options));
+    });
+    CHECK_THAT(message, ContainsSubstring("[100000, 100000]") && ContainsSubstring("[2, 3]"));
+  }
+  SECTION("a shape whose element count overflows is rejected") {
+    options.warmup_shapes = {{std::numeric_limits<std::int64_t>::max(), 4}};
+    error_of(ErrorCode::InvalidInput, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("scale_dynamic.onnx"), options));
+    });
+  }
+  SECTION("a non-positive dimension is rejected") {
+    options.warmup_shapes = {{0, 4}};
+    error_of(ErrorCode::InvalidInput, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("scale_dynamic.onnx"), options));
+    });
+  }
+}
+
+TEST_CASE("A moved-from Environment is an InvalidInput error, not a crash", "[runtime]") {
+  Environment source(Environment::LogLevel::Error);
+  const Environment target = std::move(source);
+  const std::string message = error_of(ErrorCode::InvalidInput, [&] {
+    // NOLINTNEXTLINE(bugprone-use-after-move): the moved-from state is under test
+    static_cast<void>(Session::open(source, fixture("scale_static.onnx"), cpu_only()));
+  });
+  CHECK_THAT(message, ContainsSubstring("moved from"));
 }
 
 TEST_CASE("run() rejects inputs that do not fit and never echoes their values", "[runtime]") {
@@ -344,7 +392,11 @@ TEST_CASE("Pinned models load, warm up and run", "[runtime][models]") {
         const auto start = std::chrono::steady_clock::now();
         const Session session = Session::open(shared_env(), entry.path, options);
         const auto opened = std::chrono::steady_clock::now();
-        CHECK(session.provider() == (accelerated ? expected_default_provider() : Provider::Cpu));
+        if (accelerated) {
+          check_default_selection(session);
+        } else {
+          CHECK(session.provider() == Provider::Cpu);
+        }
 
         std::vector<std::vector<float>> buffers;
         std::vector<TensorView> views;

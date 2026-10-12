@@ -50,6 +50,31 @@ std::string shape_text(std::span<const std::int64_t> shape) {
   return out.str();
 }
 
+// Element count of `shape` when it fits the model's `spec` (same rank, every
+// dimension positive and equal to each fixed spec dimension) and the byte size
+// of a float buffer that large is representable; nullopt otherwise. Checked
+// before anything is allocated or handed to ONNX Runtime.
+std::optional<std::size_t> fitted_count(std::span<const std::int64_t> shape, std::span<const std::int64_t> spec) {
+  if (shape.size() != spec.size()) {
+    return std::nullopt;
+  }
+  constexpr std::size_t kMaxCount = std::numeric_limits<std::size_t>::max() / sizeof(float);
+  constexpr auto kMaxDim = static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+  std::size_t count = 1;
+  for (std::size_t d = 0; d < shape.size(); ++d) {
+    const std::int64_t dim = shape[d];
+    if (dim <= 0 || (spec[d] >= 0 && spec[d] != dim)) {
+      return std::nullopt;
+    }
+    const auto size = static_cast<std::size_t>(dim);
+    if (size > kMaxDim || size > kMaxCount / count) {
+      return std::nullopt;
+    }
+    count *= size;
+  }
+  return count;
+}
+
 std::string provider_list(const std::vector<Provider>& providers) {
   std::string text;
   for (const Provider provider : providers) {
@@ -260,6 +285,10 @@ Session& Session::operator=(Session&&) noexcept = default;
 
 Session Session::open(Environment& env, const std::filesystem::path& model, const SessionOptions& options) {
   const std::string label = path_text(model);
+  if (!env.impl_) {
+    throw RuntimeError(ErrorCode::InvalidInput,
+                       "spg runtime: " + label + ": the Environment was moved from; open sessions with a live one");
+  }
   std::error_code ec;
   if (!fs::is_regular_file(model, ec)) {
     throw RuntimeError(ErrorCode::ModelNotFound,
@@ -358,23 +387,12 @@ std::vector<Tensor> Session::run(std::span<const TensorView> inputs) const {
     if (!spec.float32) {
       impl.fail(ErrorCode::InvalidInput, prefix + "is not a float32 tensor; only float32 is supported");
     }
-    bool fits = view.shape.size() == spec.shape.size();
-    std::size_t count = 1;
-    for (std::size_t d = 0; fits && d < view.shape.size(); ++d) {
-      const std::int64_t dim = view.shape[d];
-      // Largest dimension that keeps the element count representable.
-      const std::size_t max_dim =
-          std::min(std::numeric_limits<std::size_t>::max() / count,
-                   static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
-      fits = dim > 0 && static_cast<std::size_t>(dim) <= max_dim && (spec.shape[d] < 0 || spec.shape[d] == dim);
-      if (fits) {
-        count *= static_cast<std::size_t>(dim);
-      }
-    }
-    if (!fits) {
+    const std::optional<std::size_t> fitted = fitted_count(view.shape, spec.shape);
+    if (!fitted) {
       impl.fail(ErrorCode::InvalidInput,
                 prefix + "has shape " + shape_text(view.shape) + ", model expects " + shape_text(spec.shape));
     }
+    const std::size_t count = *fitted;
     if (view.data.size() != count) {
       impl.fail(ErrorCode::InvalidInput, prefix + "shape " + shape_text(view.shape) + " needs " +
                                              std::to_string(count) + " values, got " +
@@ -434,16 +452,22 @@ void Session::warmup(std::span<const std::vector<std::int64_t>> shapes, int runs
   std::vector<std::vector<float>> buffers;
   std::vector<TensorView> views;
   buffers.reserve(resolved.size());
-  for (const auto& shape : resolved) {
-    std::size_t count = 1;
-    for (const std::int64_t dim : shape) {
-      if (dim <= 0) {
-        impl.fail(ErrorCode::InvalidInput, "warmup shape " + shape_text(shape) + " has a non-positive dimension");
-      }
-      count *= static_cast<std::size_t>(dim);
+  // Check every shape before allocating any buffer, so a wrong or huge warmup
+  // shape is an InvalidInput error rather than a giant allocation.
+  std::vector<std::size_t> counts;
+  counts.reserve(resolved.size());
+  for (std::size_t i = 0; i < resolved.size(); ++i) {
+    const TensorInfo& spec = impl.inputs[i];
+    const std::optional<std::size_t> count = fitted_count(resolved[i], spec.shape);
+    if (!count) {
+      impl.fail(ErrorCode::InvalidInput, "warmup shape " + shape_text(resolved[i]) + " for input '" + spec.name +
+                                             "' does not fit the model, which expects " + shape_text(spec.shape));
     }
-    buffers.emplace_back(count, 0.0F);
-    views.push_back({buffers.back(), shape});
+    counts.push_back(*count);
+  }
+  for (std::size_t i = 0; i < resolved.size(); ++i) {
+    buffers.emplace_back(counts[i], 0.0F);
+    views.push_back({buffers.back(), resolved[i]});
   }
   for (int i = 0; i < runs; ++i) {
     static_cast<void>(run(views));

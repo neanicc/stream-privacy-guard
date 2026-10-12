@@ -127,6 +127,15 @@ Template:
   det 640x640 CoreML-registered 24.4 ms vs CPU 23.6 ms; rec 48x320 5.5 ms vs
   5.1 ms. With static-shape enforcement CoreML takes no PP-OCR nodes, so
   those two run on CPU either way.
+- Review fixes: `warmup()` now checks every warmup shape against the model
+  (rank, fixed dimensions, positive dimensions, overflow-safe element count)
+  with the same helper as `run()` before allocating any buffer, so a wrong or
+  huge shape is `InvalidInput` instead of a multi-GB allocation; opening a
+  session with a moved-from `Environment` is `InvalidInput`, not a null
+  dereference. The default-provider tests now check the recorded attempts
+  (earlier providers failed with a reason, the selected one is last) so a
+  listed GPU provider that fails on a machine is not a false failure; macOS
+  still requires CoreML. Dev Mac: 25/25 ctest tests, 12 `runtime.*` cases.
 - Eval delta: none (no pipeline yet; `run.sh eval` still prints
   `THRESHOLDS: NOT RUN`).
 - Open issues or follow-ups: package a Windows GPU provider (DirectML via

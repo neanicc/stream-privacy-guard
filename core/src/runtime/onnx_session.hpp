@@ -127,7 +127,7 @@ struct ProviderAttempt {
 class Session {
  public:
   // Throws RuntimeError: ModelNotFound, ModelLoadFailed, ProviderUnavailable or
-  // InvalidInput (bad warmup shapes).
+  // InvalidInput (bad warmup shapes, or `env` was moved from).
   [[nodiscard]] static Session open(Environment& env, const std::filesystem::path& model,
                                     const SessionOptions& options = {});
 
@@ -153,7 +153,8 @@ class Session {
   [[nodiscard]] std::vector<Tensor> run(std::span<const TensorView> inputs) const;
 
   // Runs `runs` inferences on zero-filled inputs of the given shapes (see
-  // SessionOptions::warmup_shapes). Throws like run().
+  // SessionOptions::warmup_shapes). Shapes that do not fit the model are
+  // rejected with InvalidInput before any buffer is allocated. Throws like run().
   void warmup(std::span<const std::vector<std::int64_t>> shapes, int runs = 1) const;
 
   struct Impl;
