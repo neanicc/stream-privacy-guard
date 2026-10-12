@@ -1,25 +1,23 @@
 #pragma once
 
-// The filter's render side (SPG-14): owns the Pipeline and its GPU resources,
-// takes new scheduler generations from the settings side, and draws each
-// frame. Rules: docs/plugin-render.md.
+// The filter's render side (SPG-14): builds scheduler generations when the
+// settings change, and draws each frame from the PipelineHost's plan with
+// libobs graphics. Rules: docs/plugin-render.md.
 //
 // Threads: publish() runs wherever the settings change (the video thread for
 // `update`, the UI thread for the watch-list buttons) and builds the new
-// scheduler there; render() runs on the graphics thread and only swaps a
-// pointer under a lock that publish() holds for that swap alone. status() may
-// run on any thread.
+// scheduler there; render() runs on the graphics thread; status() may run on
+// any thread.
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <optional>
 
 #include <obs.h>
 
+#include "pipeline/host.hpp"
 #include "pipeline/pipeline.hpp"
 #include "render/obs_gpu.hpp"
 #include "spg/policy_config.hpp"
@@ -35,17 +33,10 @@ inline constexpr std::chrono::hours kWorkerJoinTimeout{1};
 // A fixed English name for logs ("not scanned in time"); never text from the frame.
 [[nodiscard]] const char* cover_name(Cover cover) noexcept;
 
-struct RenderStatus {
-  bool scanning = false;  // a scheduler is running
-  std::uint64_t clean = 0;    // frames drawn with only their masks
-  std::uint64_t covered = 0;  // frames drawn covered whole
-  Cover last_cover = Cover::None;
-};
-
 class FilterRender {
  public:
   explicit FilterRender(obs_source_t* filter);
-  // Retires the schedulers to the reaper and frees GPU resources.
+  // Frees GPU resources; the host then retires the schedulers to the reaper.
   ~FilterRender();
   FilterRender(const FilterRender&) = delete;
   FilterRender& operator=(const FilterRender&) = delete;
@@ -60,30 +51,23 @@ class FilterRender {
   // The filter's video_render.
   void render() noexcept;
 
-  [[nodiscard]] RenderStatus status() const noexcept;
+  [[nodiscard]] RenderStatus status() const noexcept { return host_.status(); }
 
  private:
   void log_transition(const DrawPlan& plan) noexcept;
 
   obs_source_t* filter_;
   ObsFrameGpu gpu_;
-  std::unique_ptr<Pipeline> pipeline_;  // render thread only
+  PipelineHost host_;
 
-  std::mutex publish_mutex_;  // publishers; also guards published_
+  std::mutex publish_mutex_;  // publishers; guards the fields below
   std::optional<PolicyConfig> published_;
   FallbackMode published_fallback_ = FallbackMode::BlurSource;
   bool have_published_ = false;
+  bool publish_failed_ = false;
 
-  std::mutex handoff_mutex_;  // held only to swap `pending_`
-  std::unique_ptr<PipelineSpec> pending_;
-  std::atomic<bool> has_pending_{false};
-  std::atomic<bool> cover_all_{false};
   std::atomic<bool> overlay_{false};
-
-  std::atomic<bool> scanning_{false};
-  std::atomic<std::uint64_t> clean_{0};
-  std::atomic<std::uint64_t> covered_{0};
-  std::atomic<std::uint8_t> last_cover_{0};
+  // Render thread only.
   Cover last_logged_cover_ = Cover::None;
   bool logged_once_ = false;
   std::uint64_t last_log_ns_ = 0;

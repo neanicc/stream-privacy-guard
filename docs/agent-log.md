@@ -1094,3 +1094,26 @@ Template:
   shorter effective lookahead and a warning; move the watch-list reload off
   the video thread after #42; HDR capture; SPG-18 should confirm with
   `scrub` that the blur cell sizes leave nothing readable.
+- Review fixes (security review on `f1f63d9`, "fail-open state drift" in the
+  render path): (1) a failed adoption used to drop the new generation and
+  keep the old scheduler running, so a policy that had just become empty
+  could keep airing frames masked under the old one; `Pipeline::adopt` now
+  has the strong guarantee and the new `PipelineHost` covers the frame solid
+  and retries the same generation next frame. (2) A failed scheduler build
+  covers every frame solid until a later hand-over succeeds (it used to rely
+  on a flag a repeated identical publish could skip). (3) Every plan names
+  the capture serial of its texture and the GPU side rechecks the slot
+  (`checked_kind`) right before drawing: a recycled, freed, failed or
+  resized slot draws solid. (4) A release that does not match the frame
+  buffered under its id is covered (`Cover::Inconsistent`). (5) An invalid
+  or non-Source mask rect blurs the whole frame instead of being skipped.
+  (6) A released frame repeats for at most 100 ms (`Cover::Stalled`).
+  (7) A frame-time gap over 200 ms (filter disabled, source not rendered) or
+  a step backwards marks a discontinuity and drops the re-emit anchor.
+  (8) Exceptions from GPU calls are caught inside the tick without leaking a
+  ring slot, and a repeated render of a failed frame time stays solid.
+  Evidence: 10 new `plugin.pipeline.*` cases (276/276 ctest tests pass on
+  the dev Mac); the harness now also checks on every tick that the GPU would
+  draw exactly the planned kind; 10 mutations (one per rule, plus losing the
+  spec on a failed adopt) each failed a test; the threaded hand-off race
+  case passed 20 repeated runs.

@@ -84,6 +84,26 @@ and is drawn as opaque black when released.
   because their held detections were in the old tracker. A debug overlay
   toggle does not restart the scheduler.
 
+## One consistent snapshot per frame
+
+The render side never draws from state that may have drifted from the
+scheduler's or the GPU's. Each rule below covers the frame whole (blur, or
+solid fill when there is nothing trustworthy to blur) and is unit-tested:
+
+| Case | Rule |
+| --- | --- |
+| Settings change racing with render | The settings side hands over a complete generation under a lock held only for a pointer swap; the render thread takes it at the start of a frame (`PipelineHost`). A failed build (`fail()`) covers every frame with a solid fill until the next successful hand-over; the old scheduler is never left running in its place |
+| Adoption fails (allocation) | `Pipeline::adopt` has the strong guarantee; the frame is solid, a second render of the same frame time is solid too, and the next frame retries the same generation |
+| Policy becomes empty (storage error, no categories, rejected settings) | The next frame covers the live frame whole; the old scheduler's frames are never shown again |
+| A release that does not match the frame buffered under its id (time, size, unknown id, clean action with a fallback flag or reason) | Solid, `Inconsistent` |
+| A slot recycled, freed, never captured or captured at another size | Every plan names the capture serial of its texture; the GPU side compares it with what the slot holds right before drawing (`checked_kind`) and draws solid on any mismatch |
+| A mask rect that is invalid or not in Source space | The frame is blurred whole, never partially masked |
+| Releases stop (scheduler stalled or failing) | A released frame repeats for at most 100 ms, then the live frame is covered (`Stalled`) |
+| Frame times jump by more than 200 ms (filter disabled, source not rendered) or go backwards | Discontinuity: no earlier scan or re-emit stands in for the new content; the HoldLastScanned anchor is dropped |
+| 0x0 target | Nothing is drawn; held masks and buffered frames are kept; a discontinuity is marked when frames return |
+| A GPU call throws | Caught: the frame has no texture and is covered; no ring slot leaks |
+| First frames | Covered whole until the scheduler releases a frame (`Starting`), or for good while no policy is set (`NoDetection`) |
+
 ## Threads and unload
 
 The render thread never takes the filter's settings lock; it takes a hand-off
@@ -114,6 +134,8 @@ would hold OBS shutdown; detection stages have no unbounded wait today.
 | Grey | Starting, or detection off (no PolicyConfig) |
 | Blue | Settings changed (old hold) |
 | White | The frame could not be kept (no texture) |
+| Yellow | Nothing released for over 100 ms (stall) |
+| Cyan | Inconsistent state (see below) |
 
 ## Audio
 

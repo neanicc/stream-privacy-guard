@@ -31,11 +31,16 @@ bool uses_slot(const DrawPlan& plan) noexcept {
 void reset(DrawPlan& plan) noexcept {
   plan.kind = DrawKind::Nothing;
   plan.slot = 0;
+  plan.serial = 0;
   plan.frame = {};
   plan.rects.clear();
   plan.cover = Cover::None;
   plan.reemit = false;
   plan.live = false;
+}
+
+bool drawable_rect(const MaskRect& rect) noexcept {
+  return rect.box.space == Space::Source && is_valid(rect.box.rect);
 }
 
 }  // namespace
@@ -52,11 +57,24 @@ Size readback_size(Size source, Size max) noexcept {
   return {side(source.width), side(source.height)};
 }
 
+DrawKind checked_kind(const DrawPlan& plan, const SlotContents& slot) noexcept {
+  if (!uses_slot(plan)) {
+    return plan.kind;
+  }
+  if (!slot.present || slot.serial == 0 || slot.serial != plan.serial || slot.size != plan.frame ||
+      plan.frame.width == 0 || plan.frame.height == 0) {
+    return DrawKind::Solid;
+  }
+  if (plan.kind == DrawKind::Masked && !std::all_of(plan.rects.begin(), plan.rects.end(), drawable_rect)) {
+    return DrawKind::BlurWhole;
+  }
+  return plan.kind;
+}
+
 Pipeline::Pipeline(FrameGpu& gpu, std::size_t ring_capacity, Retire retire, Size max_readback)
     : gpu_(&gpu), retire_(std::move(retire)), max_readback_(max_readback), ring_(ring_capacity) {
-  Generation none;
-  none.id = next_generation_++;
-  gens_.push_back(std::move(none));
+  gens_.emplace_back();
+  gens_.back().id = next_generation_++;
 }
 
 Pipeline::~Pipeline() {
@@ -78,30 +96,50 @@ void Pipeline::retire(std::unique_ptr<FrameScheduler> scheduler) noexcept {
   }
 }
 
-void Pipeline::adopt(PipelineSpec spec, Timestamp now) {
-  Generation next;
+void Pipeline::adopt(PipelineSpec& spec, Timestamp now) {
+  const Generation& previous = gens_.back();
+  // Detections the old tracker still held (up to its hold past the last
+  // scan, which is no later than now) are not in the new one.
+  std::optional<Timestamp> covered_until;
+  if (previous.scheduler != nullptr) {
+    covered_until = now + previous.hold;
+  }
+  if (previous.covered_until && (!covered_until || *previous.covered_until > *covered_until)) {
+    covered_until = previous.covered_until;
+  }
+  if (adopt_fault_) {
+    adopt_fault_();
+  }
+  gens_.emplace_back();  // the only step that can throw; nothing changed yet
+  Generation& next = gens_.back();
   next.id = next_generation_++;
   next.scheduler = std::move(spec.scheduler);
   next.fallback = spec.fallback;
   next.hold = spec.hold;
-  const Generation& previous = gens_.back();
-  // Detections the old tracker still held (up to its hold past the last
-  // scan, which is no later than now) are not in the new one.
-  if (previous.scheduler != nullptr) {
-    next.covered_until = now + previous.hold;
-  }
-  if (previous.covered_until && (!next.covered_until || *previous.covered_until > *next.covered_until)) {
-    next.covered_until = previous.covered_until;
-  }
-  gens_.push_back(std::move(next));
-  staged_.reset();  // a readback of the old generation's frame
+  next.covered_until = covered_until;
+  staged_.reset();      // a readback of the old generation's frame
   forget_last_clean();  // re-emits name frames of one generation
   retire_drained();
+}
+
+void Pipeline::mark_discontinuity() noexcept {
+  for (Generation& gen : gens_) {
+    if (gen.scheduler != nullptr) {
+      try {
+        gen.scheduler->mark_discontinuity();
+      } catch (...) {
+      }
+    }
+  }
+  forget_last_clean();
 }
 
 const DrawPlan& Pipeline::tick(Timestamp t, Size source) {
   if (last_tick_ && *last_tick_ == t) {
     return display_;
+  }
+  if (last_tick_ && (t < *last_tick_ || t - *last_tick_ > kMaxTickGap)) {
+    mark_discontinuity();
   }
   last_tick_ = t;
   ++counters_.ticks;
@@ -129,23 +167,32 @@ const DrawPlan& Pipeline::tick(Timestamp t, Size source) {
     }
     reset(next_);
     set_display(next_);
+    last_release_.reset();
     retire_drained();
     return display_;
   }
   if (target_empty_) {
     // The content may have changed while nothing was rendered.
     target_empty_ = false;
-    for (Generation& gen : gens_) {
-      if (gen.scheduler != nullptr) {
-        gen.scheduler->mark_discontinuity();
-      }
-    }
+    mark_discontinuity();
   }
 
   std::optional<std::size_t> slot = ring_.acquire();
-  if (slot && !gpu_->capture(*slot, source)) {
-    ring_.release(*slot);
-    slot.reset();
+  live_serial_ = 0;
+  if (slot) {
+    const std::uint64_t serial = next_serial_++;
+    bool captured = false;
+    try {
+      captured = gpu_->capture(*slot, source, serial);
+    } catch (...) {
+      captured = false;
+    }
+    if (captured) {
+      live_serial_ = serial;
+    } else {
+      ring_.release(*slot);
+      slot.reset();
+    }
   }
   if (!slot) {
     ++counters_.capture_failures;
@@ -172,10 +219,16 @@ const DrawPlan& Pipeline::tick(Timestamp t, Size source) {
       released = true;
     }
   }
+  if (released) {
+    last_release_ = t;
+  }
   if (current.scheduler == nullptr) {
     show_live(slot, source, current.fallback, Cover::NoDetection);
   } else if (!released && (display_.kind == DrawKind::Nothing || display_.live)) {
     show_live(slot, source, current.fallback, Cover::Starting);
+  } else if (!released && (!last_release_ || t - *last_release_ > kMaxRepeat)) {
+    // Nothing new for too long: do not keep airing an old frame.
+    show_live(slot, source, current.fallback, Cover::Stalled);
   }
   if (slot && current.scheduler == nullptr) {
     ring_.release(*slot);  // the display holds it if it shows it
@@ -188,10 +241,14 @@ void Pipeline::push_frame(Generation& gen, Timestamp t, Size source, std::option
   // The readback staged on the previous tick shows the frame pushed then.
   std::shared_ptr<const OwnedFrame> readback;
   if (staged_ && staged_->generation == gen.id) {
-    MappedReadback mapped;
-    if (gpu_->map(staged_->surface, mapped)) {
-      readback = pool_.copy_bgra(mapped.data, mapped.linesize, staged_->size, staged_->t);
-      gpu_->unmap(staged_->surface);
+    try {
+      MappedReadback mapped;
+      if (gpu_->map(staged_->surface, mapped)) {
+        readback = pool_.copy_bgra(mapped.data, mapped.linesize, staged_->size, staged_->t);
+        gpu_->unmap(staged_->surface);
+      }
+    } catch (...) {
+      readback = nullptr;  // no scan; the frame fails closed unless another cycle covers it
     }
   }
   staged_.reset();
@@ -202,7 +259,7 @@ void Pipeline::push_frame(Generation& gen, Timestamp t, Size source, std::option
   FrameId id = 0;
   try {
     id = gen.scheduler->push(t, source, std::move(readback));
-    gen.buffered.push_back(Buffered{id, slot.value_or(kNoSlot)});
+    gen.buffered.push_back(Buffered{id, slot.value_or(kNoSlot), slot ? live_serial_ : 0, t, source});
   } catch (...) {
     // Not buffered (or buffered without its texture): when released it is
     // covered with a solid fill.
@@ -211,57 +268,79 @@ void Pipeline::push_frame(Generation& gen, Timestamp t, Size source, std::option
     }
     if (id != 0) {
       try {
-        gen.buffered.push_back(Buffered{id, kNoSlot});
+        gen.buffered.push_back(Buffered{id, kNoSlot, 0, t, source});
       } catch (...) {
       }
     }
     return;
   }
 
-  if (slot && gen.scheduler->wants_scan(t)) {
+  bool wanted = false;
+  try {
+    wanted = slot.has_value() && gen.scheduler->wants_scan(t);
+  } catch (...) {
+    wanted = false;
+  }
+  if (wanted) {
     const Size size = readback_size(source, max_readback_);
     const std::size_t surface = next_surface_;
-    if (gpu_->stage(*slot, surface, size)) {
+    bool staged = false;
+    try {
+      staged = gpu_->stage(*slot, surface, size);
+    } catch (...) {
+      staged = false;
+    }
+    if (staged) {
       staged_ = Staged{surface, t, gen.id, size};
       next_surface_ = 1 - next_surface_;
     }
   }
 }
 
-std::size_t Pipeline::take_buffered(Generation& gen, FrameId id) noexcept {
+std::optional<Pipeline::Buffered> Pipeline::take_buffered(Generation& gen, FrameId id) noexcept {
   // Frames are released in push order; anything before this one is gone.
-  std::size_t slot = kNoSlot;
+  std::optional<Buffered> found;
   while (!gen.buffered.empty() && gen.buffered.front().id <= id) {
     const Buffered entry = gen.buffered.front();
     gen.buffered.pop_front();
     if (entry.id == id) {
-      slot = entry.slot;
+      found = entry;
     } else if (entry.slot != kNoSlot) {
       ring_.release(entry.slot);
     }
   }
-  return slot;
+  return found;
 }
 
 void Pipeline::release_buffered(Generation& gen, FrameId id) noexcept {
-  if (const std::size_t slot = take_buffered(gen, id); slot != kNoSlot) {
-    ring_.release(slot);
+  if (const std::optional<Buffered> entry = take_buffered(gen, id); entry && entry->slot != kNoSlot) {
+    ring_.release(entry->slot);
   }
 }
 
 void Pipeline::show_released(Generation& gen, const ReleasedFrame& frame) {
   ++counters_.released;
-  const std::size_t slot = take_buffered(gen, frame.id);
+  const std::optional<Buffered> entry = take_buffered(gen, frame.id);
+  const std::size_t slot = entry ? entry->slot : kNoSlot;
+  const std::uint64_t serial = entry ? entry->serial : 0;
   reset(next_);
   next_.frame = frame.source;
+  // The release must describe the frame the pipeline buffered under that id;
+  // anything else (unknown id, another time or size, or a clean action on a
+  // plan marked fallback) is covered whole.
+  const bool clean_action = frame.action == FallbackAction::None;
+  const bool consistent = entry && entry->t == frame.frame_time && entry->size == frame.source &&
+                          frame.plan.fallback != clean_action &&
+                          (frame.reason == FallbackReason::None) == clean_action;
   const bool settings_changed = gen.covered_until && frame.frame_time < *gen.covered_until;
-  if (frame.action == FallbackAction::None && !settings_changed) {
+  if (consistent && frame.action == FallbackAction::None && !settings_changed) {
     if (slot == kNoSlot) {
       next_.kind = DrawKind::Solid;
       next_.cover = Cover::NoTexture;
     } else {
       next_.kind = DrawKind::Masked;
       next_.slot = slot;
+      next_.serial = serial;
       next_.rects.assign(frame.plan.rects.begin(), frame.plan.rects.end());
       // Kept for HoldLastScanned.
       try {
@@ -274,6 +353,7 @@ void Pipeline::show_released(Generation& gen, const ReleasedFrame& frame) {
         last_clean_->generation = gen.id;
         last_clean_->frame = frame.id;
         last_clean_->slot = slot;
+        last_clean_->serial = serial;
         last_clean_->size = frame.source;
         last_clean_->rects.assign(frame.plan.rects.begin(), frame.plan.rects.end());
       } catch (...) {
@@ -281,23 +361,29 @@ void Pipeline::show_released(Generation& gen, const ReleasedFrame& frame) {
       }
     }
   } else {
-    next_.cover = settings_changed && frame.action == FallbackAction::None ? Cover::SettingsChanged
-                                                                            : cover_for(frame.reason);
-    if (frame.action == FallbackAction::HoldLastScanned && last_clean_ && last_clean_->generation == gen.id &&
-        last_clean_->frame == frame.reemit) {
+    if (!consistent) {
+      next_.cover = Cover::Inconsistent;
+    } else if (settings_changed && frame.action == FallbackAction::None) {
+      next_.cover = Cover::SettingsChanged;
+    } else {
+      next_.cover = cover_for(frame.reason);
+    }
+    if (consistent && frame.action == FallbackAction::HoldLastScanned && last_clean_ &&
+        last_clean_->generation == gen.id && last_clean_->frame == frame.reemit) {
       next_.kind = DrawKind::Masked;
       next_.slot = last_clean_->slot;
+      next_.serial = last_clean_->serial;
       next_.frame = last_clean_->size;
       next_.rects.assign(last_clean_->rects.begin(), last_clean_->rects.end());
       next_.reemit = true;
-    } else if (frame.action == FallbackAction::SolidFill ||
-               (frame.action == FallbackAction::None && gen.fallback == FallbackMode::SolidFill)) {
+    } else if (frame.action == FallbackAction::SolidFill || gen.fallback == FallbackMode::SolidFill) {
       next_.kind = DrawKind::Solid;
-    } else if (slot == kNoSlot) {
-      next_.kind = DrawKind::Solid;
+    } else if (slot == kNoSlot || !consistent) {
+      next_.kind = DrawKind::Solid;  // no texture known to show this frame
     } else {
       next_.kind = DrawKind::BlurWhole;
       next_.slot = slot;
+      next_.serial = serial;
     }
   }
   if (slot == kNoSlot && next_.cover == Cover::None) {
@@ -309,19 +395,21 @@ void Pipeline::show_released(Generation& gen, const ReleasedFrame& frame) {
   }
 }
 
-void Pipeline::cover_whole(DrawPlan& next, std::size_t slot, Size size, FallbackMode fallback) const {
+void Pipeline::cover_whole(DrawPlan& next, std::size_t slot, std::uint64_t serial, Size size,
+                           FallbackMode fallback) const {
   next.frame = size;
   if (fallback == FallbackMode::SolidFill || slot == kNoSlot) {
     next.kind = DrawKind::Solid;
   } else {
     next.kind = DrawKind::BlurWhole;  // HoldLastScanned has nothing to hold yet
     next.slot = slot;
+    next.serial = serial;
   }
 }
 
 void Pipeline::show_live(std::optional<std::size_t> slot, Size source, FallbackMode fallback, Cover cover) {
   reset(next_);
-  cover_whole(next_, slot.value_or(kNoSlot), source, fallback);
+  cover_whole(next_, slot.value_or(kNoSlot), slot ? live_serial_ : 0, source, fallback);
   next_.cover = slot ? cover : Cover::NoTexture;
   next_.live = true;
   set_display(next_);
@@ -336,6 +424,7 @@ void Pipeline::set_display(DrawPlan& next) {
   }
   display_.kind = next.kind;
   display_.slot = next.slot;
+  display_.serial = next.serial;
   display_.frame = next.frame;
   display_.cover = next.cover;
   display_.reemit = next.reemit;
@@ -347,7 +436,8 @@ void Pipeline::set_display(DrawPlan& next) {
     display_.rects.clear();
     if (display_.kind == DrawKind::Masked) {
       display_.kind = DrawKind::BlurWhole;
-      display_.cover = Cover::NoTexture;
+      display_.cover = Cover::Inconsistent;
+      display_.reemit = false;
     }
   }
   if (display_.kind != DrawKind::Nothing) {

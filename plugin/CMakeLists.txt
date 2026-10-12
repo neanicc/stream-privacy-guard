@@ -25,6 +25,7 @@ spg_target_defaults(obs-spg-settings)
 # without OBS (SPG-14), unit-tested on every OS with a fake GPU.
 add_library(obs-spg-pipeline STATIC
   src/pipeline/frame_ring.cpp
+  src/pipeline/host.cpp
   src/pipeline/mask_levels.cpp
   src/pipeline/pipeline.cpp
   src/pipeline/readback_pool.cpp

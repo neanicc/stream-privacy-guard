@@ -7,11 +7,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -21,6 +24,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "pipeline/frame_ring.hpp"
+#include "pipeline/host.hpp"
 #include "pipeline/mask_levels.hpp"
 #include "pipeline/pipeline.hpp"
 #include "pipeline/readback_pool.hpp"
@@ -48,13 +52,27 @@ constexpr Size k720{1280, 720};
 // Records the GPU work; the readback pixels name the slot they came from.
 class FakeGpu final : public spg::plugin::FrameGpu {
  public:
-  bool capture(std::size_t slot, Size size) override {
+  bool capture(std::size_t slot, Size size, std::uint64_t serial) override {
     ++captures;
+    slot_serial[slot] = 0;
+    if (throw_capture) {
+      throw std::runtime_error("device lost");
+    }
     if (fail_capture) {
       return false;
     }
     slot_size[slot] = size;
+    slot_serial[slot] = serial;
     return true;
+  }
+  [[nodiscard]] spg::plugin::SlotContents contents(std::size_t slot) const {
+    spg::plugin::SlotContents out;
+    if (const auto it = slot_serial.find(slot); it != slot_serial.end() && it->second != 0) {
+      out.present = true;
+      out.serial = it->second;
+      out.size = slot_size.at(slot);
+    }
+    return out;
   }
   bool stage(std::size_t slot, std::size_t surface, Size readback) override {
     REQUIRE(surface < 2);
@@ -83,7 +101,10 @@ class FakeGpu final : public spg::plugin::FrameGpu {
     mapped[surface] = false;
     staged[surface].reset();
   }
-  void free_slot(std::size_t slot) override { freed.push_back(slot); }
+  void free_slot(std::size_t slot) override {
+    freed.push_back(slot);
+    slot_serial.erase(slot);
+  }
 
   struct Staged {
     std::size_t slot = 0;
@@ -91,9 +112,11 @@ class FakeGpu final : public spg::plugin::FrameGpu {
     int tick = 0;
   };
   bool fail_capture = false;
+  bool throw_capture = false;
   int tick = 0;
   int captures = 0;
   std::map<std::size_t, Size> slot_size;
+  std::map<std::size_t, std::uint64_t> slot_serial;
   std::array<std::optional<Staged>, 2> staged;
   std::array<bool, 2> mapped{};
   std::vector<std::size_t> stage_calls;
@@ -223,7 +246,7 @@ struct Harness {
     spec.scheduler = std::move(scheduler);
     spec.fallback = config.fallback;
     spec.hold = config.tracker.hold;
-    pipeline.adopt(std::move(spec), clock.now());
+    pipeline.adopt(spec, clock.now());
     schedulers.push_back(&ref);
     return ref;
   }
@@ -231,7 +254,7 @@ struct Harness {
   void adopt_none(FallbackMode fallback = FallbackMode::BlurSource) {
     spg::plugin::PipelineSpec spec;
     spec.fallback = fallback;
-    pipeline.adopt(std::move(spec), clock.now());
+    pipeline.adopt(spec, clock.now());
   }
 
   const DrawPlan& step(std::int64_t ms, Size size = k720) {
@@ -239,7 +262,7 @@ struct Harness {
     ++gpu.tick;
     const int captures_before = gpu.captures;
     const DrawPlan& plan = pipeline.tick(at_ms(ms), size);
-    if (gpu.captures > captures_before && !gpu.fail_capture) {
+    if (gpu.captures > captures_before && !gpu.fail_capture && !gpu.throw_capture) {
       // The slot captured this tick is the one acquired last; find it by size
       // bookkeeping: the newest slot not shown before.
       for (const auto& [slot, s] : gpu.slot_size) {
@@ -268,6 +291,9 @@ struct Harness {
     INFO("kind " << static_cast<int>(plan.kind) << " cover " << static_cast<int>(plan.cover) << " live " << plan.live
                  << " slot " << plan.slot << " now " << spg::to_ns(now));
     REQUIRE(pipeline.ring().holders(plan.slot) > 0);
+    // The GPU side would draw exactly this plan: the slot still holds the
+    // capture the plan names, at the plan's size.
+    REQUIRE(spg::plugin::checked_kind(plan, gpu.contents(plan.slot)) == plan.kind);
     if (plan.kind == DrawKind::BlurWhole) {
       REQUIRE(plan.cover != Cover::None);
       return;
@@ -604,6 +630,333 @@ TEST_CASE("random stalls and failures never air an unscanned frame", "[plugin][p
       CHECK(h.pipeline.ring().held() <= 32);
     }
   }
+}
+
+// --- State drift: the render side must never draw from state that no longer
+// matches what the scheduler and the GPU hold.
+
+namespace {
+
+// A scheduler whose releases the test writes by hand.
+class ScriptedScheduler final : public spg::plugin::FrameScheduler {
+ public:
+  struct Pushed {
+    spg::FrameId id = 0;
+    Timestamp t{};
+    Size source;
+  };
+  [[nodiscard]] bool wants_scan(Timestamp) const override { return false; }
+  spg::FrameId push(Timestamp t, Size source, std::shared_ptr<const spg::OwnedFrame>) override {
+    pushed.push_back(Pushed{++next_id, t, source});
+    return next_id;
+  }
+  void release_due(std::vector<spg::ReleasedFrame>& out) override {
+    out.insert(out.end(), queue.begin(), queue.end());
+    queue.clear();
+  }
+  void mark_discontinuity() override { ++discontinuities; }
+  [[nodiscard]] spg::SchedulerStats stats() const override { return {}; }
+
+  std::vector<Pushed> pushed;
+  std::vector<spg::ReleasedFrame> queue;
+  int discontinuities = 0;
+  spg::FrameId next_id = 0;
+};
+
+// A clean release of `p` with one mask.
+spg::ReleasedFrame clean_release(const ScriptedScheduler::Pushed& p) {
+  spg::ReleasedFrame r;
+  r.id = p.id;
+  r.frame_time = p.t;
+  r.source = p.source;
+  r.plan.frame_time = p.t;
+  r.plan.rects.push_back(spg::MaskRect{spg::Box{Rect{10, 10, 50, 50}, spg::Space::Source}, spg::MaskStyle::Blur});
+  return r;
+}
+
+struct ScriptedRig {
+  ScriptedRig() {
+    auto owned = std::make_unique<ScriptedScheduler>();
+    scheduler = owned.get();
+    spg::plugin::PipelineSpec spec;
+    spec.scheduler = std::move(owned);
+    spec.fallback = FallbackMode::HoldLastScanned;
+    pipeline.adopt(spec, at_ms(1000));
+  }
+  const DrawPlan& tick(std::int64_t ms, Size size = k720) { return pipeline.tick(at_ms(ms), size); }
+
+  FakeGpu gpu;
+  std::vector<std::unique_ptr<spg::plugin::FrameScheduler>> retired;
+  Pipeline pipeline{gpu, 16, [this](std::unique_ptr<spg::plugin::FrameScheduler> s) { retired.push_back(std::move(s)); }};
+  ScriptedScheduler* scheduler = nullptr;
+};
+
+}  // namespace
+
+TEST_CASE("the draw decision rechecks the slot snapshot", "[plugin][pipeline][drift]") {
+  using spg::plugin::checked_kind;
+  using spg::plugin::SlotContents;
+  DrawPlan plan;
+  plan.kind = DrawKind::Masked;
+  plan.slot = 3;
+  plan.serial = 42;
+  plan.frame = k720;
+  plan.rects.push_back(spg::MaskRect{spg::Box{Rect{1, 2, 30, 40}, spg::Space::Source}, spg::MaskStyle::Blur});
+  const SlotContents good{true, 42, k720};
+  CHECK(checked_kind(plan, good) == DrawKind::Masked);
+  CHECK(checked_kind(plan, SlotContents{}) == DrawKind::Solid);                  // texture missing
+  CHECK(checked_kind(plan, SlotContents{true, 43, k720}) == DrawKind::Solid);    // recycled for another frame
+  CHECK(checked_kind(plan, SlotContents{true, 0, k720}) == DrawKind::Solid);     // capture failed
+  CHECK(checked_kind(plan, SlotContents{true, 42, {640, 360}}) == DrawKind::Solid);  // another size
+  DrawPlan blurred = plan;
+  blurred.kind = DrawKind::BlurWhole;
+  CHECK(checked_kind(blurred, SlotContents{true, 7, k720}) == DrawKind::Solid);
+  // A mask that cannot be drawn: the frame is blurred whole, never partially masked.
+  DrawPlan bad = plan;
+  bad.rects.push_back(spg::MaskRect{spg::Box{Rect{std::nanf(""), 0, 5, 5}, spg::Space::Source}, spg::MaskStyle::Blur});
+  CHECK(checked_kind(bad, good) == DrawKind::BlurWhole);
+  DrawPlan wrong_space = plan;
+  wrong_space.rects[0].box.space = spg::Space::Readback;
+  CHECK(checked_kind(wrong_space, good) == DrawKind::BlurWhole);
+  DrawPlan solid;
+  solid.kind = DrawKind::Solid;
+  CHECK(checked_kind(solid, SlotContents{}) == DrawKind::Solid);
+}
+
+TEST_CASE("a recaptured slot is never drawn as the frame a plan names", "[plugin][pipeline][drift]") {
+  ScriptedRig rig;
+  rig.tick(1000);
+  rig.scheduler->queue.push_back(clean_release(rig.scheduler->pushed[0]));
+  const DrawPlan plan = rig.tick(1010);
+  REQUIRE(plan.kind == DrawKind::Masked);
+  CHECK(spg::plugin::checked_kind(plan, rig.gpu.contents(plan.slot)) == DrawKind::Masked);
+  // The slot's texture is overwritten by another capture behind the plan's back.
+  rig.gpu.slot_serial[plan.slot] = 999;
+  CHECK(spg::plugin::checked_kind(plan, rig.gpu.contents(plan.slot)) == DrawKind::Solid);
+  rig.gpu.slot_serial.erase(plan.slot);
+  CHECK(spg::plugin::checked_kind(plan, rig.gpu.contents(plan.slot)) == DrawKind::Solid);
+}
+
+TEST_CASE("a release that does not match its buffered frame is covered", "[plugin][pipeline][drift]") {
+  ScriptedRig rig;
+  rig.tick(1000);
+  rig.tick(1010);
+  const ScriptedScheduler::Pushed first = rig.scheduler->pushed[0];
+  spg::ReleasedFrame r = clean_release(first);
+  SECTION("clean action on a plan marked fallback") { r.plan.fallback = true; }
+  SECTION("clean action with a fallback reason") { r.reason = spg::FallbackReason::NotScanned; }
+  SECTION("another frame time") { r.frame_time = at_ms(1005); }
+  SECTION("another source size") { r.source = Size{640, 360}; }
+  SECTION("an id never pushed") { r.id = 77; }
+  rig.scheduler->queue.push_back(r);
+  const DrawPlan& plan = rig.tick(1020);
+  CHECK(plan.kind == DrawKind::Solid);
+  CHECK(plan.cover == Cover::Inconsistent);
+}
+
+TEST_CASE("an old frame is not repeated past the repeat limit", "[plugin][pipeline][drift]") {
+  ScriptedRig rig;
+  rig.tick(1000);
+  rig.scheduler->queue.push_back(clean_release(rig.scheduler->pushed[0]));
+  CHECK(rig.tick(1010).kind == DrawKind::Masked);
+  // The scheduler stops releasing (a stall); the clean frame repeats briefly,
+  // then the live frame is covered whole.
+  std::int64_t t = 1020;
+  for (; t <= 1110; t += 10) {
+    CHECK(rig.tick(t).kind == DrawKind::Masked);
+  }
+  const DrawPlan& plan = rig.tick(t);
+  CHECK(plan.kind == DrawKind::BlurWhole);
+  CHECK(plan.cover == Cover::Stalled);
+  CHECK(plan.live);
+}
+
+TEST_CASE("a gap or a backwards step in frame time is a discontinuity", "[plugin][pipeline][drift]") {
+  ScriptedRig rig;
+  rig.tick(1000);
+  rig.scheduler->queue.push_back(clean_release(rig.scheduler->pushed[0]));
+  REQUIRE(rig.tick(1010).kind == DrawKind::Masked);
+  // The filter was disabled (no renders) for 300 ms.
+  rig.tick(1310);
+  CHECK(rig.scheduler->discontinuities == 1);
+  // A HoldLastScanned release naming the frame from before the gap is not
+  // re-emitted: content may have changed while nothing was rendered.
+  spg::ReleasedFrame hold;
+  const ScriptedScheduler::Pushed& p = rig.scheduler->pushed[1];
+  hold.id = p.id;
+  hold.frame_time = p.t;
+  hold.source = p.source;
+  hold.plan.fallback = true;
+  hold.action = spg::FallbackAction::HoldLastScanned;
+  hold.reason = spg::FallbackReason::NotScanned;
+  hold.reemit = rig.scheduler->pushed[0].id;
+  rig.scheduler->queue.push_back(hold);
+  const DrawPlan& plan = rig.tick(1320);
+  CHECK_FALSE(plan.reemit);
+  CHECK(plan.kind == DrawKind::BlurWhole);
+  rig.tick(1300);  // backwards
+  CHECK(rig.scheduler->discontinuities == 2);
+}
+
+TEST_CASE("a GPU call that throws covers the frame and leaks nothing", "[plugin][pipeline][drift]") {
+  ScriptedRig rig;
+  rig.gpu.throw_capture = true;
+  const DrawPlan& plan = rig.tick(1000);
+  CHECK(plan.kind == DrawKind::Solid);
+  CHECK(rig.pipeline.ring().held() == 0);
+  rig.gpu.throw_capture = false;
+  rig.tick(1010);
+  rig.scheduler->queue.push_back(clean_release(rig.scheduler->pushed[0]));  // the frame without a texture
+  const DrawPlan& next = rig.tick(1020);
+  CHECK(next.kind == DrawKind::Solid);
+  CHECK(next.cover == Cover::NoTexture);
+}
+
+// --- The hand-off between the settings side and the render thread.
+
+namespace {
+
+struct HostRig {
+  HostRig()
+      : host(gpu, 32, [this](std::unique_ptr<spg::plugin::FrameScheduler> s) {
+          const std::lock_guard lock(mutex);
+          retired.push_back(std::move(s));
+        }) {}
+
+  std::unique_ptr<spg::plugin::PipelineSpec> spec(std::shared_ptr<spg::Detector> faces,
+                                                  FallbackMode fallback = FallbackMode::BlurSource) {
+    auto out = std::make_unique<spg::plugin::PipelineSpec>();
+    spg::SchedulerConfig config = face_config(fallback);
+    out->scheduler = std::make_unique<SyncScheduler>(clock, config, spg::ScanStages{std::move(faces), nullptr, nullptr, nullptr},
+                                                     30ms, nullptr);
+    out->fallback = fallback;
+    out->hold = config.tracker.hold;
+    return out;
+  }
+  static std::unique_ptr<spg::plugin::PipelineSpec> none(FallbackMode fallback = FallbackMode::BlurSource) {
+    auto out = std::make_unique<spg::plugin::PipelineSpec>();
+    out->fallback = fallback;
+    return out;
+  }
+  const DrawPlan& frame(std::int64_t ms, Size size = k720) {
+    clock.set(at_ms(ms));
+    ++gpu.tick;
+    return host.frame(at_ms(ms), size);
+  }
+
+  spg::ManualClock clock{at_ms(1000)};
+  FakeGpu gpu;
+  std::mutex mutex;
+  std::vector<std::unique_ptr<spg::plugin::FrameScheduler>> retired;
+  spg::plugin::PipelineHost host;
+};
+
+}  // namespace
+
+TEST_CASE("the host covers until a generation is adopted and when a build fails", "[plugin][pipeline][drift]") {
+  HostRig rig;
+  const Rect face{400, 200, 120, 160};
+  // Before any settings arrive: covered whole.
+  CHECK(rig.frame(1000).cover == Cover::NoDetection);
+  rig.host.offer(rig.spec(face_between(face, 0, 10'000)));
+  int masked = 0;
+  for (std::int64_t t = 1010; t < 1300; t += 10) {
+    masked += rig.frame(t).kind == DrawKind::Masked ? 1 : 0;
+  }
+  CHECK(masked > 10);
+  // A failed build for new settings: every frame is solid, even though the
+  // old scheduler could still release clean frames, and a second render of
+  // the same frame time gets the same answer.
+  rig.host.fail();
+  for (std::int64_t t = 1300; t < 1400; t += 10) {
+    CHECK(rig.frame(t).kind == DrawKind::Solid);
+    CHECK(rig.host.frame(at_ms(t), k720).kind == DrawKind::Solid);
+  }
+  // The policy becomes empty (a storage error): covered whole at once.
+  rig.host.offer(HostRig::none());
+  for (std::int64_t t = 1400; t < 1700; t += 10) {
+    const DrawPlan& plan = rig.frame(t);
+    CHECK(plan.kind == DrawKind::BlurWhole);
+    CHECK(plan.cover == Cover::NoDetection);
+  }
+}
+
+TEST_CASE("a generation that cannot be adopted is retried, never skipped", "[plugin][pipeline][drift]") {
+  HostRig rig;
+  const Rect face{400, 200, 120, 160};
+  rig.host.offer(rig.spec(face_between(face, 0, 10'000)));
+  for (std::int64_t t = 1000; t < 1200; t += 10) {
+    rig.frame(t);
+  }
+  REQUIRE(rig.host.status().scanning);
+  // The next settings remove the policy, but adopting them fails once.
+  int failures = 1;
+  rig.host.set_adopt_fault([&failures] {
+    if (failures-- > 0) {
+      throw std::bad_alloc();
+    }
+  });
+  rig.host.offer(HostRig::none());
+  const DrawPlan& failed = rig.frame(1200);
+  CHECK(failed.kind == DrawKind::Solid);  // not the old policy's next frame
+  CHECK(failed.cover == Cover::Inconsistent);
+  CHECK(rig.host.frame(at_ms(1200), k720).kind == DrawKind::Solid);
+  const DrawPlan& adopted = rig.frame(1210);
+  CHECK(adopted.cover == Cover::NoDetection);
+  CHECK(adopted.kind == DrawKind::BlurWhole);
+  CHECK_FALSE(rig.host.status().scanning);
+
+  // The same with a generation that has a scheduler: after a failed attempt
+  // the next frame adopts it whole, scheduler included.
+  failures = 1;
+  const auto failing = std::make_shared<spg_test::ScriptedDetector>(
+      [](Timestamp, Size) { return std::vector<Detection>{}; }, [](Timestamp) { throw std::runtime_error("x"); });
+  rig.host.offer(rig.spec(failing, FallbackMode::SolidFill));
+  CHECK(rig.frame(1220).kind == DrawKind::Solid);
+  rig.frame(1230);
+  CHECK(rig.host.status().scanning);
+  for (std::int64_t t = 1240; t < 1500; t += 10) {
+    const DrawPlan& plan = rig.frame(t);
+    if (t >= 1340) {
+      CHECK(plan.kind == DrawKind::Solid);
+      CHECK(plan.cover == Cover::NotScanned);  // released by the new scheduler
+    }
+  }
+}
+
+TEST_CASE("a generation offered twice before a frame retires the first", "[plugin][pipeline][drift]") {
+  HostRig rig;
+  rig.host.offer(rig.spec(face_between({0, 0, 10, 10}, 0, 0)));
+  rig.host.offer(HostRig::none(FallbackMode::SolidFill));
+  CHECK(rig.retired.size() == 1);
+  CHECK(rig.frame(1000).kind == DrawKind::Solid);  // the second (solid fill, no policy)
+}
+
+TEST_CASE("settings published while frames render never draw an unscanned frame", "[plugin][pipeline][drift]") {
+  HostRig rig;
+  const auto failing = std::make_shared<spg_test::ScriptedDetector>(
+      [](Timestamp, Size) { return std::vector<Detection>{}; }, [](Timestamp) { throw std::runtime_error("x"); });
+  std::vector<std::unique_ptr<spg::plugin::PipelineSpec>> specs;
+  for (int i = 0; i < 200; ++i) {
+    specs.push_back(i % 3 == 0 ? HostRig::none() : rig.spec(failing));
+  }
+  std::atomic<bool> done{false};
+  std::thread publisher([&] {
+    for (auto& s : specs) {
+      rig.host.offer(std::move(s));
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    rig.host.fail();
+    done.store(true);
+  });
+  std::int64_t t = 1000;
+  // Every cycle fails, so nothing may ever be drawn with only its masks.
+  while (!done.load()) {
+    t += 10;
+    CHECK(rig.frame(t).kind != DrawKind::Masked);
+  }
+  publisher.join();
+  CHECK(rig.frame(t + 10).kind == DrawKind::Solid);
 }
 
 TEST_CASE("the frame ring counts holders and trims idle textures", "[plugin][pipeline]") {

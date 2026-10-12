@@ -24,7 +24,7 @@ class ObsFrameGpu final : public FrameGpu {
   ObsFrameGpu(obs_source_t* filter, std::size_t slots);
   ~ObsFrameGpu() override;  // destroy()
 
-  bool capture(std::size_t slot, Size size) override;
+  bool capture(std::size_t slot, Size size, std::uint64_t serial) override;
   bool stage(std::size_t slot, std::size_t surface, Size readback) override;
   bool map(std::size_t surface, MappedReadback& out) override;
   void unmap(std::size_t surface) override;
@@ -43,6 +43,8 @@ class ObsFrameGpu final : public FrameGpu {
  private:
   bool load_effect();
   gs_texture_t* slot_texture(std::size_t slot) const;
+  // What the slot holds now, for checked_kind().
+  SlotContents contents(std::size_t slot) const;
   // Builds levels 1..level of the halving chain of `base`; returns the
   // texture of `level`, or null.
   gs_texture_t* build_chain(gs_texture_t* base, Size frame, std::uint32_t level);
@@ -50,11 +52,12 @@ class ObsFrameGpu final : public FrameGpu {
   void draw_region(gs_texture_t* level_texture, Size level_size, const LevelRegion& region,
                    const char* technique, Size output);
   void fill(float x, float y, float width, float height, std::uint32_t argb);
-  void compose(const DrawPlan& plan, Size output, bool overlay);
+  void compose(const DrawPlan& plan, DrawKind kind, Size output, bool overlay);
 
   obs_source_t* filter_;
   std::vector<gs_texrender_t*> slots_;
   std::vector<Size> slot_sizes_;
+  std::vector<std::uint64_t> slot_serials_;  // 0: nothing valid captured
   gs_texrender_t* readback_ = nullptr;
   std::array<gs_stagesurf_t*, 2> surfaces_{};
   std::array<Size, 2> surface_sizes_{};

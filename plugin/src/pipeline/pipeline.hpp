@@ -28,6 +28,7 @@
 //     workers); they go to the `retire` callback.
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -91,8 +92,10 @@ class FrameGpu {
   FrameGpu(const FrameGpu&) = delete;
   FrameGpu& operator=(const FrameGpu&) = delete;
   virtual ~FrameGpu() = default;
-  // Renders the filter's target at `size` into ring slot `slot`'s texture.
-  virtual bool capture(std::size_t slot, Size size) = 0;
+  // Renders the filter's target at `size` into ring slot `slot`'s texture
+  // and records `serial` and `size` as what the slot now holds (see
+  // SlotContents); on failure the slot must report itself empty.
+  virtual bool capture(std::size_t slot, Size size, std::uint64_t serial) = 0;
   // Draws slot `slot` scaled to `readback` and stages it into stage surface
   // `surface` (0 or 1) for mapping on the next tick.
   virtual bool stage(std::size_t slot, std::size_t surface, Size readback) = 0;
@@ -121,12 +124,18 @@ enum class Cover : std::uint8_t {
   NoDetection,      // no PolicyConfig: storage error, no categories, rejected settings
   SettingsChanged,  // within the old hold after a settings change
   NoTexture,        // the frame could not be kept (ring full or capture failed)
+  Stalled,          // nothing released for longer than Pipeline::kMaxRepeat
+  Inconsistent,     // a released frame did not match the frame buffered for it,
+                    // or the render side could not build a plan this frame
 };
-inline constexpr std::size_t kCoverCount = 9;
+inline constexpr std::size_t kCoverCount = 11;
 
 struct DrawPlan {
   DrawKind kind = DrawKind::Nothing;
   std::size_t slot = 0;  // Masked and BlurWhole
+  // The capture serial of the frame in `slot`: the GPU side draws the slot
+  // only while it still holds exactly this capture (checked_kind()).
+  std::uint64_t serial = 0;
   Size frame;            // the source size of the frame in `slot`
   std::vector<MaskRect> rects;  // Masked: Source space of `frame`
   Cover cover = Cover::None;
@@ -135,6 +144,20 @@ struct DrawPlan {
   // Shows the frame just captured (always covered whole); replaced next tick.
   bool live = false;
 };
+
+// What a ring slot holds on the GPU side right now.
+struct SlotContents {
+  bool present = false;      // a texture exists and its last capture succeeded
+  std::uint64_t serial = 0;  // the capture serial it holds
+  Size size;                 // the size it was captured at
+};
+
+// What may actually be drawn for `plan`, decided from one snapshot of the
+// slot it names: Solid whenever the slot is missing, holds another capture
+// (recycled or never captured), or a different size than the plan expects;
+// BlurWhole when a Masked plan lists a rect that is invalid or not in Source
+// space (a partial mask is never drawn); otherwise plan.kind.
+[[nodiscard]] DrawKind checked_kind(const DrawPlan& plan, const SlotContents& slot) noexcept;
 
 // One scheduler generation, made off the render thread when the settings
 // change (plugin/src/render/filter_render.cpp).
@@ -174,8 +197,9 @@ class Pipeline {
   Pipeline(const Pipeline&) = delete;
   Pipeline& operator=(const Pipeline&) = delete;
 
-  // Switches to a new generation at frame time `now`.
-  void adopt(PipelineSpec spec, Timestamp now);
+  // Switches to a new generation at frame time `now`. Strong guarantee: if it
+  // throws (allocation), nothing changed and `spec` still owns its scheduler.
+  void adopt(PipelineSpec& spec, Timestamp now);
 
   // One output frame: `t` is the video frame time, `source` the target's size
   // now. A second call with the same `t` (the source rendered in another
@@ -186,14 +210,28 @@ class Pipeline {
   [[nodiscard]] const PipelineCounters& counters() const noexcept { return counters_; }
   [[nodiscard]] std::size_t generations() const noexcept { return gens_.size(); }
   [[nodiscard]] const FrameRing& ring() const noexcept { return ring_; }
+  // Test seam: runs inside adopt() at the step that can throw (allocation).
+  void set_adopt_fault(std::function<void()> fault) { adopt_fault_ = std::move(fault); }
   // Idle textures kept for reuse beyond those in use.
   static constexpr std::size_t kMaxIdleSlots = 4;
+  // A released frame stays on screen for at most this long with nothing new
+  // released; then the live frame is covered whole (Cover::Stalled).
+  static constexpr Duration kMaxRepeat = std::chrono::milliseconds{100};
+  // Frame times further apart than this (the filter was disabled, or its
+  // source not rendered) or going backwards mark a discontinuity: content may
+  // have changed unseen, so no earlier scan or re-emit stands in for it.
+  static constexpr Duration kMaxTickGap = std::chrono::milliseconds{200};
   static constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
 
  private:
+  // A pushed frame as the pipeline recorded it; a release that does not
+  // match it (time or size) is covered whole.
   struct Buffered {
     FrameId id = 0;
     std::size_t slot = kNoSlot;
+    std::uint64_t serial = 0;
+    Timestamp t{};
+    Size size;
   };
   struct Generation {
     std::uint64_t id = 0;
@@ -207,6 +245,7 @@ class Pipeline {
     std::uint64_t generation = 0;
     FrameId frame = 0;
     std::size_t slot = 0;
+    std::uint64_t serial = 0;
     Size size;
     std::vector<MaskRect> rects;
   };
@@ -218,11 +257,12 @@ class Pipeline {
   };
 
   void push_frame(Generation& gen, Timestamp t, Size source, std::optional<std::size_t> slot);
-  std::size_t take_buffered(Generation& gen, FrameId id) noexcept;
+  std::optional<Buffered> take_buffered(Generation& gen, FrameId id) noexcept;
   void release_buffered(Generation& gen, FrameId id) noexcept;
   void show_released(Generation& gen, const ReleasedFrame& frame);
   void show_live(std::optional<std::size_t> slot, Size source, FallbackMode fallback, Cover cover);
-  void cover_whole(DrawPlan& next, std::size_t slot, Size size, FallbackMode fallback) const;
+  void cover_whole(DrawPlan& next, std::size_t slot, std::uint64_t serial, Size size, FallbackMode fallback) const;
+  void mark_discontinuity() noexcept;
   void set_display(DrawPlan& next);
   void forget_last_clean() noexcept;
   void retire_drained();
@@ -242,9 +282,13 @@ class Pipeline {
   std::optional<Staged> staged_;
   std::size_t next_surface_ = 0;
   std::optional<Timestamp> last_tick_;
+  std::optional<Timestamp> last_release_;  // tick time of the last plan made from a release
+  std::uint64_t next_serial_ = 1;
+  std::uint64_t live_serial_ = 0;  // serial of this tick's capture
   bool target_empty_ = false;
   std::vector<ReleasedFrame> released_;
   PipelineCounters counters_;
+  std::function<void()> adopt_fault_;
 };
 
 }  // namespace spg::plugin

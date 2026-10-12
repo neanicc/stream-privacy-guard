@@ -36,6 +36,10 @@ std::uint32_t cover_colour(Cover cover) noexcept {
       return 0xFF2979FF;  // blue
     case Cover::NoTexture:
       return 0xFFFFFFFF;  // white
+    case Cover::Stalled:
+      return 0xFFFFEA00;  // yellow
+    case Cover::Inconsistent:
+      return 0xFF00E5FF;  // cyan
   }
   return 0xFFFFFFFF;
 }
@@ -69,7 +73,7 @@ gs_texrender_t* ensure(gs_texrender_t*& texrender) {
 }  // namespace
 
 ObsFrameGpu::ObsFrameGpu(obs_source_t* filter, std::size_t slots)
-    : filter_(filter), slots_(slots, nullptr), slot_sizes_(slots) {}
+    : filter_(filter), slots_(slots, nullptr), slot_sizes_(slots), slot_serials_(slots, 0) {}
 
 ObsFrameGpu::~ObsFrameGpu() {
   destroy();
@@ -99,10 +103,26 @@ gs_texture_t* ObsFrameGpu::slot_texture(std::size_t slot) const {
   return slot < slots_.size() && slots_[slot] != nullptr ? gs_texrender_get_texture(slots_[slot]) : nullptr;
 }
 
-bool ObsFrameGpu::capture(std::size_t slot, Size size) {
+SlotContents ObsFrameGpu::contents(std::size_t slot) const {
+  SlotContents out;
+  if (slot < slots_.size() && slot_texture(slot) != nullptr) {
+    out.present = true;
+    out.serial = slot_serials_[slot];
+    out.size = slot_sizes_[slot];
+  }
+  return out;
+}
+
+bool ObsFrameGpu::capture(std::size_t slot, Size size, std::uint64_t serial) {
+  if (slot >= slots_.size()) {
+    return false;
+  }
+  // Until this capture completes the slot holds nothing a plan may draw.
+  slot_serials_[slot] = 0;
+  slot_sizes_[slot] = {};
   obs_source_t* target = obs_filter_get_target(filter_);
   obs_source_t* parent = obs_filter_get_parent(filter_);
-  if (target == nullptr || parent == nullptr || slot >= slots_.size() || ensure(slots_[slot]) == nullptr) {
+  if (target == nullptr || parent == nullptr || ensure(slots_[slot]) == nullptr) {
     return false;
   }
   gs_texrender_reset(slots_[slot]);
@@ -125,12 +145,13 @@ bool ObsFrameGpu::capture(std::size_t slot, Size size) {
   gs_blend_state_pop();
   gs_texrender_end(slots_[slot]);
   slot_sizes_[slot] = size;
+  slot_serials_[slot] = serial;
   return true;
 }
 
 bool ObsFrameGpu::stage(std::size_t slot, std::size_t surface, Size readback) {
   gs_texture_t* texture = slot_texture(slot);
-  if (texture == nullptr || surface >= surfaces_.size() || !load_effect()) {
+  if (texture == nullptr || slot_serials_[slot] == 0 || surface >= surfaces_.size() || !load_effect()) {
     return false;
   }
   if (slot_sizes_[slot] != readback) {
@@ -190,6 +211,7 @@ void ObsFrameGpu::free_slot(std::size_t slot) {
     gs_texrender_destroy(slots_[slot]);
     slots_[slot] = nullptr;
     slot_sizes_[slot] = {};
+    slot_serials_[slot] = 0;
   }
 }
 
@@ -258,13 +280,13 @@ gs_texture_t* ObsFrameGpu::build_chain(gs_texture_t* base, Size frame, std::uint
   return below;
 }
 
-void ObsFrameGpu::compose(const DrawPlan& plan, Size output, bool overlay) {
+void ObsFrameGpu::compose(const DrawPlan& plan, DrawKind kind, Size output, bool overlay) {
   const float ow = f(output.width);
   const float oh = f(output.height);
-  gs_texture_t* frame = plan.kind == DrawKind::Solid ? nullptr : slot_texture(plan.slot);
-  if (plan.kind == DrawKind::Solid || frame == nullptr) {
+  gs_texture_t* frame = kind == DrawKind::Solid ? nullptr : slot_texture(plan.slot);
+  if (kind == DrawKind::Solid || frame == nullptr) {
     fill(0.0F, 0.0F, ow, oh, 0xFF000000);
-  } else if (plan.kind == DrawKind::BlurWhole) {
+  } else if (kind == DrawKind::BlurWhole) {
     const std::uint32_t level = whole_level(plan.frame);
     gs_texture_t* coarse = build_chain(frame, plan.frame, level);
     if (coarse == nullptr || level == 0) {
@@ -322,14 +344,17 @@ void ObsFrameGpu::compose(const DrawPlan& plan, Size output, bool overlay) {
       }
     }
   }
-  if (overlay && plan.cover != Cover::None) {
+  if (overlay && (plan.cover != Cover::None || kind != plan.kind)) {
     const float side = std::max(8.0F, std::min(ow, oh) / 24.0F);
-    fill(0.0F, 0.0F, side, side, cover_colour(plan.cover));
+    fill(0.0F, 0.0F, side, side, cover_colour(kind != plan.kind ? Cover::Inconsistent : plan.cover));
   }
 }
 
 void ObsFrameGpu::draw(const DrawPlan& plan, Size output, bool overlay) {
-  if (plan.kind == DrawKind::Nothing || output.width == 0 || output.height == 0) {
+  // Decide from one snapshot of the slot: a plan whose texture was recycled,
+  // never captured or captured at another size is not drawn from it.
+  const DrawKind kind = checked_kind(plan, contents(plan.slot));
+  if (kind == DrawKind::Nothing || output.width == 0 || output.height == 0) {
     return;
   }
   if (!load_effect() || ensure(output_) == nullptr) {
@@ -343,7 +368,7 @@ void ObsFrameGpu::draw(const DrawPlan& plan, Size output, bool overlay) {
   gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
   const bool begun = begin_target(output_, output);
   if (begun) {
-    compose(plan, output, overlay);
+    compose(plan, kind, output, overlay);
     gs_texrender_end(output_);
   }
   gs_blend_state_pop();
