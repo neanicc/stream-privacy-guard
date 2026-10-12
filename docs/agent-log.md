@@ -985,3 +985,43 @@ Template:
   Windows loads the plugin and reports dump exclusion `none` instead of
   failing to load the DLL. The Windows branch was syntax-checked locally
   against a stub `windows.h` only; the Windows CI job is the build evidence.
+
+## 2026-10-12 — SPG-11 CPU compositor and spg-cli (#49)
+
+- Decision / change: `spg::compose()` and `fit_mask_rects()` in
+  `core/include/spg/compose.hpp` and `core/src/compose/compositor.cpp`, and
+  `spg-cli run`, `eval` and `bench` in `cli/src/`; rules in [cli.md](cli.md).
+  `eval/run_eval.py` now runs `spg-cli eval` on the generated suites, and the
+  `THRESHOLDS: NOT RUN` path is gone from it and from `scripts/ci/run.sh`: a
+  missing or failing `spg-cli` is `THRESHOLDS: FAIL` in every mode.
+  Choices: (1) `run` and `eval` drive `spg::Lookahead` on a `ManualClock`
+  with simulated time: a fixed 200 ms cycle and 2 simulated workers, so plans
+  do not depend on runner speed. Real timing is `bench --realtime` on
+  `spg::Scheduler` and the wall clock (the local realtime suite, SPG-16).
+  (2) After the last real frame both drivers keep feeding padding frames (the
+  last frame repeated, never composed or written) until every real frame is
+  released, as a live source would. (3) Readback scale defaults to 1 (full
+  frame); SPG-14 decides the plugin's readback size and the CLI default must
+  follow. (4) `kMaskRectCapacity` = 64 rects per frame for the GPU effect's
+  fixed array; `fit_mask_rects()` drops contained rects, then merges the pair
+  whose hull adds the least area (stronger style wins), so coverage only
+  grows. `driver_config()` caps `max_retro_rects` and the tracker's
+  `max_rects_per_track` at the capacity. (5) Scoring stays in the Python
+  scorer; the CLI writes plans only. (6) PNG I/O uses stb_image
+  2.30 and stb_image_write 1.16, pinned by commit `31c1ad37` and per-header
+  SHA-256 in `cli/CMakeLists.txt`. (7) The per-track recognition cache is not
+  used, because `run_scan()` has no track ids: every region is read every
+  cycle (time, not recall).
+- Review fixes: (1) Ubuntu CI (GCC 13, `-O3 -Werror`) failed on a false
+  `-Wmaybe-uninitialized` in `std::optional<std::pair<FrameId,
+  BgraImage>>::emplace` in `cli/src/driver.cpp`; the eval job shares the
+  compile step and failed there too, before any suite ran. The last clean
+  frame is now held in plain members. (2) Staff review P2: a blur or
+  pixelate rect under 2 px on a side was drawn unchanged (a 1x1 box blur or
+  block is the pixel itself); such rects are now filled, with a unit case for
+  1x1, 1xN and Nx1 rects in both styles. P3 (prefetch thread and
+  `StageTimes`) declined: `StageTimes::add` takes its mutex.
+- Open issues or follow-ups: live OBS not tested (the plugin does not use the
+  pipeline until SPG-14); GPU parity with this reference compositor is
+  SPG-14's; whether the blur defeats OCR is SPG-18's. The `NOT RUN` mention
+  in the human-owned autopilot skill is left for a human.

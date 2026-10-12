@@ -70,7 +70,27 @@ std::uint8_t* pixel_at(BgraImage& image, std::size_t x, std::size_t y) {
   return image.pixels.data() + (y * image.width + x) * kBytesPerPixel;
 }
 
+void fill(BgraImage& image, const PixelRect& r, const CompositorConfig& config) {
+  for (auto y = static_cast<std::size_t>(r.y); y < static_cast<std::size_t>(r.y + r.height); ++y) {
+    for (auto x = static_cast<std::size_t>(r.x); x < static_cast<std::size_t>(r.x + r.width); ++x) {
+      std::uint8_t* p = pixel_at(image, x, y);
+      for (std::size_t c = 0; c < kChannels; ++c) {
+        p[c] = config.fill_bgr[c];
+      }
+    }
+  }
+}
+
+// A rect under 2 px on a side has nothing to average across (a 1x1 blur or
+// pixelate block returns the pixel unchanged), so it is filled instead: a
+// mask must always hide what it covers.
+bool too_thin(const PixelRect& r) noexcept { return r.width < 2 || r.height < 2; }
+
 void blur(BgraImage& image, const PixelRect& r, const CompositorConfig& config) {
+  if (too_thin(r)) {
+    fill(image, r, config);
+    return;
+  }
   const auto w = static_cast<std::size_t>(r.width);
   const auto h = static_cast<std::size_t>(r.height);
   const auto x0 = static_cast<std::size_t>(r.x);
@@ -89,6 +109,10 @@ void blur(BgraImage& image, const PixelRect& r, const CompositorConfig& config) 
 }
 
 void pixelate(BgraImage& image, const PixelRect& r, const CompositorConfig& config) {
+  if (too_thin(r)) {
+    fill(image, r, config);
+    return;
+  }
   const auto w = static_cast<std::size_t>(r.width);
   const auto h = static_cast<std::size_t>(r.height);
   const auto x0 = static_cast<std::size_t>(r.x);
@@ -120,17 +144,6 @@ void pixelate(BgraImage& image, const PixelRect& r, const CompositorConfig& conf
             p[c] = mean[c];
           }
         }
-      }
-    }
-  }
-}
-
-void fill(BgraImage& image, const PixelRect& r, const CompositorConfig& config) {
-  for (auto y = static_cast<std::size_t>(r.y); y < static_cast<std::size_t>(r.y + r.height); ++y) {
-    for (auto x = static_cast<std::size_t>(r.x); x < static_cast<std::size_t>(r.x + r.width); ++x) {
-      std::uint8_t* p = pixel_at(image, x, y);
-      for (std::size_t c = 0; c < kChannels; ++c) {
-        p[c] = config.fill_bgr[c];
       }
     }
   }

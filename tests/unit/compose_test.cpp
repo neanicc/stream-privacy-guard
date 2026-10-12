@@ -256,3 +256,30 @@ TEST_CASE("compose rejects invalid images, configs and rects", "[compose]") {
   plan.rects[0].box.space = spg::Space::ModelInput;
   CHECK_THROWS_AS(spg::compose(image, plan, FallbackAction::None), spg::ContractError);
 }
+
+TEST_CASE("compose fills rects too thin to blur or pixelate", "[compose]") {
+  // A 1x1 blur or pixelate block would return the pixel unchanged; a mask
+  // must never leave what it covers as it was.
+  spg::CompositorConfig config;
+  config.fill_bgr = {1, 2, 3};
+  for (const MaskStyle style : {MaskStyle::Blur, MaskStyle::Pixelate}) {
+    const BgraImage before = checkerboard(16, 16);
+    BgraImage image = before;
+    MaskPlan plan;
+    plan.rects = {rect(5, 5, 1, 1, style), rect(9, 2, 1, 6, style), rect(2, 12, 7, 1, style)};
+    spg::compose(image, plan, FallbackAction::None, config);
+    for (std::uint32_t y = 0; y < 16; ++y) {
+      for (std::uint32_t x = 0; x < 16; ++x) {
+        const bool masked = (x == 5 && y == 5) || (x == 9 && y >= 2 && y < 8) || (y == 12 && x >= 2 && x < 9);
+        if (masked) {
+          REQUIRE(px(image, x, y)[0] == 1);
+          REQUIRE(px(image, x, y)[1] == 2);
+          REQUIRE(px(image, x, y)[2] == 3);
+        } else {
+          REQUIRE(same_pixel(image, before, x, y));
+        }
+        REQUIRE(px(image, x, y)[3] == 200);
+      }
+    }
+  }
+}

@@ -76,7 +76,9 @@ BGRA pixels. It is the reference the GPU effect (SPG-14) must match or exceed.
   outward to whole pixels and clipped, in its style. Blur is a box blur run 3
   times per axis (close to a Gaussian), radius `max(12, 0.5 * shorter side)`,
   mixing only pixels of the same rect; pixelate uses blocks of
-  `max(8, 0.25 * shorter side)`; solid fill is black. Alpha is left alone.
+  `max(8, 0.25 * shorter side)`; solid fill is black. A blur or pixelate
+  rect under 2 px on a side is filled instead, since a 1x1 blur or block
+  returns the pixel unchanged. Alpha is left alone.
 - `BlurSource`: the whole frame blurred. `SolidFill`: the whole frame filled.
   `HoldLastScanned` is the caller's job (show the re-emitted frame; the CLI
   keeps the last clean composed frame); drawn by `compose()` it blurs the
