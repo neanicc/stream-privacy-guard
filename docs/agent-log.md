@@ -876,3 +876,9 @@ Template:
   characters: unchanged. Recorded in `docs/policy.md` for the scheduler
   ticket. Mutation check: mapping a shared region under the lock failed the
   lock-scope unit case.
+- Review fix (staff review on `f18d74a`): `WerRegisterExcludedMemoryBlock`
+  and its undo (Windows 10 1703 and later) are resolved from `kernel32.dll`
+  with `GetProcAddress` instead of imported through `wer.lib`, so an older
+  Windows loads the plugin and reports dump exclusion `none` instead of
+  failing to load the DLL. The Windows branch was syntax-checked locally
+  against a stub `windows.h` only; the Windows CI job is the build evidence.

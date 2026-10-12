@@ -14,8 +14,6 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-// windows.h first: werapi.h needs its types.
-#include <werapi.h>
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -38,6 +36,37 @@ void secure_wipe(void* data, std::size_t size) noexcept {
 }
 
 namespace {
+
+#if defined(_WIN32)
+// WerRegisterExcludedMemoryBlock and its undo exist from Windows 10 1703 on.
+// They are looked up at run time instead of imported, so on an older Windows
+// the DLL that holds spg-core still loads and dump exclusion reports "none".
+struct WerExclusion {
+  using Register = HRESULT(WINAPI*)(const void*, DWORD);
+  using Unregister = HRESULT(WINAPI*)(const void*);
+  Register register_block = nullptr;
+  Unregister unregister_block = nullptr;
+};
+
+const WerExclusion& wer_exclusion() noexcept {
+  static const WerExclusion calls = [] {
+    WerExclusion found;
+    const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (kernel != nullptr) {
+      // Through void*: GetProcAddress returns a generic FARPROC.
+      found.register_block = reinterpret_cast<WerExclusion::Register>(
+          reinterpret_cast<void*>(GetProcAddress(kernel, "WerRegisterExcludedMemoryBlock")));
+      found.unregister_block = reinterpret_cast<WerExclusion::Unregister>(
+          reinterpret_cast<void*>(GetProcAddress(kernel, "WerUnregisterExcludedMemoryBlock")));
+    }
+    if (found.register_block == nullptr || found.unregister_block == nullptr) {
+      found = WerExclusion{};  // both or neither
+    }
+    return found;
+  }();
+  return calls;
+}
+#endif
 
 class NativePlatform final : public SecureMemoryPlatform {
  public:
@@ -74,10 +103,11 @@ class NativePlatform final : public SecureMemoryPlatform {
 #if defined(_WIN32)
     // Windows Error Reporting leaves registered blocks out of the dumps it
     // writes (at most WER_MAX_REGISTERED_ENTRIES blocks per process).
-    if (bytes > MAXDWORD) {
+    const WerExclusion& wer = wer_exclusion();
+    if (wer.register_block == nullptr || bytes > MAXDWORD) {
       return false;
     }
-    return WerRegisterExcludedMemoryBlock(region, static_cast<DWORD>(bytes)) == S_OK;
+    return wer.register_block(region, static_cast<DWORD>(bytes)) == S_OK;
 #elif defined(MADV_DONTDUMP)
     // Linux: the kernel's core dump (and so systemd-coredump) skips the region.
     return ::madvise(region, bytes, MADV_DONTDUMP) == 0;
@@ -92,7 +122,11 @@ class NativePlatform final : public SecureMemoryPlatform {
   void include_in_dumps(void* region, std::size_t bytes) noexcept override {
 #if defined(_WIN32)
     static_cast<void>(bytes);
-    WerUnregisterExcludedMemoryBlock(region);
+    // Only called for a region exclude_from_dumps() registered, so the
+    // function was found.
+    if (const WerExclusion& wer = wer_exclusion(); wer.unregister_block != nullptr) {
+      wer.unregister_block(region);
+    }
 #else
     // munmap drops the madvise flag with the mapping.
     static_cast<void>(region);
@@ -118,7 +152,7 @@ class NativePlatform final : public SecureMemoryPlatform {
 
   [[nodiscard]] const char* dump_exclusion_method() const noexcept override {
 #if defined(_WIN32)
-    return "WerRegisterExcludedMemoryBlock";
+    return wer_exclusion().register_block != nullptr ? "WerRegisterExcludedMemoryBlock" : "none";
 #elif defined(MADV_DONTDUMP)
     return "madvise(MADV_DONTDUMP)";
 #else

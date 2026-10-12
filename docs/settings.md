@@ -150,7 +150,11 @@ an entry that spg-core or the plugin makes lives in `SecureHeap`
   lock, which guards only the free lists and the region list.
 - Each region is excluded from crash dumps where the OS has a call for it,
   before any block in it is used: `madvise(MADV_DONTDUMP)` on Linux,
-  `WerRegisterExcludedMemoryBlock` on Windows. macOS has none.
+  `WerRegisterExcludedMemoryBlock` on Windows. macOS has none. The Windows
+  call exists from Windows 10 1703 on and is looked up in `kernel32.dll` at
+  run time, not imported: on an older Windows the plugin still loads and
+  reports `none`, rather than failing to load (which would leave a scene's
+  filter unapplied).
 - Each region is locked in RAM (`mlock`, `VirtualLock`) so it is not paged to
   swap. Best effort: `RLIMIT_MEMLOCK` or the Windows working-set quota can
   refuse it, and the heap then carries on unlocked.
