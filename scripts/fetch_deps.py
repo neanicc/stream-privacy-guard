@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -151,11 +152,13 @@ def exclusive_lock(path: Path) -> Iterator[None]:
             handle.seek(0)
             while True:
                 try:
-                    # LK_LOCK retries for about 10 s, then raises; keep waiting.
+                    # LK_LOCK retries for about 10 s, then raises EDEADLOCK
+                    # while another process holds the lock; keep waiting then.
                     msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
                     break
-                except OSError:
-                    continue
+                except OSError as exc:
+                    if exc.errno not in (errno.EDEADLK, errno.EACCES):
+                        raise
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:

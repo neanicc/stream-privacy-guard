@@ -118,6 +118,36 @@ class FetchDepsTest(unittest.TestCase):
         dest = self.cache / "deps" / "pkg" / "1.0-linux-x64"
         self.assertEqual((dest / "include" / "pkg.h").read_bytes(), b"// header\n")
 
+    def test_windows_lock_waits_on_contention_and_raises_other_errors(self) -> None:
+        # Exercises the msvcrt branch on every host with a fake msvcrt.
+        attempts = []
+
+        def make_fake(failures: list[int]) -> mock.Mock:
+            fake = mock.Mock(LK_LOCK=1, LK_UNLCK=0)
+
+            def locking(_fd: int, mode: int, _nbytes: int) -> None:
+                attempts.append(mode)
+                if mode == fake.LK_LOCK and failures:
+                    code = failures.pop(0)
+                    raise OSError(code, "fake")
+
+            fake.locking.side_effect = locking
+            return fake
+
+        lock = self.cache / "locks" / "x.lock"
+        with mock.patch.object(fetch_deps.os, "name", "nt"):
+            busy = make_fake([fetch_deps.errno.EDEADLK, fetch_deps.errno.EACCES])
+            with mock.patch.object(fetch_deps, "msvcrt", busy, create=True):
+                with fetch_deps.exclusive_lock(lock):
+                    pass
+            self.assertEqual(attempts, [1, 1, 1, 0])  # two waits, lock, unlock
+
+            broken = make_fake([fetch_deps.errno.EBADF])
+            with mock.patch.object(fetch_deps, "msvcrt", broken, create=True):
+                with self.assertRaises(OSError):
+                    with fetch_deps.exclusive_lock(lock):
+                        self.fail("entered the block without the lock")
+
     def test_refuses_hash_mismatch_and_discards_download(self) -> None:
         good = make_tar({"pkg-1.0/a": b"a"})
         expected = hashlib.sha256(good).hexdigest()

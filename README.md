@@ -32,7 +32,9 @@ build/cli/Release/spg-cli.exe --version     # Windows (Visual Studio puts binari
 
 `setup` downloads the archives listed in [deps/manifest.json](deps/manifest.json)
 once into `$SPG_CACHE_DIR` (default `~/.cache/spg`) and refuses any whose hash
-does not match. Catch2 is fetched by CMake, also pinned by hash. ccache from the
+does not match. An unpacked dependency is trusted once its `.spg-fetch.json`
+marker matches the manifest; delete `$SPG_CACHE_DIR/deps/<name>/` to force a
+fresh unpack. Catch2 is fetched by CMake, also pinned by hash. ccache from the
 manifest is used automatically and keeps its cache in `$SPG_CACHE_DIR/ccache`.
 To build without ONNX Runtime and OpenCV, configure with `-DSPG_WITH_DEPS=OFF`.
 [docs/ci.md](docs/ci.md) describes the CI checks these commands mirror.
