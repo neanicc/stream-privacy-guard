@@ -16,8 +16,8 @@ namespace spg {
 
 namespace {
 
-// Source sizes remembered for rescaling late results. A job older than this
-// many resizes is treated as incomplete.
+// Source sizes remembered for rescaling late results. A complete result from
+// a job older than this many resizes cannot be rescaled and fails closed.
 constexpr std::size_t kMaxSizeHistory = 64;
 
 const SchedulerConfig& validated(const SchedulerConfig& config) {
