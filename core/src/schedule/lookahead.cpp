@@ -187,14 +187,24 @@ void Lookahead::complete(const ScanJob& job, const ScanResult& result) {
     throw ContractError("lookahead: complete() for a job that is not in flight");
   }
   in_flight_.erase(it);
-  if (!result.complete) {
+  if (result.detections_lost) {
+    // The cycle found boxes it could not return: nothing can hold or
+    // retro-mask what is missing, so every frame they could have masked
+    // fails closed.
+    fail_closed(job);
+    return;
+  }
+  // An incomplete cycle covers no frame, but the boxes its finished stages
+  // found are still held and masked retroactively (a partial cycle), so a
+  // later cycle that misses them cannot air them inside the hold.
+  if (!result.complete && result.detections.empty()) {
     ++stats_.scans_failed;
     return;
   }
   if (job.size_epoch < first_epoch_) {
-    // Complete, but from before more resizes than the size history holds:
-    // its boxes cannot be scaled to the current size. Dropping it would let
-    // frames another cycle covers air without boxes held over them.
+    // From before more resizes than the size history holds: its boxes cannot
+    // be scaled to the current size. Dropping them would let frames another
+    // cycle covers air without boxes held over them.
     fail_closed(job);
     return;
   }
@@ -206,7 +216,11 @@ void Lookahead::complete(const ScanJob& job, const ScanResult& result) {
     fail_closed(job);
     return;
   }
-  ++stats_.scans_completed;
+  if (result.complete) {
+    ++stats_.scans_completed;
+  } else {
+    ++stats_.scans_failed;
+  }
 }
 
 void Lookahead::fail_closed(const ScanJob& job) noexcept {
@@ -272,7 +286,8 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
         add_retro(frame, r);
       }
     }
-    if (frame.segment == job.segment) {
+    // Only a complete cycle is a scan; a partial one only adds masks.
+    if (result.complete && frame.segment == job.segment) {
       frame.covered = true;
     }
   }
