@@ -136,7 +136,8 @@ enum class Cover : std::uint8_t {
   BadTimestamp,     // scheduler: frame time not increasing or off the clock
   ApplyFailed,      // scheduler: a result could not be fully applied
   Starting,         // nothing released yet (the first lookahead after a start)
-  NoDetection,      // no PolicyConfig: storage error, no categories, rejected settings
+  NoDetection,      // no PolicyConfig (storage error, no categories, rejected
+                    // settings) or no detection models (loading, missing, failed)
   SettingsChanged,  // within the old hold after a settings change
   NoTexture,        // the frame could not be kept (ring full or capture failed)
   Stalled,          // nothing released for longer than Pipeline::kMaxRepeat

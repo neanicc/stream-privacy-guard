@@ -5,10 +5,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -217,6 +219,42 @@ TEST_CASE("Unusable model files fail with clear errors", "[runtime]") {
     });
     CHECK_THAT(message, ContainsSubstring("not_a_model.onnx"));
     CHECK_THAT(message, ContainsSubstring("cpu:"));
+  }
+}
+
+std::vector<std::byte> file_bytes(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+  std::vector<std::byte> bytes(text.size());
+  std::transform(text.begin(), text.end(), bytes.begin(), [](char c) { return static_cast<std::byte>(c); });
+  return bytes;
+}
+
+TEST_CASE("A model opens from bytes without reading its file", "[runtime]") {
+  // The label names a file that does not exist: only the bytes are read.
+  const fs::path label = fixture("verified_elsewhere.onnx");
+  std::vector<std::byte> bytes = file_bytes(fixture("scale_static.onnx"));
+  REQUIRE_FALSE(bytes.empty());
+  const Session session = Session::open(shared_env(), spg::runtime::ModelBytes{label, bytes}, cpu_only());
+  CHECK(session.model_path() == label);
+  CHECK(session.metadata("spg_fixture") == "scale-by-two");
+  // ONNX Runtime keeps no reference to the caller's buffer.
+  std::fill(bytes.begin(), bytes.end(), std::byte{0});
+  bytes.clear();
+  bytes.shrink_to_fit();
+  const std::vector<float> input{1.0F, -2.0F, 3.5F, 0.0F, 10.0F, -0.25F};
+  CHECK(doubled(session, input, {2, 3}) == times_two(input));
+
+  SECTION("unparsable bytes are ModelLoadFailed and name the label") {
+    const std::vector<std::byte> junk = file_bytes(fixture("not_a_model.onnx"));
+    const std::string message = error_of(ErrorCode::ModelLoadFailed, [&] {
+      static_cast<void>(Session::open(shared_env(), spg::runtime::ModelBytes{label, junk}));
+    });
+    CHECK_THAT(message, ContainsSubstring("verified_elsewhere.onnx"));
+  }
+  SECTION("no bytes is ModelLoadFailed") {
+    error_of(ErrorCode::ModelLoadFailed,
+             [&] { static_cast<void>(Session::open(shared_env(), spg::runtime::ModelBytes{label, {}})); });
   }
 }
 

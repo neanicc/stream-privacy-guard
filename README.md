@@ -12,10 +12,11 @@ blurring the whole source. Some things will still get through; the eval in this
 repo measures how often.
 
 > Status: pre-alpha. The build foundation exists (`spg-core`, `spg-cli`, tests
-> and pinned dependencies), and the OBS filter runs its lookahead, readback and
-> blur path, but it does not load the detection models yet: every frame airs
-> covered whole (fail closed) instead of with only sensitive regions blurred.
-> Nothing here protects a stream today.
+> and pinned dependencies), and the OBS filter loads the pinned detection models
+> (`scripts/fetch_models.py` puts them in `~/.cache/spg/models`) to blur detected
+> faces and sensitive text; without them it covers the whole source (fails
+> closed). It has not been checked in a live OBS session yet, and its recall on
+> real content is not measured: do not rely on it for a stream.
 
 ## Install
 
@@ -45,7 +46,9 @@ packages for each OS (the `packages-<os>` artifacts of the Check workflow);
    Windows). It downloads YuNet and PP-OCR from the URLs pinned in
    `models/manifest.json`, checks each file's size and SHA-256, and installs
    them in `~/.cache/spg/models` (`%USERPROFILE%\.cache\spg\models` on
-   Windows, or `$SPG_CACHE_DIR/models`). Nothing downloads models at runtime.
+   Windows, or `$SPG_CACHE_DIR/models`). The plugin looks in its own
+   `data/models/` first, then in that cache, and checks each file's size and
+   SHA-256 again before loading it. Nothing downloads models at runtime.
 4. Start OBS. To remove the plugin, delete what you copied; watch-list files
    stay in OBS's `plugin_config/obs-spg/` folder and the models in the cache
    until you delete them.
@@ -89,10 +92,10 @@ Read these before you rely on the filter.
 
 - **Anything missed has already aired.** No setting makes detection complete.
   Keep personal information off screen; the filter is a second line.
-- **This build does not run detection in OBS.** The plugin does not load the
-  models yet, so every frame airs covered whole by the fallback after the
-  lookahead (fail closed). Loading the models in the plugin is SPG-14b
-  ([#61](https://github.com/neanicc/stream-privacy-guard/pull/61)).
+- **Detection needs the models.** The plugin loads them once, on its own
+  thread, when the first filter is created. Until they load, and whenever one
+  is missing or fails its size or SHA-256 check, every frame airs covered
+  whole; after fetching them, restart OBS.
 - **Not verified in a live OBS session.** CI loads the module into a headless
   libobs on macOS and Windows and checks its exports on Linux; nobody has run
   it in the OBS app on a real source yet ([docs/live-check.md](docs/live-check.md)).
@@ -195,8 +198,9 @@ license are present, every library the module imports is shipped beside it
 or comes from OBS or the OS, nothing unused is shipped, macOS rpaths stay
 inside the bundle and its signature verifies, and no model file is present
 unless `--with-models` was given. `--with-models` copies the pinned models
-from `$SPG_CACHE_DIR` into the plugin's `data/models/` with their MIT and
-Apache-2.0 licenses, for local use; CI never passes it.
+from `$SPG_CACHE_DIR` into the plugin's `data/models/` (the first place it
+looks) with their MIT and Apache-2.0 licenses, for local use; CI never
+passes it.
 Draft notes for the first release: [docs/release-notes/0.1.0.md](docs/release-notes/0.1.0.md).
 
 ## How it works

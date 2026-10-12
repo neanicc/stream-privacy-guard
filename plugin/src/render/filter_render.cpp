@@ -6,6 +6,8 @@
 #include <chrono>
 #include <utility>
 
+#include "model_loading.hpp"
+#include "models/model_set.hpp"
 #include "pipeline/reaper.hpp"
 #include "plugin-support.hpp"
 #include "settings/filter_settings.hpp"
@@ -33,14 +35,6 @@ const Clock& obs_clock() noexcept {
 // still be draining after a settings change, plus the frame on screen and
 // the last clean frame.
 constexpr std::size_t kRingCapacity = 2 * SchedulerConfig{}.max_buffered_frames + 2;
-
-// The detection stages for `policy`. Not loaded by this build yet (models and
-// ONNX Runtime in the plugin are a follow-up to SPG-14): with no detector for
-// an enabled category every cycle fails (ScanFailure::MissingStage), so every
-// frame is released with the fallback. Never fail open.
-ScanStages make_stages(const PolicyConfig& /*policy*/) {
-  return ScanStages{};
-}
 
 constexpr std::uint64_t kLogInterval = 10'000'000'000ULL;  // ns
 
@@ -88,9 +82,16 @@ FilterRender::FilterRender(obs_source_t* filter)
     : filter_(filter),
       gpu_(filter, kRingCapacity),
       host_(gpu_, kRingCapacity,
-            [](std::unique_ptr<FrameScheduler> scheduler) { module_reaper().retire(std::move(scheduler)); }) {}
+            [](std::unique_ptr<FrameScheduler> scheduler) { module_reaper().retire(std::move(scheduler)); }) {
+  // Last, so a throw above leaves nothing subscribed. Loading runs on the
+  // hub's thread; until it ends this filter publishes no scheduler.
+  models_listener_ = module_models().subscribe([this] { models_changed(); });
+  module_models().start();
+}
 
 FilterRender::~FilterRender() {
+  // No models_changed() runs on this object once this returns.
+  module_models().unsubscribe(models_listener_);
   // host_ is destroyed after this body (members in reverse order), retiring
   // its schedulers; the GPU resources go first, inside the graphics context.
   gpu_.destroy();
@@ -109,6 +110,35 @@ void FilterRender::publish(const std::optional<PolicyConfig>& policy, FallbackMo
   }
 }
 
+void FilterRender::models_changed() noexcept {
+  bool first_failure = false;
+  try {
+    const std::lock_guard lock(publish_mutex_);
+    // As in tick(): after a failed settings change there is nothing to
+    // rebuild (the old settings must not run again).
+    if (have_published_ && (!publish_failed_ || refit_failed_)) {
+      try {
+        publish_locked(published_, published_fallback_, published_budget_);
+      } catch (...) {
+        first_failure = !refit_failed_;
+        refit_failed_ = true;  // tick() retries it after a resize; a publish clears it
+        throw;
+      }
+    }
+  } catch (...) {
+    // No scheduler with the models: cover everything until one is built.
+    host_.fail();
+    if (first_failure) {
+      log(LOG_WARNING, "could not start detection for these settings: covering the whole source");
+    }
+  }
+  // OBS does not rebuild a properties view on its own, so one opened while
+  // the models loaded would keep saying "loading". This only emits the
+  // source's update_properties signal; the frontend reloads the view on its
+  // own (UI) thread.
+  obs_source_update_properties(filter_);
+}
+
 void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, FallbackMode fallback,
                                   std::uint64_t budget_bytes) {
   Size source = source_size();
@@ -119,10 +149,14 @@ void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, Fal
       policy ? Duration{std::chrono::milliseconds(clamp_lookahead_ms(policy->lookahead.count()))} : Duration{};
   const LookaheadFit fit = fit_lookahead(requested, budget_bytes, source,
                                          texture_bytes(source, gpu_.bits_per_pixel()), video_frame_interval());
+  // Already loaded on the hub's thread: nothing here opens or warms up a model.
+  const ModelHub::Snapshot models = module_models().snapshot();
   if (have_published_ && !publish_failed_ && published_ == policy && published_fallback_ == fallback &&
-      published_budget_ == budget_bytes && published_lookahead_ == fit.lookahead) {
+      published_budget_ == budget_bytes && published_lookahead_ == fit.lookahead &&
+      published_models_ == models.generation) {
     // The same generation (a debug overlay toggle, an unrelated update, a
-    // resize that fits the same lookahead): only the status is refreshed.
+    // resize that fits the same lookahead, the same models): only the status
+    // is refreshed.
     static_cast<void>(budget_notice_.update(fit));
     return;
   }
@@ -131,7 +165,9 @@ void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, Fal
   auto spec = std::make_unique<PipelineSpec>();
   spec->fallback = policy ? policy->fallback : fallback;
   spec->ring_budget_bytes = budget_bytes;
-  if (policy) {
+  // Without models (still loading, missing, damaged) no scheduler is built:
+  // every frame is covered whole (Cover::NoDetection), nothing is scanned.
+  if (policy && models.models != nullptr) {
     SchedulerConfig config = SchedulerConfig::from_policy(*policy);
     // Clamped again where consumed (settings are clamped when read), then
     // shortened to what the ring can hold within the VRAM budget.
@@ -140,18 +176,26 @@ void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, Fal
     config.tracker.hold = std::chrono::milliseconds(clamp_hold_ms(policy->hold.count()));
     config.shutdown_timeout = kWorkerJoinTimeout;
     spec->hold = config.tracker.hold;
-    spec->scheduler = std::make_unique<ThreadedScheduler>(obs_clock(), std::move(config), make_stages(*policy));
+    spec->scheduler =
+        std::make_unique<ThreadedScheduler>(obs_clock(), std::move(config), make_stages(models.models, *policy));
   }
+  const bool first_with_models = spec->scheduler != nullptr && published_models_ != models.generation;
   if (&policy != &published_) {
     published_ = policy;
   }
   published_fallback_ = fallback;
   published_budget_ = budget_bytes;
   published_lookahead_ = fit.lookahead;
+  published_models_ = models.generation;
   have_published_ = true;
   host_.offer(std::move(spec));
   publish_failed_ = false;
   refit_failed_ = false;
+  if (first_with_models) {
+    // The source name is the user's label for the filter, not frame content.
+    const char* name = obs_source_get_name(filter_);
+    log(LOG_INFO, "'%s': scanning with the detection models", name != nullptr ? name : "");
+  }
   if (budget_notice_.update(fit)) {
     // One line per change: shortened, shortened to another value, restored.
     try {

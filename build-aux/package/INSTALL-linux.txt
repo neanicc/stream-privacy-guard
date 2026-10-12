@@ -31,11 +31,12 @@ Install
 Models
   The package carries no model weights. From this folder, run once:
        python3 scripts/fetch_models.py
-  It downloads YuNet and PP-OCR from the pinned URLs in models/manifest.json,
-  checks each file's size and SHA-256, and installs them in
-  ~/.cache/spg/models (or $SPG_CACHE_DIR/models). Nothing in the plugin
-  downloads anything. Without the models the filter cannot detect anything
-  and fails closed: it blurs the whole source.
+  It downloads YuNet and PP-OCR from the pinned URLs in
+  models/manifest.json, checks each file's size and SHA-256, and installs
+  them in ~/.cache/spg/models (or $SPG_CACHE_DIR/models). The plugin checks
+  them again before loading and downloads nothing. Without the models the
+  filter cannot detect anything and fails closed: it blurs the whole source.
+  Restart OBS after fetching.
 
 Audio
   The filter delays the video by its Lookahead (500 ms by default). Set the

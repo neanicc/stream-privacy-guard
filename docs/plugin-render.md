@@ -172,7 +172,7 @@ solid fill when there is nothing trustworthy to blur) and is unit-tested:
 | A GPU call throws | Caught: the frame has no texture and is covered; no ring slot leaks |
 | Copying a released frame's masks fails (allocation) | The frame is solid; the slot it held goes back to the ring |
 | Composing the output fails | The output texrender and blend state are closed first, then the output is solid. Mask levels are a fixed array, so composing allocates nothing |
-| First frames | Covered whole until the scheduler releases a frame (`Starting`), or for good while no policy is set (`NoDetection`) |
+| First frames | Covered whole until the scheduler releases a frame (`Starting`), or while no policy is set or the detection models are not loaded (`NoDetection`) |
 
 ## Threads and unload
 
@@ -209,7 +209,7 @@ would hold OBS shutdown; detection stages have no unbounded wait today.
 | Orange | Released late (rendering stopped and resumed) |
 | Magenta | Bad frame timestamp |
 | Violet | A result could not be applied |
-| Grey | Starting, or detection off (no PolicyConfig) |
+| Grey | Starting, or detection off (no PolicyConfig, or no detection models) |
 | Blue | Settings changed (old hold) |
 | White | The frame could not be kept (no texture) |
 | Yellow | Nothing released for over 100 ms (stall) |
@@ -223,13 +223,38 @@ lookahead on every audio source that belongs with the filtered video: the
 source's own audio, the microphone, desktop audio. The filter never changes
 other sources' offsets itself (SPG-13 decision).
 
-## This build
+## Detection models (SPG-14b)
 
-Detection models are not loaded by the plugin yet: `make_stages()` returns no
-detectors, so every scan fails (`ScanFailure::MissingStage`) and every frame
-airs covered whole after the lookahead. The readback, ring, release and blur
-paths all run; loading the models and ONNX Runtime in the module is a
-follow-up.
+The module loads YuNet, PP-OCR det and PP-OCR rec once, for every filter, on a
+loader thread of its own (`plugin/src/models/`, `plugin/src/model_loading.cpp`)
+that the first filter starts; the render, video and UI threads never open or
+warm up a model. It looks in the plugin's data directory (`models/`, for a
+packaged build) and then in `$SPG_CACHE_DIR/models` or `~/.cache/spg/models`
+(`%USERPROFILE%` on Windows), where `scripts/fetch_models.py` puts them. It
+reads each file once into memory, checks the size and SHA-256 of those bytes
+against `models/manifest.json`, and hands ONNX Runtime the same bytes, so a
+file replaced after the check is never loaded. It never downloads anything.
+
+Until the models are ready, and for good when one is missing, damaged or fails
+to open, a filter builds no scheduler: every frame is covered whole
+(`Cover::NoDetection`), the properties say why, and the log has one line
+(`detection models missing, covering every frame whole: <model>: <path>`;
+a loader that threw or a thread that could not start gets a fixed reason in
+the same line). When loading ends the loader hands each filter's current
+policy a new scheduler whose stages are the shared detectors, the recognizer
+and a `PolicyEngine` built from the filter's `PolicyConfig` (no model is
+opened there: the stages share the loaded ones); the log says `'<filter
+name>': scanning with the detection models`, and the filter asks OBS to
+rebuild a properties view that is open on it. A failed load is not retried
+until OBS restarts.
+
+ONNX Runtime 1.30.0 ships next to the module (`obs-spg.plugin/Contents/Frameworks`
+with the module's only rpath on macOS, `onnxruntime.dll` beside `obs-spg.dll`,
+`libonnxruntime.so.1` beside `obs-spg.so` with `$ORIGIN`); OpenCV is linked
+statically, and on Linux the static libraries' symbols are kept out of the
+module's dynamic symbol table. Each model session uses ONNX Runtime's default
+execution providers (CoreML on macOS, with CPU fallback) and default thread
+count.
 
 ## Evidence and limits
 

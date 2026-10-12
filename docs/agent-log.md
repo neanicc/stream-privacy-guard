@@ -1474,6 +1474,96 @@ Template:
   fit 1 ms short failed the property test. The retry wiring in
   `FilterRender::tick` needs libobs and is covered only by the live check.
 
+## 2026-10-12 — SPG-14b Detection models and ONNX Runtime in the plugin (#54)
+
+- Decision / change: `obs-spg` now opens the pinned YuNet, PP-OCR det and
+  PP-OCR rec models and runs them in each filter's scheduler
+  ([plugin-render.md](plugin-render.md), "Detection models"). New OBS-free
+  library `obs-spg-models` (`plugin/src/models/`): `locate_models` finds each
+  pinned file in the plugin's data directory (`models/`, for a packaged
+  build) and then `$SPG_CACHE_DIR/models` or `~/.cache/spg/models`
+  (`%USERPROFILE%` on Windows), as `scripts/fetch_models.py` does, and checks
+  its size and SHA-256 (pins generated from `models/manifest.json` at
+  configure time) on bytes read once into memory, which are then what ONNX
+  Runtime parses (new `runtime::ModelBytes` overloads of `Session::open` and
+  the three detectors' `open`), so a file swapped after the check is never
+  loaded; `load_models` opens and warms
+  up the three sessions through the spg-core wrapper; `make_stages` returns
+  the shared detectors, a recognizer adapter and an `EnginePolicy` built from
+  the filter's `PolicyConfig` (the same stages as `spg-cli`'s
+  `stages_models.cpp` on PR #49, written independently of it). `ModelHub`
+  loads once per module on its own thread, started by the first filter, and
+  calls every filter back when loading ends; each filter then rebuilds its
+  scheduler with the models (`FilterRender::models_changed`, under the
+  publish lock, so it never races a settings change). Choices: (1) Without
+  models (loading, missing, damaged, failed) a filter builds no scheduler
+  rather than one whose cycles fail with `MissingStage`: the frame is covered
+  whole (`Cover::NoDetection`) at once and nothing is read back or scanned.
+  (2) A file that is missing or fails its size or hash check is reported as
+  such and never handed to ONNX Runtime; one log line per module load names
+  the model and path, and the properties show a fixed message (plus the
+  model's manifest name). (3) One attempt per module load; the properties
+  say to restart OBS after fetching. (4) Loading starts with the first
+  filter, not at module load, so OBS without the filter pays nothing.
+  (5) ONNX Runtime ships next to the module: copied into
+  `obs-spg.plugin/Contents/Frameworks` with `@loader_path/../Frameworks` as
+  the module's only rpath (so the build tree loads the copy a package
+  ships), `onnxruntime.dll` beside `obs-spg.dll` (libobs adds the module's
+  directory to the DLL search path, ahead of the older copy in System32),
+  `libonnxruntime.so.1` beside `obs-spg.so` with `$ORIGIN`. OpenCV stays
+  static; on Linux `--exclude-libs,ALL` keeps the static libraries' symbols
+  (OpenCV, spg-core) out of the module's dynamic symbol table so they cannot
+  interpose another plugin's OpenCV. (6) Sessions use the wrapper's defaults
+  (CoreML first on macOS with CPU fallback, ORT's default thread count).
+  (7) The plugin now requires `SPG_WITH_DEPS=ON`.
+- Evidence: 8 new `plugin.models.*` cases (all OSes): FIPS 180-4 SHA-256
+  vectors in several chunkings; manifest pins; missing models reported and
+  stages without detectors failing every cycle with `MissingStage`; wrong
+  size, wrong bytes, a directory in a model's place, and search order (the
+  first directory holding a file wins); `ModelHub` loads on its own thread,
+  `start()` returns while the loader is blocked, listeners run once on the
+  loader thread, unsubscribed ones never, a throwing loader or Ready without
+  models ends Failed, shutdown waits for a load in progress; and with the
+  pinned models (CPU provider) `run_scan` on a synthetic 1280x720 frame
+  masks a drawn face and a line holding a made-up watch-list entry, leaves
+  an ordinary line unmasked, leaves the entry's line unmasked under a policy
+  without the entry, and still runs after the hub lets go of the models.
+  `plugin.loads` (macOS, Windows) now also waits for the models in the real
+  module and checks the properties say ready, one load log line, and that a
+  filter created before the models were ready rebuilt its scheduler with
+  them (log `'spg-early': scanning with the detection models`); new
+  `plugin.loads.no_models` (empty `SPG_CACHE_DIR`) checks the error status,
+  exactly one `detection models missing ... yunet` line, and no scheduler.
+  Mutation: dropping the models generation from the publish check (so the
+  loader's hand-over is skipped) failed `plugin.loads`. Dev Mac (Apple M4,
+  macOS 26.5.2): models loaded in the module in 260-293 ms on CoreML (warm
+  file cache); `scripts/ci/run.sh build` and `test` 305/305 passed with
+  `main` at `8d409b5` merged.
+- Eval delta: not run. The core pipeline is unchanged (plugin-only change),
+  `eval/run_eval.py` is not on `main` yet (PR #49), and the agent sandbox
+  refuses the eval stage.
+- Open issues or follow-ups: the live check ([live-check.md](live-check.md),
+  steps 2 to 5 and 13) is the only evidence that faces and watch-list text
+  are masked in OBS and how fast; ORT thread count and execution provider per
+  stage against OBS's own CPU and GPU use (SPG-16); packaging the models in
+  the plugin's data directory or documenting the fetch step for users
+  (SPG-17); another plugin that already loaded a different `onnxruntime.dll`
+  into OBS on Windows wins by module name (obs-backgroundremoval and
+  obs-localvocal share this problem); a retry button for a failed load.
+- Review follow-up (babysit, after merging `main` at `e2a3911`, SPG-14c):
+  the staff review's P2 (hash-then-reopen window) is closed by opening from
+  the verified bytes; Greptile's three findings are fixed: `ModelHub` takes a
+  reporter called once per load with fixed reasons for a throwing loader,
+  out of memory, Ready without models and a thread that cannot start (the
+  module logs it, so "the OBS log has the reason" holds); the loader's
+  hand-over calls `obs_source_update_properties` so an open properties view
+  stops saying "loading" (`plugin.loads` counts the signal; removing the
+  call failed it); and the lifetime case drops its snapshot so the stages
+  are the models' only owners, then checks the models die with the stages.
+  `models_changed` uses SPG-14c's rule: after a failed settings change it
+  rebuilds nothing. Building schedulers off the graphics thread is SPG-14d;
+  the model hand-over adds no model work to that path.
+
 ## 2026-10-12 — SPG-17 Packaging and docs (#63)
 
 - Decision / change: `scripts/package.sh` (called by `scripts/ci/run.sh
@@ -1535,9 +1625,10 @@ Template:
   and owner scrubbing, checksums, notices in step with the pins). Windows and
   Linux packages are built only by CI; see the PR's Validation section.
 - Eval delta: not affected (packaging and docs only).
-- Open issues or follow-ups: when SPG-14b (#61) merges, the README status,
-  the "does not run detection" limitation and the release notes must say the
-  plugin loads the models, and the Windows and Linux packages must show
-  ONNX Runtime beside the module (the check fails otherwise). No live OBS
-  install from a package has been done; the live check should install from
-  the CI artifact rather than the build tree.
+- Merged `main` after SPG-14b (#61) landed: configure now reports `ships
+  ONNX Runtime: TRUE`; the README status, limitations, INSTALL texts and
+  release notes say the plugin loads the models. The package contents per OS
+  from CI are listed in the PR's Validation section.
+- Open issues or follow-ups: no live OBS install from a package has been
+  done; the live check should install from the CI artifact rather than the
+  build tree.
