@@ -21,12 +21,27 @@ target_include_directories(obs-spg-settings PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(obs-spg-settings PUBLIC spg::core)
 spg_target_defaults(obs-spg-settings)
 
+# Lookahead ring, readback scheduling, draw plans and scheduler retirement
+# without OBS (SPG-14), unit-tested on every OS with a fake GPU.
+add_library(obs-spg-pipeline STATIC
+  src/pipeline/frame_ring.cpp
+  src/pipeline/mask_levels.cpp
+  src/pipeline/pipeline.cpp
+  src/pipeline/readback_pool.cpp
+  src/pipeline/reaper.cpp)
+target_include_directories(obs-spg-pipeline PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(obs-spg-pipeline PUBLIC spg::core)
+spg_target_defaults(obs-spg-pipeline)
+
 add_library(obs-spg MODULE
   src/plugin-main.cpp
   src/plugin-support.cpp
   src/spg-filter.cpp
+  src/render/filter_render.cpp
+  src/render/obs_gpu.cpp
+  data/effects/spg-mask.effect
   data/locale/en-US.ini)
-target_link_libraries(obs-spg PRIVATE OBS::libobs obs-spg-settings)
+target_link_libraries(obs-spg PRIVATE OBS::libobs obs-spg-settings obs-spg-pipeline)
 target_compile_definitions(obs-spg PRIVATE SPG_PLUGIN_VERSION="${PROJECT_VERSION}")
 spg_target_defaults(obs-spg)
 # OBS finds modules by file name: obs-spg.so / obs-spg.dll / obs-spg.plugin.
@@ -38,6 +53,7 @@ set_target_properties(obs-spg PROPERTIES
   VISIBILITY_INLINES_HIDDEN ON)
 if(APPLE)
   set_source_files_properties(data/locale/en-US.ini PROPERTIES MACOSX_PACKAGE_LOCATION Resources/locale)
+  set_source_files_properties(data/effects/spg-mask.effect PROPERTIES MACOSX_PACKAGE_LOCATION Resources/effects)
   set_target_properties(obs-spg PROPERTIES
     BUNDLE TRUE
     BUNDLE_EXTENSION plugin
@@ -47,7 +63,7 @@ if(APPLE)
     MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
 else()
-  set_source_files_properties(data/locale/en-US.ini PROPERTIES HEADER_FILE_ONLY TRUE)
+  set_source_files_properties(data/locale/en-US.ini data/effects/spg-mask.effect PROPERTIES HEADER_FILE_ONLY TRUE)
 endif()
 
 if(NOT SPG_BUILD_TESTS)
@@ -63,6 +79,14 @@ add_executable(obs-spg-settings-tests tests/settings_test.cpp)
 target_link_libraries(obs-spg-settings-tests PRIVATE obs-spg-settings Catch2::Catch2WithMain)
 spg_target_defaults(obs-spg-settings-tests)
 catch_discover_tests(obs-spg-settings-tests TEST_PREFIX "plugin.settings." DISCOVERY_MODE PRE_TEST)
+
+# Render pipeline with a fake GPU and a synchronous scheduler (SPG-14).
+add_executable(obs-spg-pipeline-tests tests/pipeline_test.cpp)
+target_link_libraries(obs-spg-pipeline-tests PRIVATE obs-spg-pipeline Catch2::Catch2WithMain)
+target_include_directories(obs-spg-pipeline-tests PRIVATE "${PROJECT_SOURCE_DIR}/tests/unit")
+spg_target_defaults(obs-spg-pipeline-tests)
+catch_discover_tests(obs-spg-pipeline-tests TEST_PREFIX "plugin.pipeline." DISCOVERY_MODE PRE_TEST
+  PROPERTIES TIMEOUT 300)
 
 # The module exports the entry points libobs looks up with dlsym/GetProcAddress.
 if(CMAKE_NM)

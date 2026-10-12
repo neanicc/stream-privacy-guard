@@ -1,0 +1,61 @@
+// Stream Privacy Guard mask effect (SPG-14). Draws a texture with linear
+// (Smooth) or point (Blocks) sampling. The plugin builds a chain of halvings
+// with Smooth (each texel the average of 2x2 below it, a box filter), then
+// draws a mask region from a coarse level with Smooth (Blur) or Blocks
+// (Pixelate). See plugin/src/pipeline/mask_levels.hpp.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+sampler_state linear_clamp {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+sampler_state point_clamp {
+	Filter   = Point;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSSmooth(VertData v_in) : TARGET
+{
+	return image.Sample(linear_clamp, v_in.uv);
+}
+
+float4 PSBlocks(VertData v_in) : TARGET
+{
+	return image.Sample(point_clamp, v_in.uv);
+}
+
+technique Smooth
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSSmooth(v_in);
+	}
+}
+
+technique Blocks
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBlocks(v_in);
+	}
+}

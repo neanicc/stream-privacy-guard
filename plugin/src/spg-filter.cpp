@@ -4,11 +4,13 @@
 #include <obs-module.h>
 
 #include "plugin-support.hpp"
+#include "render/filter_render.hpp"
 #include "settings/watchlist_store.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -38,14 +40,17 @@ enum class Notice : std::uint8_t {
 struct FilterState {
   obs_source_t *context = nullptr;
   std::filesystem::path watchlist_dir;  // fixed at create
+  // Readback, lookahead ring, scheduler and blur (SPG-14). Set at create;
+  // null only if that failed, and then every frame gets an opaque fill.
+  std::unique_ptr<FilterRender> render;
 
   std::mutex mutex;  // guards everything below
   FilterSettings settings;
   std::string ref;
   StoreError store_error = StoreError::NoConfigDir;
   std::vector<Secret> watchlist;
-  // Set only when detection could run with these settings. SPG-10/14 hand it
-  // to the pipeline; until then the filter fails closed regardless.
+  // Set only when detection could run with these settings; handed to
+  // `render`, which covers the whole source while it is empty.
   std::optional<PolicyConfig> policy;
   FilterIssue issue = FilterIssue::WatchlistStorage;
   // True once `policy` and `issue` match the fields above; an update that
@@ -137,6 +142,15 @@ WatchlistSnapshot snapshot(FilterState &state) {
   return {state.ref, state.store_error, state.watchlist};
 }
 
+// Hands the current policy (or none) to the render side. Caller holds
+// state.mutex; the render thread never takes it.
+void publish_render_locked(FilterState &state) noexcept {
+  if (state.render != nullptr) {
+    state.render->set_debug_overlay(state.settings.debug_overlay);
+    state.render->publish(state.policy, state.settings.fallback);
+  }
+}
+
 // Caller holds state.mutex.
 void rebuild_policy_locked(FilterState &state) {
   state.policy_current = false;
@@ -151,6 +165,7 @@ void rebuild_policy_locked(FilterState &state) {
     log(LOG_WARNING, "detection off, covering the whole source: %s", issue_name(state.issue));
   }
   state.policy_current = true;
+  publish_render_locked(state);
 }
 
 WatchlistRefRegistry &ref_registry() {
@@ -308,6 +323,7 @@ void filter_update(void *data, obs_data_t *settings) {
     state->policy.reset();
     state->issue = FilterIssue::InvalidConfig;
     state->policy_current = false;
+    publish_render_locked(*state);
   }
 }
 
@@ -322,6 +338,11 @@ void *filter_create(obs_data_t *settings, obs_source_t *source) {
     state->watchlist_dir = watchlist_directory();
   } catch (...) {
     state->watchlist_dir.clear();  // NoConfigDir: fail closed
+  }
+  try {
+    state->render = std::make_unique<FilterRender>(source);
+  } catch (...) {
+    state->render.reset();  // video_render draws an opaque fill
   }
   filter_update(state, settings);
   return state;
@@ -552,6 +573,21 @@ void add_watchlist_group(obs_properties_t *props, FilterState *state) {
   obs_properties_add_group(props, "watchlist_group", text("SPG.Watchlist"), OBS_GROUP_NORMAL, group);
 }
 
+// What has aired so far: counts and a fixed reason name, never frame content.
+void add_render_status(obs_properties_t *props, const FilterState &state) {
+  if (state.render == nullptr) {
+    return;
+  }
+  const RenderStatus status = state.render->status();
+  std::string line = std::string(text("SPG.Render.Aired")) + " " + std::to_string(status.clean) + " " +
+                     text("SPG.Render.Masked") + ", " + std::to_string(status.covered) + " " +
+                     text("SPG.Render.Covered");
+  if (status.covered > 0) {
+    line += std::string(" ") + text("SPG.Render.Last") + " " + cover_name(status.last_cover) + ".";
+  }
+  add_info(props, kRenderStatusKey, line.c_str(), status.covered > 0 ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
+}
+
 obs_properties_t *filter_get_properties(void *data) {
   auto *state = static_cast<FilterState *>(data);
   obs_properties_t *props = obs_properties_create();
@@ -566,6 +602,11 @@ obs_properties_t *filter_get_properties(void *data) {
       add_info(props, kIssueKey, text("SPG.Issue.NoCategories"), OBS_TEXT_INFO_ERROR);
     } else if (issue == FilterIssue::InvalidConfig) {
       add_info(props, kIssueKey, text("SPG.Issue.InvalidConfig"), OBS_TEXT_INFO_ERROR);
+    }
+    try {
+      add_render_status(props, *state);
+    } catch (...) {
+      // Allocation failure: no status line.
     }
   }
 
@@ -598,6 +639,8 @@ obs_properties_t *filter_get_properties(void *data) {
                                                             static_cast<int>(kMaxLookaheadMs), 50);
   obs_property_int_set_suffix(lookahead, " ms");
   obs_property_set_long_description(lookahead, text("SPG.Lookahead.Help"));
+  // The filter delays video only; a filter cannot delay audio (SPG-13 spike).
+  add_info(props, kAudioKey, text("SPG.Audio"), OBS_TEXT_INFO_WARNING);
   obs_property_t *hold = obs_properties_add_int_slider(props, kHoldKey, text("SPG.Hold"), static_cast<int>(kMinHoldMs),
                                                        static_cast<int>(kMaxHoldMs), 50);
   obs_property_int_set_suffix(hold, " ms");
@@ -616,11 +659,15 @@ obs_properties_t *filter_get_properties(void *data) {
   return props;
 }
 
-// Fail closed: draw an opaque fill the size of the source instead of the
-// source itself. The target is never rendered, so no unscanned pixel reaches
-// the preview, a recording or the stream.
+// The render side draws each frame (docs/plugin-render.md). Without it, fail
+// closed: an opaque fill the size of the source, and the target is never
+// drawn, so no unscanned pixel reaches the preview, a recording or the stream.
 void filter_video_render(void *data, gs_effect_t * /*effect*/) {
   const auto *state = static_cast<const FilterState *>(data);
+  if (state->render != nullptr) {
+    state->render->render();
+    return;
+  }
   obs_source_t *target = obs_filter_get_target(state->context);
   const uint32_t width = target != nullptr ? obs_source_get_base_width(target) : 0;
   const uint32_t height = target != nullptr ? obs_source_get_base_height(target) : 0;
