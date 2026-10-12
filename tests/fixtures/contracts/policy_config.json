@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "categories": ["face", "watchlist", "pii:email", "pii:card"],
+  "watchlist": ["SYNTHETIC NAME QX7", "0 Synthetic Road QX7"],
+  "fuzzy": {"max_edits": 1, "max_edit_ratio": 0.15, "min_partial_chars": 5},
+  "lookahead_ms": 400,
+  "hold_ms": 1000,
+  "margin_px": 6,
+  "margin_ratio": 0.5,
+  "fallback": "solid_fill",
+  "mask_style": "pixelate"
+}

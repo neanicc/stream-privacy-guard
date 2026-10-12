@@ -12,9 +12,14 @@ include(Catch)
 
 # Unit tests for spg-core -----------------------------------------------------
 add_executable(spg-unit-tests
+  unit/contracts_test.cpp
+  unit/geometry_test.cpp
+  unit/json_test.cpp
   unit/version_test.cpp)
 target_link_libraries(spg-unit-tests PRIVATE spg::core Catch2::Catch2WithMain)
-target_compile_definitions(spg-unit-tests PRIVATE SPG_EXPECTED_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(spg-unit-tests PRIVATE
+  SPG_EXPECTED_VERSION="${PROJECT_VERSION}"
+  SPG_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 spg_target_defaults(spg-unit-tests)
 catch_discover_tests(spg-unit-tests TEST_PREFIX "unit." DISCOVERY_MODE PRE_TEST)
 
