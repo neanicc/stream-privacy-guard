@@ -89,21 +89,27 @@ endif()
 
 # Detectors (lane:vision) ------------------------------------------------------------
 if(SPG_WITH_DEPS)
-  # The pinned YuNet path, from the manifest; the model tests skip when it is
-  # not cached. The runtime fixtures supply a model that is not YuNet.
+  # The pinned model paths, from the manifest; the model tests skip when a
+  # model is not cached. The runtime fixtures supply a model that is neither.
+  # Text fixtures are drawn at test time with OpenCV (synthetic_text.hpp).
   set(_spg_models_manifest "${PROJECT_SOURCE_DIR}/models/manifest.json")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_spg_models_manifest}")
   file(READ "${_spg_models_manifest}" _spg_models_json)
   string(JSON _spg_yunet_version GET "${_spg_models_json}" models yunet version)
   string(JSON _spg_yunet_file GET "${_spg_models_json}" models yunet file)
+  string(JSON _spg_ppocr_det_version GET "${_spg_models_json}" models ppocr-det-en version)
+  string(JSON _spg_ppocr_det_file GET "${_spg_models_json}" models ppocr-det-en file)
 
   add_executable(spg-detect-tests
     unit/face_detect_test.cpp
-    integration/face_detector_test.cpp)
+    unit/text_detect_test.cpp
+    integration/face_detector_test.cpp
+    integration/text_detector_test.cpp)
   add_dependencies(spg-detect-tests spg-runtime-fixtures)
-  target_link_libraries(spg-detect-tests PRIVATE spg::detect Catch2::Catch2WithMain)
+  target_link_libraries(spg-detect-tests PRIVATE spg::detect spg::opencv Catch2::Catch2WithMain)
   target_compile_definitions(spg-detect-tests PRIVATE
     SPG_YUNET_MODEL="${SPG_CACHE_DIR}/models/yunet/${_spg_yunet_version}/${_spg_yunet_file}"
+    SPG_PPOCR_DET_MODEL="${SPG_CACHE_DIR}/models/ppocr-det-en/${_spg_ppocr_det_version}/${_spg_ppocr_det_file}"
     SPG_RUNTIME_FIXTURES="${_spg_runtime_fixtures}")
   spg_target_defaults(spg-detect-tests)
   spg_copy_runtime_dlls(spg-detect-tests)
