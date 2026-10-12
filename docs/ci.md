@@ -15,11 +15,14 @@ aggregate `check` job.
 | `check` | All of the above succeeded; failures, cancellations and skips cannot pass |
 
 Workflows are human-owned. Agents change what CI does by editing
-`scripts/ci/run.sh` (lane:build), which every stage calls. Before SPG-01 the
-build stages print a notice and succeed; once `CMakeLists.txt` exists they must
-build and test for real.
+`scripts/ci/run.sh` (lane:build), which every stage calls. Since SPG-01 the
+build stages are real: `setup` runs `scripts/fetch_deps.py` against
+`deps/manifest.json`, `build` configures CMake (Ninja when installed, Visual
+Studio 2022 on Windows) and prints ccache statistics, and `test` runs `ctest`,
+which fails if no tests are registered.
 
-Dependencies and models are cached in `~/.cache/spg` keyed on the manifests.
+Dependencies, models and the ccache cache (`~/.cache/spg/ccache`) are cached in
+`~/.cache/spg` keyed on the manifests and `CMakeLists.txt`.
 Action references are pinned to commit SHAs.
 
 ## Reviews on every PR

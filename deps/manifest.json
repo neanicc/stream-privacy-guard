@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "comment": "Prebuilt dependencies fetched by scripts/fetch_deps.py into $SPG_CACHE_DIR/deps/<name>/<version>-<platform>/. Every archive is pinned by version and SHA-256; a mismatch aborts the fetch. 'root' is the directory inside the archive that becomes the install prefix ('.' for the archive root). Kind 'library' is linked by the build; kind 'tool' is only run on the build machine and never shipped.",
+  "platforms": ["linux-x64", "macos-arm64", "windows-x64"],
+  "deps": {
+    "onnxruntime": {
+      "kind": "library",
+      "version": "1.30.0",
+      "license": "MIT",
+      "homepage": "https://github.com/microsoft/onnxruntime",
+      "release": "https://github.com/microsoft/onnxruntime/releases/tag/v1.30.0",
+      "platforms": {
+        "linux-x64": {
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-linux-x64-1.30.0.tgz",
+          "sha256": "a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd",
+          "root": "onnxruntime-linux-x64-1.30.0"
+        },
+        "macos-arm64": {
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-osx-arm64-1.30.0.tgz",
+          "sha256": "6ebb5062a934537c352937821f9fe9718e7de1a2db1122a93dd363ffd53a7012",
+          "root": "onnxruntime-osx-arm64-1.30.0"
+        },
+        "windows-x64": {
+          "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-win-x64-1.30.0.zip",
+          "sha256": "c6ba983baf5681af108599675d2a89c2d145512d02de28aed0bff177cd0ba949",
+          "root": "onnxruntime-win-x64-1.30.0"
+        }
+      }
+    },
+    "opencv": {
+      "kind": "library",
+      "version": "4.9.0",
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/occ-ai/obs-backgroundremoval-dep-opencv",
+      "release": "https://github.com/occ-ai/obs-backgroundremoval-dep-opencv/releases/tag/v4.9.0-1",
+      "notes": "Minimal static OpenCV 4.9.0 (core, imgproc, features2d, photo, video, videoio, imgcodecs, highgui; no codecs, IPP or OpenCL) built by the occ-ai OBS plugin project. Dynamic CRT (/MD) on Windows; macOS deployment target 11.0.",
+      "platforms": {
+        "linux-x64": {
+          "url": "https://github.com/occ-ai/obs-backgroundremoval-dep-opencv/releases/download/v4.9.0-1/opencv-linux-v4.9.0-1-Release.tar.gz",
+          "sha256": "73652c2155b477b5fd95fcd8ea7ce35d313543ece17bdfa3a2b217a0239d74c6",
+          "root": "."
+        },
+        "macos-arm64": {
+          "url": "https://github.com/occ-ai/obs-backgroundremoval-dep-opencv/releases/download/v4.9.0-1/opencv-macos-v4.9.0-1-Release.tar.gz",
+          "sha256": "5db4fcfbd8c7cdba136657b4d149821a670df9a7c71120f5a4d34fa35a58d07b",
+          "root": "."
+        },
+        "windows-x64": {
+          "url": "https://github.com/occ-ai/obs-backgroundremoval-dep-opencv/releases/download/v4.9.0-1/opencv-windows-v4.9.0-1-Release.zip",
+          "sha256": "56a5e042f490b8390b1c1819b2b48c858f10cd64e613babbf11925a57269c3fa",
+          "root": "."
+        }
+      }
+    },
+    "ccache": {
+      "kind": "tool",
+      "version": "4.13.6",
+      "license": "GPL-3.0-or-later",
+      "homepage": "https://ccache.dev",
+      "release": "https://github.com/ccache/ccache/releases/tag/v4.13.6",
+      "platforms": {
+        "linux-x64": {
+          "url": "https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-linux-x86_64-glibc.tar.gz",
+          "sha256": "567b1b648411819590f918f045218c92da14418bdec3b30db94a3b4f5d77cf13",
+          "root": "ccache-4.13.6-linux-x86_64-glibc"
+        },
+        "macos-arm64": {
+          "url": "https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-darwin.tar.gz",
+          "sha256": "0274210ec9c9936ed5711d59b0de3167a51216a588ddde35f6bc828f366fe6d9",
+          "root": "ccache-4.13.6-darwin"
+        },
+        "windows-x64": {
+          "url": "https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-windows-x86_64.zip",
+          "sha256": "3d7cebb05850ad704e197b3f1d3f0f924ab6c9fdfc561578e146184fe9d89380",
+          "root": "ccache-4.13.6-windows-x86_64"
+        }
+      }
+    }
+  }
+}

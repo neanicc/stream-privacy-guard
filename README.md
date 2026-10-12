@@ -11,8 +11,29 @@ to every buffered frame, and when the pipeline cannot keep up it fails closed by
 blurring the whole source. Some things will still get through; the eval in this
 repo measures how often.
 
-> Status: pre-alpha. The repository currently holds the plan, agent workflows,
-> CI structure and eval targets. Build instructions arrive with SPG-01.
+> Status: pre-alpha. The build foundation exists (`spg-core`, `spg-cli`, tests
+> and pinned dependencies); the detection pipeline and the OBS plugin do not yet.
+> Nothing here protects a stream today.
+
+## Quickstart (developers)
+
+Needs CMake 3.25+, a C++20 compiler (Xcode clang on macOS, GCC or Clang on
+Linux, Visual Studio 2022 on Windows), Python 3.11+ and `curl`. Supported hosts:
+Linux x64, macOS on Apple Silicon, Windows x64. From Git Bash on Windows:
+
+```sh
+bash scripts/ci/run.sh setup   # fetch pinned ONNX Runtime, OpenCV and ccache, SHA-256 verified
+bash scripts/ci/run.sh build   # configure and build into build/ (Release, warnings as errors)
+bash scripts/ci/run.sh test    # run all tests with ctest
+build/cli/spg-cli --version
+```
+
+`setup` downloads the archives listed in [deps/manifest.json](deps/manifest.json)
+once into `$SPG_CACHE_DIR` (default `~/.cache/spg`) and refuses any whose hash
+does not match. Catch2 is fetched by CMake, also pinned by hash. ccache from the
+manifest is used automatically and keeps its cache in `$SPG_CACHE_DIR/ccache`.
+To build without ONNX Runtime and OpenCV, configure with `-DSPG_WITH_DEPS=OFF`.
+[docs/ci.md](docs/ci.md) describes the CI checks these commands mirror.
 
 ## How it works
 
