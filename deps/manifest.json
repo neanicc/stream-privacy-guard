@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "comment": "Prebuilt dependencies fetched by scripts/fetch_deps.py into $SPG_CACHE_DIR/deps/<name>/<version>-<platform>/. Every archive is pinned by version and SHA-256; a mismatch aborts the fetch. 'root' is the directory inside the archive that becomes the install prefix ('.' for the archive root). Kind 'library' is linked by the build; kind 'tool' is only run on the build machine and never shipped.",
+  "comment": "Prebuilt dependencies fetched by scripts/fetch_deps.py into $SPG_CACHE_DIR/deps/<name>/<version>-<platform>/. Every archive is pinned by version and SHA-256; a mismatch aborts the fetch. 'root' is the directory inside the archive that becomes the install prefix ('.' for the archive root). Kind 'library' is linked by the build; kind 'tool' is only run on the build machine and never shipped; kind 'source' is built or consumed by a build-aux script. A platform entry {\"unused\": reason} records that a dependency is not needed there. Group 'plugin' is the OBS plugin's inputs (skipped when SPG_BUILD_PLUGIN=0).",
   "platforms": ["linux-x64", "macos-arm64", "windows-x64"],
   "deps": {
     "onnxruntime": {
@@ -74,6 +74,110 @@
           "sha256": "3d7cebb05850ad704e197b3f1d3f0f924ab6c9fdfc561578e146184fe9d89380",
           "root": "ccache-4.13.6-windows-x86_64"
         }
+      }
+    },
+    "obs-studio": {
+      "kind": "source",
+      "group": "plugin",
+      "version": "32.1.2",
+      "license": "GPL-2.0-or-later",
+      "homepage": "https://obsproject.com",
+      "release": "https://github.com/obsproject/obs-studio/releases/tag/32.1.2",
+      "notes": "Official OBS source release. build-aux/build_libobs.py builds libobs from it against obs-deps on macOS and Windows (as obs-plugintemplate does) and installs it into $SPG_CACHE_DIR/deps/libobs/. 32.1.2 is the newest release whose macOS build accepts Xcode 16 (32.2 needs Xcode 26.5, newer than the macos-15 runner has).",
+      "platforms": {
+        "linux-x64": {"unused": "Linux links the official Ubuntu package (obs-studio-ubuntu)"},
+        "macos-arm64": {
+          "url": "https://github.com/obsproject/obs-studio/releases/download/32.1.2/OBS-Studio-32.1.2-Sources.tar.gz",
+          "sha256": "c6532380c68a75327fe8b551461adeca8f184dcbe4015096251a6de76362a554",
+          "root": "obs-studio-32.1.2-sources"
+        },
+        "windows-x64": {
+          "url": "https://github.com/obsproject/obs-studio/releases/download/32.1.2/OBS-Studio-32.1.2-Sources.tar.gz",
+          "sha256": "c6532380c68a75327fe8b551461adeca8f184dcbe4015096251a6de76362a554",
+          "root": "obs-studio-32.1.2-sources"
+        }
+      }
+    },
+    "obs-studio-ubuntu": {
+      "kind": "library",
+      "group": "plugin",
+      "version": "32.1.2",
+      "license": "GPL-2.0-or-later",
+      "homepage": "https://obsproject.com",
+      "release": "https://github.com/obsproject/obs-studio/releases/tag/32.1.2",
+      "notes": "Official Ubuntu 24.04 package. Only libobs headers, its CMake package and libobs.so are unpacked; the plugin links against them. Not installed system-wide.",
+      "platforms": {
+        "linux-x64": {
+          "url": "https://github.com/obsproject/obs-studio/releases/download/32.1.2/OBS-Studio-32.1.2-Ubuntu-24.04-x86_64.deb",
+          "sha256": "a3bb1b0176604dad9e22710e057f0fdd76e8afb600e0e1914c30464ae49908e8",
+          "root": "usr/local",
+          "include": [
+            "usr/local/include/obs/",
+            "usr/local/lib/x86_64-linux-gnu/cmake/libobs/",
+            "usr/local/lib/x86_64-linux-gnu/libobs.so"
+          ]
+        },
+        "macos-arm64": {"unused": "built from obs-studio sources by build-aux/build_libobs.py"},
+        "windows-x64": {"unused": "built from obs-studio sources by build-aux/build_libobs.py"}
+      }
+    },
+    "obs-deps": {
+      "kind": "library",
+      "group": "plugin",
+      "version": "2025-08-23",
+      "license": "Various (FFmpeg LGPL-2.1-or-later, x264 GPL-2.0-or-later, others); see share/obs-deps and licenses/ in the archive",
+      "homepage": "https://github.com/obsproject/obs-deps",
+      "release": "https://github.com/obsproject/obs-deps/releases/tag/2025-08-23",
+      "notes": "Prebuilt OBS build dependencies (FFmpeg, jansson, SIMDe, ...) that obs-studio 32.1.2 pins in its CMakePresets.json. Used to build libobs and to run the plugin load test.",
+      "platforms": {
+        "linux-x64": {"unused": "Linux links the official Ubuntu package (obs-studio-ubuntu)"},
+        "macos-arm64": {
+          "url": "https://github.com/obsproject/obs-deps/releases/download/2025-08-23/macos-deps-2025-08-23-arm64.tar.xz",
+          "sha256": "09cbeb3cbf4fbb9e58e4cf4ca030a724fb1be41d2d7851c8b356f476e04544db",
+          "root": "."
+        },
+        "windows-x64": {
+          "url": "https://github.com/obsproject/obs-deps/releases/download/2025-08-23/windows-deps-2025-08-23-x64.zip",
+          "sha256": "8de229cff6f1981508c0eb646b35e644633a5855787b9f5d3b90ae2aeb87ffc1",
+          "root": "."
+        }
+      }
+    },
+    "obs-deps-x86": {
+      "kind": "source",
+      "group": "plugin",
+      "version": "2025-08-23",
+      "license": "Various; see licenses/ in the archive",
+      "homepage": "https://github.com/obsproject/obs-deps",
+      "release": "https://github.com/obsproject/obs-deps/releases/tag/2025-08-23",
+      "notes": "Not unpacked. OBS's Windows configure always configures a 32-bit helper build that expects this archive in <source>/.deps; build-aux/build_libobs.py places the verified copy there so OBS's CMake does not download it.",
+      "unpack": false,
+      "platforms": {
+        "linux-x64": {"unused": "Windows only"},
+        "macos-arm64": {"unused": "Windows only"},
+        "windows-x64": {
+          "url": "https://github.com/obsproject/obs-deps/releases/download/2025-08-23/windows-deps-2025-08-23-x86.zip",
+          "sha256": "fb3c68b75911f292b3206e346053638db1c73605957207445a0a92b33ab5e00a",
+          "root": "."
+        }
+      }
+    },
+    "simde": {
+      "kind": "library",
+      "group": "plugin",
+      "version": "0.8.2",
+      "license": "MIT",
+      "homepage": "https://github.com/simd-everywhere/simde",
+      "release": "https://github.com/simd-everywhere/simde/releases/tag/v0.8.2",
+      "notes": "Header-only; libobs headers need it on Linux. obs-deps ships the same version for macOS and Windows.",
+      "platforms": {
+        "linux-x64": {
+          "url": "https://github.com/simd-everywhere/simde/archive/refs/tags/v0.8.2.tar.gz",
+          "sha256": "ed2a3268658f2f2a9b5367628a85ccd4cf9516460ed8604eed369653d49b25fb",
+          "root": "simde-0.8.2"
+        },
+        "macos-arm64": {"unused": "provided by obs-deps"},
+        "windows-x64": {"unused": "provided by obs-deps"}
       }
     }
   }

@@ -8,6 +8,13 @@ the same manifest to find those directories (cmake/SpgDeps.cmake).
 
     scripts/fetch_deps.py --cache ~/.cache/spg                 # this machine
     scripts/fetch_deps.py --cache /tmp/c --platform all --no-extract   # verify every pin
+    scripts/fetch_deps.py --skip-group plugin                  # without the OBS plugin inputs
+
+Manifest options: a platform entry {"unused": "<reason>"} records that the
+dependency is not needed there; "include" keeps only archive members whose path
+starts with one of the listed prefixes; a dependency with "unpack": false is only
+downloaded and verified, for another script to consume; a .deb is unpacked from
+its data.tar member.
 
 Standard library only. Called by `scripts/ci/run.sh setup`.
 """
@@ -114,26 +121,74 @@ def safe_member(name: str) -> bool:
     return not path.is_absolute() and ".." not in path.parts and not (path.parts and ":" in path.parts[0])
 
 
-def extract(archive: Path, dest: Path) -> None:
+def wanted(name: str, include: list[str] | None) -> bool:
+    """True when `include` is unset or the member path starts with one of its
+    prefixes (plain string prefixes, so "lib/libobs.so" also keeps "lib/libobs.so.0")."""
+    if not include:
+        return True
+    name = name.replace("\\", "/")
+    while name.startswith("./"):
+        name = name[2:]
+    return any(name.startswith(prefix) for prefix in include)
+
+
+def deb_data_member(archive: Path, dest_dir: Path) -> Path:
+    """Copy the data.tar.* member of a Debian package (an ar archive) to dest_dir."""
+    with archive.open("rb") as handle:
+        if handle.read(8) != b"!<arch>\n":
+            raise FetchError(f"{archive.name}: not a Debian package (missing ar magic)")
+        while True:
+            header = handle.read(60)
+            if not header:
+                break
+            if len(header) != 60 or header[58:60] != b"`\n":
+                raise FetchError(f"{archive.name}: malformed ar header")
+            name = header[:16].decode("ascii", "replace").strip().rstrip("/")
+            try:
+                size = int(header[48:58].decode("ascii").strip())
+            except ValueError as exc:
+                raise FetchError(f"{archive.name}: malformed ar member size") from exc
+            if name.startswith("data.tar") and safe_member(name) and "/" not in name:
+                out = dest_dir / name
+                with out.open("wb") as sink:
+                    remaining = size
+                    while remaining:
+                        block = handle.read(min(CHUNK, remaining))
+                        if not block:
+                            raise FetchError(f"{archive.name}: truncated {name}")
+                        sink.write(block)
+                        remaining -= len(block)
+                return out
+            handle.seek(size + (size % 2), os.SEEK_CUR)  # members are 2-byte aligned
+    raise FetchError(f"{archive.name}: no data.tar member in Debian package")
+
+
+def extract(archive: Path, dest: Path, include: list[str] | None = None) -> None:
+    if archive.name.endswith(".deb"):
+        with tempfile.TemporaryDirectory(prefix=".deb-", dir=dest) as tmp:
+            extract(deb_data_member(archive, Path(tmp)), dest, include)
+        return
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as zf:
-            bad = [n for n in zf.namelist() if not safe_member(n)]
+            names = [n for n in zf.namelist() if wanted(n, include)]
+            bad = [n for n in names if not safe_member(n)]
             if bad:
                 raise FetchError(f"{archive.name}: unsafe paths in archive: {bad[:3]}")
-            zf.extractall(dest)
+            zf.extractall(dest, members=names)
         return
     try:
         with tarfile.open(archive, "r:*") as tf:
+            members = [m for m in tf.getmembers() if wanted(m.name, include)]
             if hasattr(tarfile, "data_filter"):
                 # Rejects absolute paths, '..', links escaping dest and device files.
-                tf.extractall(dest, filter="data")
+                tf.extractall(dest, members=members, filter="data")
             else:
-                bad = [m.name for m in tf.getmembers()
+                bad = [m.name for m in members
                        if not safe_member(m.name) or m.isdev()
                        or (m.issym() or m.islnk()) and not safe_member(m.linkname)]
                 if bad:
                     raise FetchError(f"{archive.name}: unsafe members in archive: {bad[:3]}")
-                tf.extractall(dest)
+                tf.extractall(dest, members=members)
     except tarfile.TarError as exc:
         raise FetchError(f"{archive.name}: cannot unpack safely: {exc}") from exc
 
@@ -200,7 +255,7 @@ def _install_locked(name: str, version: str, plat: str, entry: dict, cache: Path
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{name}-", dir=dest.parent))
     try:
-        extract(archive, staging)
+        extract(archive, staging, entry.get("include"))
         root = (staging / entry.get("root", ".")).resolve()
         if not root.is_dir() or staging.resolve() not in (root, *root.parents):
             raise FetchError(f"{name}/{plat}: root {entry.get('root')!r} not found in {archive.name}")
@@ -225,6 +280,8 @@ def main(argv: list[str]) -> int:
                         help="platform key from the manifest, or 'all' (default: this machine)")
     parser.add_argument("--only", action="append", default=[], metavar="NAME",
                         help="fetch only this dependency (repeatable)")
+    parser.add_argument("--skip-group", action="append", default=[], metavar="GROUP",
+                        help="skip dependencies whose manifest 'group' is GROUP (repeatable)")
     parser.add_argument("--no-extract", action="store_true",
                         help="download and verify hashes without unpacking")
     args = parser.parse_args(argv)
@@ -249,11 +306,18 @@ def main(argv: list[str]) -> int:
         for name, dep in deps.items():
             if args.only and name not in args.only:
                 continue
+            if dep.get("group") in args.skip_group:
+                print(f"{name}: skipped (group {dep['group']!r})")
+                continue
             for plat in platforms:
                 entry = dep["platforms"].get(plat)
                 if entry is None:
                     raise FetchError(f"{name} has no entry for platform {plat}")
-                print(install(name, dep["version"], plat, entry, cache, not args.no_extract))
+                if "unused" in entry:
+                    print(f"{name} {plat}: not used ({entry['unused']})")
+                    continue
+                unpack = not args.no_extract and dep.get("unpack", True)
+                print(install(name, dep["version"], plat, entry, cache, unpack))
     except FetchError as exc:
         print(f"fetch_deps: error: {exc}", file=sys.stderr)
         return 1

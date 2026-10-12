@@ -17,7 +17,9 @@ aggregate `check` job.
 Workflows are human-owned. Agents change what CI does by editing
 `scripts/ci/run.sh` (lane:build), which every stage calls. Since SPG-01 the
 build stages are real: `setup` runs `scripts/fetch_deps.py` against
-`deps/manifest.json`, `build` configures CMake (Ninja when installed, the newest
+`deps/manifest.json` and, since SPG-13, `build-aux/build_libobs.py`, which
+builds libobs from the pinned OBS sources on macOS and Windows for the plugin
+(Linux uses the pinned Ubuntu package), `build` configures CMake (Ninja when installed, the newest
 Visual Studio with C++ tools on Windows) and prints ccache statistics, and
 `test` runs `ctest`, which fails if no tests are registered. One pin lives
 outside the manifest: Catch2 is fetched by CMake `FetchContent` at configure

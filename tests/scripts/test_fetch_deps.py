@@ -26,14 +26,34 @@ _spec.loader.exec_module(fetch_deps)
 URL = "https://example.invalid/pkg-1.0.tar.gz"
 
 
-def make_tar(members: dict[str, bytes]) -> bytes:
+def make_tar(members: dict[str, bytes], links: dict[str, str] | None = None) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for name, data in members.items():
             info = tarfile.TarInfo(name)
             info.size = len(data)
             tf.addfile(info, io.BytesIO(data))
+        for name, target in (links or {}).items():
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            tf.addfile(info)
     return buf.getvalue()
+
+
+def make_ar(members: dict[str, bytes]) -> bytes:
+    out = io.BytesIO()
+    out.write(b"!<arch>\n")
+    for name, data in members.items():
+        header = f"{name + '/':<16}{0:<12}{0:<6}{0:<6}{'100644':<8}{len(data):<10}".encode("ascii") + b"`\n"
+        out.write(header + data + (b"\n" if len(data) % 2 else b""))
+    return out.getvalue()
+
+
+def make_deb(data_tar_gz: bytes) -> bytes:
+    return make_ar({"debian-binary": b"2.0\n",
+                    "control.tar.gz": make_tar({"./control": b"Package: pkg\n"}),
+                    "data.tar.gz": data_tar_gz})
 
 
 def make_zip(members: dict[str, bytes]) -> bytes:
@@ -83,12 +103,12 @@ class FetchDepsTest(unittest.TestCase):
         release_first = threading.Event()
         calls = []
 
-        def gated_extract(archive: Path, dest: Path) -> None:
+        def gated_extract(archive: Path, dest: Path, include: list[str] | None = None) -> None:
             calls.append(dest)
             if len(calls) == 1:
                 first_inside.set()
                 release_first.wait(timeout=10)
-            real_extract(archive, dest)
+            real_extract(archive, dest, include)
 
         results: dict[str, str] = {}
         errors: list[BaseException] = []
@@ -197,6 +217,66 @@ class FetchDepsTest(unittest.TestCase):
         with self.assertRaisesRegex(fetch_deps.FetchError, "not found"):
             fetch_deps.install("pkg", "1.0", "linux-x64", entry, self.cache, True)
 
+    def test_unpacks_deb_data_with_include_filter_and_relative_symlinks(self) -> None:
+        url = "https://example.invalid/pkg_1.0_amd64.deb"
+        data = make_tar({
+            "./usr/local/include/pkg/pkg.h": b"// header\n",
+            "./usr/local/lib/libpkg.so.30": b"ELF",
+            "./usr/local/share/big/asset.bin": b"not wanted",
+        }, links={"./usr/local/lib/libpkg.so.0": "libpkg.so.30"})
+        sha = self.seed(make_deb(data), url)
+        entry = {"url": url, "sha256": sha, "root": "usr/local",
+                 "include": ["usr/local/include/", "usr/local/lib/libpkg.so"]}
+        fetch_deps.install("pkg", "1.0", "linux-x64", entry, self.cache, True)
+        dest = self.cache / "deps" / "pkg" / "1.0-linux-x64"
+        self.assertEqual((dest / "include" / "pkg" / "pkg.h").read_bytes(), b"// header\n")
+        self.assertEqual((dest / "lib" / "libpkg.so.0").read_bytes(), b"ELF")
+        self.assertFalse((dest / "share").exists())
+
+    def test_deb_without_data_member_is_an_error(self) -> None:
+        url = "https://example.invalid/pkg_1.0_amd64.deb"
+        sha = self.seed(make_ar({"debian-binary": b"2.0\n"}), url)
+        with self.assertRaisesRegex(fetch_deps.FetchError, "no data.tar"):
+            fetch_deps.install("pkg", "1.0", "linux-x64", {"url": url, "sha256": sha, "root": "."},
+                               self.cache, True)
+
+    def test_zip_include_filter(self) -> None:
+        url = "https://example.invalid/pkg-1.0.zip"
+        sha = self.seed(make_zip({"bin/a.dll": b"a", "bin/b.exe": b"b"}), url)
+        entry = {"url": url, "sha256": sha, "root": ".", "include": ["bin/a"]}
+        fetch_deps.install("pkg", "1.0", "windows-x64", entry, self.cache, True)
+        dest = self.cache / "deps" / "pkg" / "1.0-windows-x64"
+        self.assertTrue((dest / "bin" / "a.dll").exists())
+        self.assertFalse((dest / "bin" / "b.exe").exists())
+
+    def test_main_honors_unused_platforms_groups_and_unpack_false(self) -> None:
+        packed = self.seed(make_tar({"pkg-1.0/a": b"a"}))
+        raw_url = "https://example.invalid/raw-1.0.zip"
+        raw = self.seed(make_zip({"x": b"x"}), raw_url)
+        manifest = {"schema": 1, "platforms": ["linux-x64", "windows-x64"], "deps": {
+            "pkg": {"version": "1.0", "platforms": {
+                "linux-x64": {"url": URL, "sha256": packed, "root": "pkg-1.0"},
+                "windows-x64": {"unused": "not needed"}}},
+            "raw": {"version": "1.0", "unpack": False, "platforms": {
+                "linux-x64": {"url": raw_url, "sha256": raw, "root": "."},
+                "windows-x64": {"unused": "not needed"}}},
+            "plugin-only": {"version": "1.0", "group": "plugin", "platforms": {
+                "linux-x64": {"url": "https://example.invalid/never-1.0.tgz",
+                              "sha256": "0" * 64, "root": "."},
+                "windows-x64": {"unused": "not needed"}}},
+        }}
+        path = Path(self._tmp.name) / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        args = ["--cache", str(self.cache), "--manifest", str(path), "--skip-group", "plugin"]
+        with mock.patch.object(fetch_deps, "download", self.no_network):
+            self.assertEqual(fetch_deps.main(args + ["--platform", "linux-x64"]), 0)
+            self.assertEqual(fetch_deps.main(args + ["--platform", "windows-x64"]), 0)
+        deps = self.cache / "deps"
+        self.assertTrue((deps / "pkg" / "1.0-linux-x64" / "a").exists())
+        self.assertFalse((deps / "raw").exists())
+        self.assertFalse((deps / "plugin-only").exists())
+        self.assertFalse((deps / "pkg" / "1.0-windows-x64").exists())
+
     def test_refuses_plain_http(self) -> None:
         with self.assertRaisesRegex(fetch_deps.FetchError, "non-HTTPS"):
             fetch_deps.download("http://example.invalid/x.tgz", self.cache / "x.tgz")
@@ -210,15 +290,37 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(manifest["deps"])
         for name, dep in manifest["deps"].items():
             with self.subTest(dep=name):
-                self.assertRegex(dep["version"], r"^\d+\.\d+\.\d+$")
+                # Semantic versions, or the release date obs-deps uses as its version.
+                self.assertRegex(dep["version"], r"^(\d+\.\d+\.\d+|\d{4}-\d{2}-\d{2})$")
                 self.assertTrue(dep["license"])
-                self.assertIn(dep["kind"], ("library", "tool"))
+                self.assertIn(dep["kind"], ("library", "tool", "source"))
+                # Every platform is listed: pinned, or explicitly unused with a reason.
                 self.assertEqual(sorted(dep["platforms"]), sorted(platforms))
+                pinned = 0
                 for plat, entry in dep["platforms"].items():
+                    if "unused" in entry:
+                        self.assertEqual(list(entry), ["unused"], plat)
+                        self.assertTrue(entry["unused"].strip(), plat)
+                        continue
+                    pinned += 1
                     self.assertTrue(entry["url"].startswith("https://"), plat)
                     self.assertIn(dep["version"], entry["url"], plat)
                     self.assertRegex(entry["sha256"], r"^[0-9a-f]{64}$", plat)
                     self.assertIn("root", entry, plat)
+                    for prefix in entry.get("include", []):
+                        self.assertTrue(prefix.startswith(entry["root"].rstrip("/") + "/")
+                                        or entry["root"] == ".", (plat, prefix))
+                self.assertGreater(pinned, 0)
+
+    def test_plugin_group_covers_every_platform(self) -> None:
+        # The plugin builds on all three platforms, so each one needs libobs:
+        # the Ubuntu package on Linux, sources plus obs-deps elsewhere.
+        deps = json.loads((ROOT / "deps" / "manifest.json").read_text(encoding="utf-8"))["deps"]
+        self.assertNotIn("unused", deps["obs-studio-ubuntu"]["platforms"]["linux-x64"])
+        for plat in ("macos-arm64", "windows-x64"):
+            self.assertNotIn("unused", deps["obs-studio"]["platforms"][plat])
+            self.assertNotIn("unused", deps["obs-deps"]["platforms"][plat])
+        self.assertEqual(deps["obs-studio"]["version"], deps["obs-studio-ubuntu"]["version"])
 
 
 if __name__ == "__main__":
