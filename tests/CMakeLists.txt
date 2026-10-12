@@ -62,6 +62,15 @@ add_test(NAME scripts.fetch_deps
 add_test(NAME scripts.fetch_models
   COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_models.py")
 
+# Eval scorer and suite generators (lane:eval) -------------------------------------
+# The scorer test is standard library only. The generator test fetches the
+# Pillow wheel pinned in eval/pydeps.json into the cache on first use.
+add_test(NAME scoring.scorer
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_scorer.py")
+add_test(NAME scoring.generators
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_generators.py")
+set_tests_properties(scoring.generators PROPERTIES ENVIRONMENT "SPG_CACHE_DIR=${SPG_CACHE_DIR}")
+
 # ONNX Runtime session wrapper ------------------------------------------------------
 if(SPG_WITH_DEPS)
   # Tiny ONNX models generated at build time (no weights in Git) plus a listing
