@@ -333,16 +333,20 @@ TEST_CASE("realtime run feeds the scheduler on the wall clock", "[cli]") {
   CHECK(r.padding_frames > 0);
 }
 
-TEST_CASE("realtime run counts a decoding stall in detection latency", "[cli]") {
-  // Frame 40 takes 500 ms to decode. The decoder runs 16 frames ahead, so the
-  // feed reaches frame 40 about 230 ms after it was due. A live source would
-  // not wait: the frame keeps its due time, and the delay shows up as
-  // latency (and, past the lookahead, as fail-closed frames) instead of
-  // silently slowing the feed.
+TEST_CASE("realtime run keeps a stalled frame's due time and fails it closed", "[cli]") {
+  // Frame 40 takes 1.5 s to decode. The decoder runs 16 frames ahead, so it
+  // starts on frame 40 only after the feed took frame 24, and the feed gets
+  // frame 40 at least 1.5 s - 16 periods (about 1.23 s) after it was due. A
+  // live source does not wait for the pipeline: the frame keeps its due
+  // time, so it arrives past its lookahead, release grace and clock
+  // tolerance (500 ms, 500 ms, 1 s) and must fail closed. Stamped on arrival
+  // instead, it would be scanned as a fresh frame and the stall would only
+  // slow the feed. Only lower bounds on time matter here, so a slow runner
+  // cannot make the frame look on time.
   constexpr std::size_t kStalled = 40;
   spg::cli::FrameSource source{60, 60, [](std::size_t i) {
                                  if (i == kStalled) {
-                                   std::this_thread::sleep_for(std::chrono::milliseconds{500});
+                                   std::this_thread::sleep_for(std::chrono::milliseconds{1500});
                                  }
                                  return gray_frame(64, 48, static_cast<std::uint8_t>(16 + i));
                                }};
@@ -354,8 +358,8 @@ TEST_CASE("realtime run counts a decoding stall in detection latency", "[cli]") 
   const auto r = spg::cli::run_realtime(source, faces_only(), stages, spg::cli::DriverOptions{}, times, *cycles);
   REQUIRE(r.plans.size() == 60);
   CHECK(r.late_frames >= 1);
-  REQUIRE_FALSE(r.latencies_ms.empty());
-  CHECK(*std::max_element(r.latencies_ms.begin(), r.latencies_ms.end()) >= 200.0);
+  CHECK(r.plans[kStalled].fallback);
+  CHECK(r.fail_closed >= 1);
 }
 
 TEST_CASE("timed stages end a cycle after its policy calls", "[cli]") {
