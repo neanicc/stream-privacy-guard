@@ -28,10 +28,11 @@ these hold; otherwise it gets the fallback:
    a non-`std` throw), a detection that fails `validate()` or has the wrong
    kind, or a recognizer returning the wrong number of texts makes it
    incomplete. A frame whose cycle result could not be fully applied (an
-   allocation or tracker failure in `complete()`) fails closed
+   allocation or tracker failure in `complete()`, or a complete result from
+   before more resizes than the size history holds) fails closed
    (`FallbackReason::ApplyFailed`), as do the other frames that result could
-   have masked: buffered frames from `ts - retro` on, and frames pushed up to
-   `ts + hold`.
+   have masked: buffered frames from `ts - retro` on, frames pushed up to
+   `ts + hold`, and the frame `hold_last_scanned` would show again.
 2. That cycle scanned the **same content**: no resize and no
    `mark_discontinuity()` between the two frames.
 3. The release is no later than `t + lookahead + release_grace`. A later
@@ -41,6 +42,40 @@ these hold; otherwise it gets the fallback:
    `clock.now()` when pushed. Otherwise the clock and the frames do not share
    one `FrameClock` time base (the tracker's pruning compares them), so the
    frame is never scanned and fails closed.
+
+### One gate for every path that airs a frame
+
+`Lookahead::gate(frame, at)` is the only code that decides a frame may air
+clean; it checks rules 4, 1 (`apply_failed`, `covered`) and 3 in that order and
+returns the `FallbackReason`. Two paths air a frame, and both call it:
+
+| Path | What airs | Gate call |
+| --- | --- | --- |
+| `release_due()`, frame due at `t + lookahead` | the frame with its plan | `gate(frame, now)` |
+| `release_due()`, buffer over `max_buffered_frames` (early) | the oldest frame with its plan | `gate(frame, now)`; same rule, only earlier |
+| `hold_last_scanned` re-emit | the last clean frame again, as it was released | `gate(last_clean, when it was released)` |
+
+A re-emit is a release: it shows the old frame's pixels with the masks it had
+then. A complete cycle that finishes later and could have masked it (its
+boxes reach the frame retroactively, `ts - retro <= t`, or by hold,
+`t <= ts + hold`), or whose result cannot be applied, marks it
+`apply_failed`, exactly as it marks a buffered frame in that reach. It then
+fails the gate and the fallback blurs the source instead (SPG-10b). Before
+this, the re-emit checked only the segment, so a frame could be shown again
+without boxes held over it or found just after it.
+
+Every other path only feeds the gate: `push()` sets `bad_timestamp` (rule 4)
+and `apply_failed` for frames up to `ts + hold` of a failed result;
+`complete()` sets `covered` (rules 1 and 2) or `apply_failed`; an incomplete
+result, a job dropped from a full queue or by `take_job()`, a cadence-skipped
+frame and a readback that matches no buffered frame set nothing, so their
+frames stay `NotScanned` unless another cycle covers them; a resize or
+`mark_discontinuity()` starts a segment so earlier cycles do not cover later
+frames. A result that lands after its frames were released (late
+`complete()`) cannot rescue them; it still reaches the tracker and, through
+the rule above, the re-emit candidate. `Scheduler`'s destructor drops a
+result that returns after stop and never releases another frame; nothing
+else drops, flushes or clears buffered frames.
 
 Detectors run their tiles serially with no deadline and the policy has no
 time bound, so nothing interrupts a stage. Deadlines are enforced at release:
@@ -95,7 +130,11 @@ scaled margin, as `Tracker::rescale` does for boxes held before the resize.
 A retroactive rect on a frame of another size is the hull of the box and its
 scaling grown in that size, and of the grown mask scaled.
 The cycle does not count as a scan of new-size frames (rule 2). Up to 64
-resizes are remembered; a result from before that is treated as incomplete.
+resizes are remembered. A complete result from before that cannot be scaled,
+so it fails closed like any result that cannot be applied
+(`FallbackReason::ApplyFailed` for frames from `ts - retro` on and pushed up to
+`ts + hold`). Until SPG-10b it was dropped like an incomplete one, so frames of
+later sizes that another cycle covered aired without its held boxes.
 
 ## Fallback modes
 
@@ -103,7 +142,7 @@ resizes are remembered; a result from before that is treated as incomplete.
 | --- | --- |
 | `blur_source` (default) | `BlurSource` |
 | `solid_fill` | `SolidFill` |
-| `hold_last_scanned` | `HoldLastScanned` with `reemit` = the last frame released clean in the same segment; `BlurSource` when there is none (start, after a resize or a discontinuity). The plugin shows that frame again exactly as it released it. |
+| `hold_last_scanned` | `HoldLastScanned` with `reemit` = the last frame released clean in the same segment, if it still passes the gate; `BlurSource` when there is none (start, after a resize or a discontinuity) or when a cycle that finished after its release could have masked it. The plugin shows that frame again exactly as it released it. |
 
 ## Degenerate configs
 
@@ -179,8 +218,11 @@ Offline, `spg-cli` (SPG-11) can drive `Lookahead` directly: push, take a job,
 ## Evidence
 
 `tests/unit/lookahead_test.cpp` (deterministic cases),
-`tests/unit/lookahead_property_test.cpp` (1500 seeded scenes) and
-`tests/unit/scheduler_test.cpp` (real threads). See the SPG-10 entry in
+`tests/unit/lookahead_property_test.cpp` (1500 seeded scenes; its oracle also
+checks every re-emitted frame against every box that could reach it, and its
+scenes include results the tracker rejects and a source that changes size
+faster than the size history) and `tests/unit/scheduler_test.cpp` (real
+threads). See the SPG-10 entry in
 [agent-log.md](agent-log.md). None of this is synthetic-eval or live evidence;
 cadence, worker count and the fail-closed rate on real detectors are for
 `spg-cli bench` (SPG-11/16) to measure.

@@ -807,6 +807,182 @@ TEST_CASE("hold-last-scanned re-emits the last clean frame of the same content",
   CHECK(out[2].action == FallbackAction::BlurSource);  // content switched
 }
 
+// SPG-10b: a re-emit is a release too. A complete cycle that finishes after
+// the clean frame aired, and whose boxes that frame would have needed (held
+// over it, or retroactive), means the frame no longer passes the release
+// gate: showing it again would air those boxes unmasked.
+TEST_CASE("hold-last-scanned never re-emits a frame a later result would have masked", "[schedule]") {
+  const Rect box{40, 40, 30, 30};
+  SchedulerConfig config = small_config();  // lookahead 100, retro 100, hold 200
+  config.fallback = FallbackMode::HoldLastScanned;
+  // The detector sees the box only on frame 1000 (detector flicker, which the
+  // hold exists for).
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([box](Timestamp t, Size) {
+                                    std::vector<Detection> out;
+                                    if (t == at_ms(1000)) {
+                                      out.push_back(face_at(box.x, box.y, box.width, box.height));
+                                    }
+                                    return out;
+                                  }),
+                                  nullptr, nullptr, nullptr});
+
+  SECTION("a result held over the clean frame") {
+    sim.push(1000, true);
+    auto [slow, found] = sim.run();  // finds the box, returns late
+    REQUIRE(found.detections.size() == 1);
+    const spg::FrameId clean = sim.push(1010, true);
+    sim.scan_now();  // sees nothing; covers 1000 and 1010
+    sim.push(1020, false);
+    auto out = sim.release_at(1110);
+    REQUIRE(out.size() == 2);
+    REQUIRE(out[1].id == clean);
+    REQUIRE(out[1].action == FallbackAction::None);
+    CHECK_FALSE(covered_by(out[1].plan, box));  // the box was not known yet
+
+    sim.la.complete(slow, found);  // the box at 1000 is held over 1010
+    out = sim.release_at(1120);
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].reason == FallbackReason::NotScanned);
+    CHECK(out[0].action == FallbackAction::BlurSource);  // not frame 1010 again
+    CHECK(out[0].reemit == 0);
+  }
+
+  SECTION("a result retroactive to the clean frame") {
+    sim.stages.faces = std::make_shared<spg_test::ScriptedDetector>([box](Timestamp t, Size) {
+      std::vector<Detection> out;
+      if (t == at_ms(1050)) {
+        out.push_back(face_at(box.x, box.y, box.width, box.height));
+      }
+      return out;
+    });
+    const spg::FrameId clean = sim.push(1000, true);
+    sim.scan_now();  // sees nothing
+    sim.push(1050, true);
+    auto [slow, found] = sim.run();  // finds the box; 1000 is within retro of 1050
+    REQUIRE(found.detections.size() == 1);
+    sim.push(1060, false);
+    auto out = sim.release_at(1150);
+    REQUIRE(out.size() == 2);
+    REQUIRE(out[0].id == clean);
+    REQUIRE(out[0].action == FallbackAction::None);
+    CHECK(out[1].action == FallbackAction::HoldLastScanned);  // nothing known against 1000 yet
+    CHECK(out[1].reemit == clean);
+
+    sim.la.complete(slow, found);  // would have masked 1000 retroactively
+    out = sim.release_at(1160);
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].reason == FallbackReason::NotScanned);
+    CHECK(out[0].action == FallbackAction::BlurSource);
+    CHECK(out[0].reemit == 0);
+  }
+
+  SECTION("an empty later result keeps the clean frame") {
+    const spg::FrameId clean = sim.push(1010, true);
+    sim.scan_now();
+    sim.push(1020, true);
+    auto [late, empty] = sim.run();  // sees nothing
+    sim.push(1030, false);
+    auto out = sim.release_at(1120);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].action == FallbackAction::None);
+    CHECK(out[1].action == FallbackAction::HoldLastScanned);  // 1020's cycle is late
+    sim.la.complete(late, empty);
+    out = sim.release_at(1130);
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].action == FallbackAction::HoldLastScanned);
+    CHECK(out[0].reemit == clean);
+  }
+}
+
+TEST_CASE("hold-last-scanned never re-emits a frame a failed apply could have masked", "[schedule]") {
+  SchedulerConfig config = small_config();
+  config.fallback = FallbackMode::HoldLastScanned;
+  Sim sim(config, spg::ScanStages{nothing(), nullptr, nullptr, nullptr});
+  const spg::FrameId clean = sim.push(1000, true);
+  sim.scan_now();
+  sim.push(1050, true);
+  auto [job, result] = sim.run();
+  auto out = sim.release_at(1100);
+  REQUIRE(out.size() == 1);
+  REQUIRE(out[0].id == clean);
+  REQUIRE(out[0].action == FallbackAction::None);
+  // A complete result the tracker rejects, as in the apply-failure test: its
+  // valid box would have masked 1000 retroactively.
+  result.detections = {face_at(10, 10, 20, 20), face_at(10, 10, -5, 5)};
+  sim.la.complete(job, result);
+  out = sim.release_at(1150);
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].reason == FallbackReason::ApplyFailed);
+  CHECK(out[0].action == FallbackAction::BlurSource);
+  CHECK(out[0].reemit == 0);
+}
+
+// SPG-10b: a complete result from before more resizes than the size history
+// holds cannot be scaled to the current size, so it cannot be applied. It must
+// fail closed like any other result that cannot be applied, not vanish: its
+// box is held over later frames that another cycle covers.
+TEST_CASE("a complete result older than the size history fails closed", "[schedule]") {
+  const Rect box720{100, 100, 20, 20};
+  const Rect box1080{150, 150, 30, 30};  // box720 at 1.5x
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 100ms;
+  config.tracker.hold = 750ms;
+  config.queue_capacity = 1;
+  // Sees the box only on frame 1000 (detector flicker).
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([=](Timestamp t, Size) {
+                                    std::vector<Detection> out;
+                                    if (t == at_ms(1000)) {
+                                      out.push_back(face_at(box720.x, box720.y, box720.width, box720.height));
+                                    }
+                                    return out;
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  sim.push(1000, true, k720);
+  auto [slow, found] = sim.run();
+  REQUIRE(found.detections.size() == 1);
+
+  const auto resize_then_scan = [&sim](int resizes) {
+    Size size = k720;
+    std::int64_t t = 1000;
+    for (int i = 0; i < resizes; ++i) {
+      size = size == k720 ? k1080 : k720;
+      t += 2;
+      sim.push(t, false, size);
+    }
+    sim.push(t + 2, true, size);  // same size: same segment as the last resize
+    sim.scan_now();               // sees nothing; covers both
+    return size;
+  };
+
+  SECTION("63 resizes: the result is applied and held over later frames") {
+    const Size last = resize_then_scan(63);
+    REQUIRE(last == k1080);
+    sim.la.complete(slow, found);
+    CHECK(sim.la.stats().scans_completed == 2);
+    const auto out = sim.release_at(1700);
+    REQUIRE(out.size() == 65);
+    for (std::size_t i = 63; i < 65; ++i) {
+      INFO("frame " << i);
+      CHECK(out[i].action == FallbackAction::None);
+      CHECK(covered_by(out[i].plan, box1080));
+    }
+  }
+  SECTION("64 resizes: the result cannot be scaled and its frames fail closed") {
+    const Size last = resize_then_scan(64);
+    REQUIRE(last == k720);
+    sim.la.complete(slow, found);
+    const auto out = sim.release_at(1700);
+    REQUIRE(out.size() == 66);
+    for (std::size_t i = 64; i < 66; ++i) {
+      INFO("frame " << i);
+      // On main these were released clean without the held box.
+      CHECK(out[i].reason == FallbackReason::ApplyFailed);
+      CHECK(out[i].plan.fallback);
+    }
+  }
+}
+
 TEST_CASE("a discontinuity stops older cycles from covering new frames", "[schedule]") {
   Sim sim(small_config(), spg::ScanStages{nothing(), nullptr, nullptr, nullptr});
   sim.push(1000, false);
