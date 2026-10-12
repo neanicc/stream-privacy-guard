@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "spg/secret.hpp"
+#include "spg/secure_memory.hpp"
 
 namespace spg::plugin {
 
@@ -67,8 +68,9 @@ enum class StoreError : std::uint8_t {
 [[nodiscard]] std::string_view describe(StoreError error) noexcept;
 
 // The v1 file body: a header line, then one entry per line with '\\', '\n'
-// and '\r' escaped as "\\\\", "\\n" and "\\r". The output is secret.
-[[nodiscard]] std::string encode_watchlist(const std::vector<Secret>& entries);
+// and '\r' escaped as "\\\\", "\\n" and "\\r". The output is secret, so it
+// is built in protected memory.
+[[nodiscard]] SecureString encode_watchlist(const std::vector<Secret>& entries);
 // Strict inverse of encode_watchlist. Returns nullopt for any other content,
 // including a blank entry or a list over the limits.
 [[nodiscard]] std::optional<std::vector<Secret>> decode_watchlist(std::string_view body);
@@ -85,16 +87,17 @@ class WatchlistStore {
   // `ref` comes from the filter settings.
   WatchlistStore(std::filesystem::path directory, std::string ref);
 
-  // Reads the watch-list. A missing file is an empty list when the settings
-  // record no entries (`expected_entries` <= 0, a new filter) and
-  // StoreError::Missing otherwise, so a scene collection moved without its
-  // watch-list fails closed instead of silently matching nothing. Tightens a
-  // file or directory that is readable by others back to user-only.
+  // Reads the watch-list straight into protected memory (no stream buffer).
+  // A missing file is an empty list when the settings record no entries
+  // (`expected_entries` <= 0, a new filter) and StoreError::Missing otherwise,
+  // so a scene collection moved without its watch-list fails closed instead
+  // of silently matching nothing. Tightens a file or directory that is
+  // readable by others back to user-only.
   [[nodiscard]] WatchlistLoad load(long long expected_entries) const;
 
   // Replaces the file atomically: writes a user-only temporary file next to
-  // it, syncs it and renames it over the old one. Creates the directory
-  // (user-only) when needed.
+  // it (unbuffered, from protected memory), syncs it and renames it over the
+  // old one. Creates the directory (user-only) when needed.
   [[nodiscard]] StoreError save(const std::vector<Secret>& entries) const;
 
   // The file path, or empty when the directory or reference is invalid.

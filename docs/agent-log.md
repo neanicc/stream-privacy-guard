@@ -681,3 +681,58 @@ Template:
   file read, only on an external reference change; documented in
   `docs/settings.md`). Mutation checks: reverting (1) failed 2 `plugin.loads`
   checks, reverting the fallback in (2) failed 4, dropping the release failed 1.
+
+## 2026-10-12 — SPG-15b Watch-list text out of crash dumps and the undo stack (#38)
+
+- Decision / change: a small protected heap in spg-core
+  (`core/include/spg/secure_memory.hpp`, `core/src/secure/`) instead of a
+  per-allocation `mmap`: page-aligned anonymous regions, 64 KiB shared by
+  nine size classes (16 to 4096 bytes) plus one region per larger block.
+  Each region is excluded from crash dumps before use
+  (`madvise(MADV_DONTDUMP)` on Linux, `WerRegisterExcludedMemoryBlock` on
+  Windows, nothing exists on macOS), locked with `mlock`/`VirtualLock` (best
+  effort; a refusal is counted, not fatal), and every block is zeroed on
+  release (`SecureZeroMemory`, or `memset` behind a compiler barrier). The OS
+  calls sit behind an injectable `SecureMemoryPlatform` so tests record them.
+  `SecureHeap::process()` is a never-destroyed function-local static: a
+  standard allocator needs one shared heap, and leaking it keeps a `Secret`
+  in static storage safe at exit (recorded exception to "no globals").
+  `Secret` now stores its bytes there (never inline), `Secret(std::string)`
+  zeroes the string it consumed, and `Secret::copy_of(string_view)` copies
+  without a temporary. The policy engine's compiled entries, its folded,
+  matching and reversed temporaries and the PII digit views use
+  `SecureAllocator`; matching behavior is unchanged. The plugin's store
+  reads and writes the file with unbuffered `read`/`write` (`_read`/`_write`
+  and `_commit` on Windows) straight from protected memory. Undo stack:
+  in OBS 32.1.2 the properties view records a filter undo step from the live
+  settings 500 ms after the last edit, but runs a property's modified
+  callback synchronously on each edit, so the masked field now has one that
+  moves the text into `FilterState::pending_entry` (a `Secret`), overwrites
+  the libobs item in place and erases the key; Add uses it. Settings, and so
+  every undo snapshot and save, hold only `watchlist_ref`, `watchlist_count`
+  and the plain settings. A side effect: a scene collection save while the
+  user types no longer clears what was typed. Limits (Qt and libobs copies
+  of each keystroke, short-string buffers on the stack, dumps WER does not
+  write, macOS) are in `docs/settings.md`, "Watch-list text in memory".
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang):
+  `scripts/ci/run.sh build` and `test` pass, 174/174 ctest tests. New unit
+  cases: a recording platform shows map, exclude and lock before a block is
+  handed out, and unlock, include and unmap when a large block is freed; the
+  wipe observer sees every released block all zero (small, large, `Secret`
+  destroyed and reassigned); refused exclusion or locking keeps the heap
+  working and is counted; a failed map throws `std::bad_alloc`; the policy
+  engine's entries are live blocks of the process heap; on Linux
+  `/proc/self/smaps` must show `dd` on the mapping holding a `Secret` (CI
+  only), on Windows WER registration must succeed, on macOS the method is
+  `none`. `plugin.loads` replays the OBS 32.1.2 `ControlChanged` sequence
+  key by key and checks the undo snapshots `FilterChangeUndoRedo` would
+  store. Mutation checks: not registering the callback failed 8
+  `plugin.loads` checks; not resetting `pending_entry` on a property build
+  failed 2; a no-op wipe failed 4 unit cases; skipping exclusion failed 2.
+- Eval delta: none expected (allocator change only). The eval stage was not
+  run locally (the agent sandbox refuses that command); CI runs it.
+- Open issues or follow-ups: live check in OBS on the dev Mac (human, steps
+  added to `docs/live-check.md`): typing, undo and redo in the real Qt view.
+  Not verified anywhere: that WER leaves the regions out of a real crash
+  dump on Windows, or that a Linux core file omits them (the `dd` flag is
+  checked, not a core file).

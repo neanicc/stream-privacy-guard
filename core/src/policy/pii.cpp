@@ -47,8 +47,8 @@ bool luhn(std::basic_string_view<Char> digits) noexcept {
 
 // OCR reads digits as look-alike letters. In the digit view, o reads as 0 and
 // l, i or | as 1 when a neighbouring character is a digit.
-std::u32string digit_view(Text t) {
-  std::u32string d(t);
+SecureU32String digit_view(Text t) {
+  SecureU32String d(t);
   for (std::size_t i = 0; i < t.size(); ++i) {
     const bool near_digit = (i > 0 && is_digit(t[i - 1])) || (i + 1 < t.size() && is_digit(t[i + 1]));
     if (!near_digit) {
@@ -132,7 +132,7 @@ void scan_numbers(Text d, CategorySet enabled, CategorySet& found) {
     }
     for (std::size_t a = 0; a < groups.size(); ++a) {
       const bool plus = after_plus(d, groups[a].begin);
-      std::u32string digits;
+      SecureU32String digits;
       std::vector<std::size_t> cuts;
       for (std::size_t b = a; b < groups.size() && digits.size() <= 19; ++b) {
         if (b > a) {
@@ -449,7 +449,7 @@ CategorySet find_pii_folded(std::u32string_view folded, CategorySet enabled) {
   CategorySet found;
   if (enabled.contains(Category::PiiPhone) || enabled.contains(Category::PiiCard) ||
       enabled.contains(Category::PiiIp)) {
-    const std::u32string digits = digit_view(folded);
+    const SecureU32String digits = digit_view(folded);
     scan_numbers(digits, enabled, found);
     if (enabled.contains(Category::PiiIp) && has_ip(folded, digits)) {
       found.insert(Category::PiiIp);

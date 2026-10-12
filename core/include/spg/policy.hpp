@@ -9,6 +9,7 @@
 #include "spg/detection.hpp"
 #include "spg/policy_config.hpp"
 #include "spg/secret.hpp"
+#include "spg/secure_memory.hpp"
 
 // The text policy (SPG-08): decides whether recognized text is sensitive and
 // why. Rules are in docs/policy.md.
@@ -60,7 +61,8 @@ class PolicyEngine {
  private:
   CategorySet categories_;
   FuzzyLimits fuzzy_;
-  std::vector<std::u32string> watchlist_;  // normalized entries
+  // Normalized entries, in protected memory like the Secrets they come from.
+  std::vector<SecureU32String, SecureAllocator<SecureU32String>> watchlist_;
 };
 
 }  // namespace spg

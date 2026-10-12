@@ -56,7 +56,7 @@ bool is_deleted(char32_t cp) noexcept {
 bool is_control(char32_t cp) noexcept { return cp < 0x20 || (cp >= 0x7F && cp < 0xA0); }
 
 // Appends c, keeping at most one space in a row and none at the start.
-void push(std::u32string& out, char32_t c) {
+void push(SecureU32String& out, char32_t c) {
   if (c == U' ' && (out.empty() || out.back() == U' ')) {
     return;
   }
@@ -82,8 +82,8 @@ char32_t merge_confusion(char32_t c) noexcept {
 
 }  // namespace
 
-std::u32string fold_text(std::string_view utf8) {
-  std::u32string out;
+SecureU32String fold_text(std::string_view utf8) {
+  SecureU32String out;
   out.reserve(utf8.size());
   while (!utf8.empty()) {
     char32_t cp = 0xFFFD;
@@ -126,8 +126,8 @@ bool is_separator(char32_t c) noexcept {
          in_separator_table(c);
 }
 
-std::u32string matching_form(std::u32string_view folded) {
-  std::u32string out;
+SecureU32String matching_form(std::u32string_view folded) {
+  SecureU32String out;
   out.reserve(folded.size());
   for (const char32_t raw : folded) {
     const char32_t c = merge_confusion(raw);
@@ -139,11 +139,27 @@ std::u32string matching_form(std::u32string_view folded) {
   return out;
 }
 
-std::string to_utf8(std::u32string_view text) {
-  std::string out;
+// append_utf8 (contracts/utf8.hpp) for a SecureString: the bytes never pass
+// through an ordinary std::string.
+SecureString to_utf8(std::u32string_view text) {
+  SecureString out;
   out.reserve(text.size());
-  for (const char32_t c : text) {
-    append_utf8(out, c);
+  for (const char32_t cp : text) {
+    if (cp < 0x80) {
+      out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      out.push_back(static_cast<char>(0xC0U | (cp >> 6U)));
+      out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+    } else if (cp < 0x10000) {
+      out.push_back(static_cast<char>(0xE0U | (cp >> 12U)));
+      out.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU)));
+      out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+    } else {
+      out.push_back(static_cast<char>(0xF0U | (cp >> 18U)));
+      out.push_back(static_cast<char>(0x80U | ((cp >> 12U) & 0x3FU)));
+      out.push_back(static_cast<char>(0x80U | ((cp >> 6U) & 0x3FU)));
+      out.push_back(static_cast<char>(0x80U | (cp & 0x3FU)));
+    }
   }
   return out;
 }
@@ -151,7 +167,7 @@ std::string to_utf8(std::u32string_view text) {
 }  // namespace detail
 
 Secret normalize_for_matching(std::string_view utf8) {
-  return Secret(detail::to_utf8(detail::matching_form(detail::fold_text(utf8))));
+  return Secret::copy_of(detail::to_utf8(detail::matching_form(detail::fold_text(utf8))));
 }
 
 }  // namespace spg

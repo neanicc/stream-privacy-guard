@@ -77,13 +77,14 @@ construction, matching, PII scanning, `describe()` and three config errors
 while capturing the sink and `std::cout`/`std::cerr`/`std::clog`, and asserts
 that no captured text contains any fragment of the entry, raw or normalized.
 
-`Secret` is a type-level guard (no stream operator, no implicit conversion), not
-protected memory: it does not lock or zero its storage. The compiled matching
-forms (`std::u32string`, private to the engine) and the folded copies
-`evaluate()` makes of recognized text are held the same way, so they are as
-exposed as the `PolicyConfig` itself in a full-memory dump. Keeping watch-list
-text out of crash dumps (AGENTS.md) therefore needs a process-level measure in
-the plugin; the engine does not provide one.
+`Secret` is a type-level guard (no stream operator, no implicit conversion)
+and, since SPG-15b, protected memory: its text lives in `SecureHeap`, which
+keeps it out of crash dumps where the OS allows, locks it in RAM where it can
+and zeroes it on release. The compiled matching forms, the folded and matching
+copies `evaluate()` makes of recognized text and the PII digit views use the
+same heap through `SecureAllocator`. What each OS covers, and the copies that
+remain outside it (short-string buffers on the stack, OBS and Qt copies of the
+typed entry), are in [settings.md](settings.md#watch-list-text-in-memory).
 
 `evaluate()` costs O(entries × entry length × text length) per call, with up to
 three passes per entry, and has no length cap of its own. It is meant for a

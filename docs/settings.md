@@ -44,13 +44,12 @@ for open question 4, entries never go into filter settings:
   then one entry per line with `\`, newline and carriage return escaped as
   `\\`, `\n` and `\r`. Anything else is corrupt. At most 256 entries of at most
   256 bytes each.
-- The masked field `watchlist_new_entry` is moved into the file by Add and is
-  erased from the settings in the filter's `save` callback, which OBS calls
-  just before writing the scene collection, so an entry typed but never added
-  is not saved there either. OBS hands that callback the live settings, so a
-  scene collection save (including an autosave) while the user is still
-  typing clears the field: the entry has to be typed again. That is the
-  intended trade: an unsent entry is dropped rather than written to disk.
+- The masked field `watchlist_new_entry` never stays in the settings: the
+  field's modified callback moves each keystroke's text into the filter's
+  memory (see [the undo stack](#the-obs-undo-stack)), and Add moves it into
+  the file. The filter's `save` callback, which OBS calls just before writing
+  the scene collection, still erases the key, for a script that set it
+  directly, so an entry typed but never added is not saved there either.
 - A filter copied in OBS (Duplicate, Copy and Paste Filters) arrives with its
   original's reference. A reference held by another live filter is forked: the
   copy gets a new reference and its own copy of the file.
@@ -91,7 +90,119 @@ captures the whole libobs log while it adds, duplicates, removes and saves a
 sentinel through the filter's real buttons, then checks the log, the saved
 scene collection data and every file outside the watch-list directory.
 
-Not covered: the entries are in process memory (crash dumps are a process-level
-measure the plugin does not take yet), in OBS's in-memory undo stack if a user
-typed into the masked field, and in watch-list files of deleted filters, which
-stay on disk until removed by hand.
+Not covered: watch-list files of deleted filters stay on disk until removed by
+hand, and the copies listed under [what is not covered](#what-is-not-covered).
+
+## The OBS undo stack
+
+OBS's undo stack is in memory only, but it keeps whole settings snapshots as
+JSON text. In OBS 32.1.2 (the pinned version) the properties view handles an
+edit in `WidgetInfo::ControlChanged`
+(`shared/properties-view/properties-view.cpp`): when a burst of edits starts
+it copies the settings, then for each edit it writes the widget's whole value
+into the settings, calls the filters dialog's visual update
+(`obs_source_update`) and then the property's modified callback. A single-shot
+500 ms timer, restarted by every edit, finally calls `FilterChangeUndoRedo`
+(`frontend/dialogs/OBSBasicFilters.cpp`), which stores the copy and the live
+settings as JSON in the undo stack.
+
+The masked field's modified callback runs synchronously on every keystroke, so
+it copies the text into a `Secret` held by the filter (`pending_entry`),
+overwrites the stored string in place and erases the key before the timer can
+fire. The burst's first copy was taken before the first keystroke reached the
+settings. Both undo snapshots therefore hold only the filter's own keys:
+`watchlist_ref`, `watchlist_count`, the selected entry number and the plain
+settings. The callback returns false, so the view is not rebuilt while the
+user types and the field keeps showing the dots. libobs also runs the callback
+whenever the properties are built (`obs_source_properties` applies the
+settings), which resets `pending_entry` to the empty field a rebuilt view
+shows: Add never adds text the field no longer shows. Add takes the text from
+the settings if a script left it there, otherwise from `pending_entry`.
+
+Other undo paths: deleting a filter or pasting filters stores
+`obs_save_source` output, which runs the `save` callback first; resetting a
+filter to defaults stores the current settings, which hold no entry. Undo and
+redo restore `watchlist_ref` and `watchlist_count`, never entries; the file
+is not changed by them.
+
+Evidence: `plugin.loads` (macOS and Windows) builds the properties once, types
+a sentinel one character at a time through the same sequence of libobs calls
+as `ControlChanged`, records the two snapshots `FilterChangeUndoRedo` would
+store (and another for a slider move), and checks that no prefix of three or
+more characters is in the settings after its keystroke, that every snapshot
+holds only the filter's own keys and no fragment of the sentinel, that Add
+then stores the typed entry, and that text typed before a rebuild is not
+added. Removing the callback fails 8 of those checks. This emulates the view;
+the real Qt view is a [live check](live-check.md) for a human.
+
+## Watch-list text in memory
+
+AGENTS.md: watch-list content is never written to crash dumps. Every copy of
+an entry that spg-core or the plugin makes lives in `SecureHeap`
+(`core/include/spg/secure_memory.hpp`):
+
+- Regions are page-aligned anonymous mappings (`mmap`, `VirtualAlloc`). Blocks
+  up to 4 KiB come from size classes in shared 64 KiB regions; larger ones get
+  a region of their own.
+- Each region is excluded from crash dumps where the OS has a call for it,
+  before any block in it is used: `madvise(MADV_DONTDUMP)` on Linux,
+  `WerRegisterExcludedMemoryBlock` on Windows. macOS has none.
+- Each region is locked in RAM (`mlock`, `VirtualLock`) so it is not paged to
+  swap. Best effort: `RLIMIT_MEMLOCK` or the Windows working-set quota can
+  refuse it, and the heap then carries on unlocked.
+- Every block is zeroed when released (`SecureZeroMemory` on Windows, `memset`
+  behind a compiler barrier elsewhere) before it is reused or unmapped.
+- The plugin logs the mechanism once at load:
+  `watch-list memory: crash-dump exclusion: madvise(MADV_DONTDUMP)`,
+  `WerRegisterExcludedMemoryBlock` or `none`.
+
+What uses it:
+
+| Copy | Where |
+| --- | --- |
+| `spg::Secret` (entries, `PolicyConfig::watchlist`, OCR text) | Its bytes, always; a `std::vector<Secret>` holds only pointers and sizes |
+| `Secret(std::string)` | Copies the string, then zeroes the string's whole buffer |
+| Policy engine's compiled entries | `SecureU32String`s in a vector on `SecureAllocator` |
+| Policy folding, matching forms, reversed forms, PII digit views | `SecureU32String` / `SecureString` temporaries |
+| Watch-list file body | Read with `read()` / `_read()` straight into a `SecureString`, written with `write()` / `_write()` from one; no stream or stdio buffer |
+| Typed, not yet added entry | `FilterState::pending_entry` (a `Secret`) |
+
+### Platform limits
+
+- **Linux:** the kernel's core dump, and so `systemd-coredump`, leaves the
+  regions out (`/proc/<pid>/smaps` shows `dd` in their `VmFlags`). A debugger
+  or another process that can read `/proc/<pid>/mem` still can.
+- **Windows:** the registration applies to dumps that Windows Error Reporting
+  collects, at most `WER_MAX_REGISTERED_ENTRIES` (512) blocks per process; the
+  heap uses one per region. OBS 32.1.2 installs its own unhandled-exception
+  filter (`libobs/obs-win-crash-handler.c`) that writes a text crash log
+  (stack traces and the module list, no memory) and exits, so most crashes
+  never reach WER. A dump written by a tool that calls `MiniDumpWriteDump`
+  itself (a debugger or a dump utility) does not consult the registration
+  and includes the regions.
+- **macOS:** no per-region exclusion exists. Crash reports (`.ips`) hold
+  backtraces and register state, not heap memory; full core dumps are off by
+  default (`ulimit -c 0`) and, when a user enables them, include the
+  regions. Locking and zeroing still apply.
+- Hibernation writes RAM, locked pages included, to disk (`hiberfil.sys`,
+  `sleepimage`).
+
+### What is not covered
+
+- **The masked field on its way in.** Each keystroke passes through Qt (the
+  `QLineEdit` and a temporary UTF-8 `QByteArray`) and into a libobs
+  `obs_data` item before the callback moves it. The callback overwrites the
+  item with `*`s before erasing it (libobs 32.1.2 reuses an item's storage
+  for a value of the same length), but Qt's and libobs's freed buffers are
+  not zeroed, and the `QLineEdit` keeps the text, and its own edit history,
+  until the view is rebuilt (Add does that). That is Qt memory the plugin
+  cannot reach.
+- **Short strings.** A `std::basic_string` keeps a few characters (3 or 4
+  `char32_t`, 15 or 22 `char`, by standard library) inside the string
+  object. For temporaries that object is on the stack, which a full dump
+  includes. A `Secret` never does this.
+- **Strings that are not `Secret`s.** Only watch-list entries are tracked.
+  OBS's and the frontend's copies of other settings and the watch-list file
+  path are ordinary memory; none of them hold entries.
+- **The file.** The watch-list file and the OS file cache hold the entries by
+  design (user-only permissions, above).
