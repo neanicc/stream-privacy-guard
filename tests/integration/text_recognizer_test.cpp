@@ -32,6 +32,8 @@
 #include "spg/error.hpp"
 #include "spg/policy.hpp"
 #include "spg/policy_config.hpp"
+#include "spg/secure_memory.hpp"
+#include "../unit/wipe_log.hpp"
 #include "synthetic_frames.hpp"
 #include "synthetic_text.hpp"
 
@@ -636,6 +638,35 @@ TEST_CASE("Batching does not change what is read", "[ocr][fixture]") {
     CHECK_FALSE(one[i].text.empty());
     CHECK(one[i].text == many[i].text);
   }
+}
+
+TEST_CASE("Recognizer temporaries are protected blocks, zeroed when released", "[ocr][fixture][secure]") {
+  // recognize() decodes each read job into a buffer of its own and joins a
+  // region's buffers into another before the Secret is made. All of them are
+  // SecureHeap blocks, zeroed when released; only one Secret per region
+  // outlives the call. A std::string temporary would show up here as fewer
+  // wiped blocks.
+  const TextRecognizer reader = open_fixture("rec_softmax.onnx");
+  const Scene scene = panel({900, 420}, {60, 60, 60}, {220, 230, 240}, kTexts, 12.0);
+  const OwnedFrame frame = spg::test::to_frame(scene.canvas, PixelFormat::BGRA);
+  const std::vector<spg::Detection> regions = regions_of(scene, {900, 420});
+  spg::SecureHeap& heap = spg::SecureHeap::process();
+  const std::size_t live_before = heap.stats().live_blocks;
+  spg::test::WipeLog wipes;
+  std::vector<Recognition> read;
+  {
+    const spg::test::ObserveWipes observing{heap, wipes};
+    read = reader.recognize(frame.view, {900, 420}, regions);
+  }
+  REQUIRE(read.size() == regions.size());
+  for (const Recognition& r : read) {
+    CHECK_FALSE(r.text.empty());
+  }
+  CHECK(heap.stats().live_blocks == live_before + regions.size());
+  CHECK(wipes.entries.size() >= 2 * regions.size());
+  CHECK(wipes.all_zero());
+  read.clear();
+  CHECK(heap.stats().live_blocks == live_before);
 }
 
 TEST_CASE("A full cache falls back to reading every track again", "[ocr][fixture][cache]") {
