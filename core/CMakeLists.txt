@@ -34,4 +34,6 @@ target_sources(spg-core PRIVATE src/track/tracker.cpp)
 # ONNX Runtime session wrapper; needs the prebuilt ONNX Runtime.
 if(SPG_WITH_DEPS)
   add_subdirectory(src/runtime)
+  # Detectors on top of the runtime and OpenCV.
+  add_subdirectory(src/detect)
 endif()
