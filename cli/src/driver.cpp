@@ -104,8 +104,8 @@ class Composer {
       return;
     }
     BgraImage image;
-    if (released.action == FallbackAction::HoldLastScanned && last_clean_ && last_clean_->first == released.reemit) {
-      image = last_clean_->second;
+    if (released.action == FallbackAction::HoldLastScanned && has_last_clean_ && last_clean_id_ == released.reemit) {
+      image = last_clean_;
     } else {
       image = source_.load(*index);
       const auto start = steady::now();
@@ -113,7 +113,9 @@ class Composer {
       times_.add(kStageCompose, elapsed_ms(start, steady::now()));
     }
     if (released.action == FallbackAction::None) {
-      last_clean_.emplace(released.id, image);
+      last_clean_id_ = released.id;
+      last_clean_ = image;
+      has_last_clean_ = true;
     }
     if (options_.on_composed) {
       options_.on_composed(*index, image);
@@ -124,7 +126,11 @@ class Composer {
   const FrameSource& source_;
   const DriverOptions& options_;
   StageTimes& times_;
-  std::optional<std::pair<FrameId, BgraImage>> last_clean_;
+  // Plain members rather than std::optional<std::pair<FrameId, BgraImage>>:
+  // GCC 13 reports a false -Wmaybe-uninitialized on that optional's emplace.
+  bool has_last_clean_ = false;
+  FrameId last_clean_id_{};
+  BgraImage last_clean_;
 };
 
 struct SimWorker {
