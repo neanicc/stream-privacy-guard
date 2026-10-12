@@ -12,12 +12,21 @@ string(JSON SPG_PLUGIN_BUNDLE_ID GET "${_spg_buildspec}" platformConfig macos bu
 set_property(DIRECTORY "${PROJECT_SOURCE_DIR}" APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${PROJECT_SOURCE_DIR}/buildspec.json")
 
+# Settings and watch-list storage without OBS (SPG-15), so they are
+# unit-tested on every OS, including Linux where plugin.loads does not run.
+add_library(obs-spg-settings STATIC
+  src/settings/filter_settings.cpp
+  src/settings/watchlist_store.cpp)
+target_include_directories(obs-spg-settings PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(obs-spg-settings PUBLIC spg::core)
+spg_target_defaults(obs-spg-settings)
+
 add_library(obs-spg MODULE
   src/plugin-main.cpp
   src/plugin-support.cpp
   src/spg-filter.cpp
   data/locale/en-US.ini)
-target_link_libraries(obs-spg PRIVATE OBS::libobs spg::core)
+target_link_libraries(obs-spg PRIVATE OBS::libobs obs-spg-settings)
 target_compile_definitions(obs-spg PRIVATE SPG_PLUGIN_VERSION="${PROJECT_VERSION}")
 spg_target_defaults(obs-spg)
 # OBS finds modules by file name: obs-spg.so / obs-spg.dll / obs-spg.plugin.
@@ -45,6 +54,16 @@ if(NOT SPG_BUILD_TESTS)
   return()
 endif()
 
+# Settings clamping, watch-list file format, permissions and secrecy.
+include(FetchContent)
+FetchContent_GetProperties(Catch2)
+list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
+include(Catch)
+add_executable(obs-spg-settings-tests tests/settings_test.cpp)
+target_link_libraries(obs-spg-settings-tests PRIVATE obs-spg-settings Catch2::Catch2WithMain)
+spg_target_defaults(obs-spg-settings-tests)
+catch_discover_tests(obs-spg-settings-tests TEST_PREFIX "plugin.settings." DISCOVERY_MODE PRE_TEST)
+
 # The module exports the entry points libobs looks up with dlsym/GetProcAddress.
 if(CMAKE_NM)
   add_test(NAME plugin.exports
@@ -58,11 +77,11 @@ endif()
 # others that the pinned inputs do not include, so Linux runs plugin.exports only.
 if(SPG_OBS_DEPS_DIR)
   add_executable(obs-spg-load-test tests/plugin_load_test.cpp)
-  target_include_directories(obs-spg-load-test PRIVATE src)
-  target_link_libraries(obs-spg-load-test PRIVATE OBS::libobs)
+  target_link_libraries(obs-spg-load-test PRIVATE OBS::libobs obs-spg-settings)
   spg_target_defaults(obs-spg-load-test)
   add_test(NAME plugin.loads
-    COMMAND obs-spg-load-test $<TARGET_FILE:obs-spg> "${CMAKE_CURRENT_SOURCE_DIR}/data")
+    COMMAND obs-spg-load-test $<TARGET_FILE:obs-spg> "${CMAKE_CURRENT_SOURCE_DIR}/data"
+            "${CMAKE_CURRENT_BINARY_DIR}/plugin-loads-config")
   if(APPLE)
     set_target_properties(obs-spg-load-test PROPERTIES
       BUILD_RPATH "${SPG_LIBOBS_PREFIX}/Frameworks;${SPG_OBS_DEPS_DIR}/lib")
