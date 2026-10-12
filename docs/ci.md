@@ -17,9 +17,12 @@ aggregate `check` job.
 Workflows are human-owned. Agents change what CI does by editing
 `scripts/ci/run.sh` (lane:build), which every stage calls. Since SPG-01 the
 build stages are real: `setup` runs `scripts/fetch_deps.py` against
-`deps/manifest.json`, `build` configures CMake (Ninja when installed, Visual
-Studio 2022 on Windows) and prints ccache statistics, and `test` runs `ctest`,
-which fails if no tests are registered.
+`deps/manifest.json`, `build` configures CMake (Ninja when installed, the newest
+Visual Studio with C++ tools on Windows) and prints ccache statistics, and
+`test` runs `ctest`, which fails if no tests are registered. One pin lives
+outside the manifest: Catch2 is fetched by CMake `FetchContent` at configure
+time, pinned by URL and SHA-256 in `tests/CMakeLists.txt`, so the first
+configure needs network access.
 
 Dependencies, models and the ccache cache (`~/.cache/spg/ccache`) are cached in
 `~/.cache/spg` keyed on the manifests and `CMakeLists.txt`.

@@ -46,6 +46,6 @@ add_test(NAME cli.rejects-no-arguments COMMAND spg-cli)
 set_tests_properties(cli.rejects-no-arguments PROPERTIES WILL_FAIL TRUE)
 
 # Dependency fetch script --------------------------------------------------------
-find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
+find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
 add_test(NAME scripts.fetch_deps
   COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_deps.py")

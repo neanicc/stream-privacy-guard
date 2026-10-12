@@ -18,14 +18,16 @@ repo measures how often.
 ## Quickstart (developers)
 
 Needs CMake 3.25+, a C++20 compiler (Xcode clang on macOS, GCC or Clang on
-Linux, Visual Studio 2022 on Windows), Python 3.11+ and `curl`. Supported hosts:
-Linux x64, macOS on Apple Silicon, Windows x64. From Git Bash on Windows:
+Linux, Visual Studio 2022 or newer on Windows), Python 3.12+ and `curl`.
+Supported hosts: Linux x64, macOS on Apple Silicon, Windows x64. From Git Bash
+on Windows:
 
 ```sh
 bash scripts/ci/run.sh setup   # fetch pinned ONNX Runtime, OpenCV and ccache, SHA-256 verified
 bash scripts/ci/run.sh build   # configure and build into build/ (Release, warnings as errors)
 bash scripts/ci/run.sh test    # run all tests with ctest
-build/cli/spg-cli --version
+build/cli/spg-cli --version                 # Linux and macOS
+build/cli/Release/spg-cli.exe --version     # Windows (Visual Studio puts binaries under Release/)
 ```
 
 `setup` downloads the archives listed in [deps/manifest.json](deps/manifest.json)
