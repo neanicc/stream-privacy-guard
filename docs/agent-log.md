@@ -504,6 +504,111 @@ Template:
   grouping, buckets without hulls, prediction shrinking over time) made at
   least one tracker test fail for each mutation.
 
+## 2026-10-12 — SPG-06 Text detector (#35)
+
+- Decision / change: `TextDetector` in `spg-detect` (`core/src/detect/`,
+  lane:vision) runs the pinned PP-OCRv3 English DBNet
+  (`en_PP-OCRv3_det_mobile.onnx`) through `spg::runtime::Session` on fixed
+  640x640 tiles of the readback frame. `tile_crops()` lays out a grid of
+  whole-pixel crops at most 640 on a side, first at the origin and last flush
+  with the far edge, neighbours overlapping by at least 64 readback px (fewest
+  tiles that keep it: 2 for 960x540, 8 for 1920x1080). Each crop is
+  letterboxed top-left at scale 1 (a frame smaller than a tile is scaled up
+  uniformly) with `render_model_input()`, so faces and text share one
+  preprocessing path; the tensor is BGR planar `(v / 255 - 0.5) / 0.5`
+  (RapidOCR DetPreProcess). Boxes go back through `spg::convert()` with that
+  tile's mapping only, are clipped to the source (`clip_to()`, moved out of
+  `face_detector.cpp` into `source_clip.cpp` so both detectors share it), and
+  boxes from different tiles that intersect and overlap vertically by at least
+  half the shorter one are united (one line cut by a tile edge becomes one
+  box). Output: Source-space `TextRegion` detections, detector `PpOcrDet`,
+  sorted top to bottom. DB post-processing (`db_postprocess.cpp`) follows
+  RapidOCR v3.9.2 `DBPostProcess` (binarize > 0.3, 2x2 dilation, RETR_LIST
+  contours, min-area rect, short side >= 3, "fast" mean score >= 0.5, unclip
+  by area * ratio / perimeter, grown short side >= 5), with SPG changes, all
+  toward covering more: axis-aligned output (bounding box of the grown rect
+  plus one pixel on the far edges); no 1000-candidate cap (RapidOCR silently
+  drops the rest); a non-finite probability anywhere or an output that is not
+  exactly `[1, 1, 640, 640]` throws `db::DecodeError` so the frame fails
+  closed; and `unclip_ratio` 2.0 instead of 1.6. Evidence for 2.0: on the
+  synthetic lines of the coverage test (100 line checks over five scenes, two
+  styles, CPU and default providers), 1.6 left a box edge inside the ink on 68
+  lines, by up to 11% of the ink height; 2.0 on 20 lines, by at most 2%. The
+  coverage tests therefore accept an edge up to 5% of the ink height inside
+  the ink; the mask margin (`margin_px` 4 + `margin_ratio` 0.25 of the box's
+  short side) is far larger. SPG-12 tunes thresholds, unclip, tile size and
+  overlap on the text suite.
+- CoreML (issue note 1): the model's input dims are named
+  (`DynamicDimension.0/1/2`), so ORT free-dimension overrides would make it
+  static. A probe with Python onnxruntime 1.23.1 (not the pinned 1.30.0 C++
+  build) on the dev Mac: with overrides CoreML took 144 of 172 nodes in 23
+  partitions and a 640x640 tile took about the same time as without them
+  (roughly 40 ms either way, CPU alone about 38 ms). No gain, so no override
+  plumbing was added to `SessionOptions`; the fixed tile size keeps the option
+  open. This is a probe, not a `bench` result; `spg-cli bench` measures it.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang): `scripts/ci/run.sh
+  build` and `test` pass, 111/111 ctest tests, 26 new `detect.*` text cases.
+  Unit cases (no model): DB decode on synthetic probability maps (exact grown
+  box for ratio 1.6 and 2.0, separate lines, binarize/box thresholds including
+  the inclusive edge, specks, a 30-degree band, 1280 candidates all kept, NaN
+  and +-inf anywhere and wrong sizes fail closed, param validation), the tile
+  layout (1000 seeded random frames: coverage, flush edges, overlap, fewest
+  tiles), tile-to-Source mapping with padding drop and clipping, upscaled
+  small frames, merging (same line across tiles, same-tile and different
+  lines kept apart, transitive chains, order), tensor layout, config. Model
+  cases (skip when the model is not cached): no box on 12 text-free frames
+  (black, gray, gradient, UI-like panels; BGRA/NV12/I420); every drawn line
+  covered by one box with no box off the text in five scenes (1080p, 720p,
+  641x479, portrait, 1440p; readback scales 1 and 1/2) x two styles x CPU and
+  default providers (CoreML here); lines with readback cap height 6 to 12 px;
+  a line crossing two tile edges merged into one box; four threads agree.
+  Fixtures are made-up strings drawn at test time with OpenCV Hershey fonts
+  (`tests/integration/synthetic_text.hpp`); no image is committed. A probe on
+  960x540 found every line from cap height 5 readback px up and only some at
+  4. Mutation checks: mapping boxes without the tile offset failed 2 model
+  cases (89 assertions); skipping the cross-tile merge failed the tile-edge
+  case.
+- Eval delta: none. The detector is not wired into a pipeline yet (SPG-10/11),
+  and the eval stage was not run here.
+- Open issues or follow-ups: Hershey strokes are not real UI fonts; SPG-12
+  must measure recall on the text suite before any recall claim. Small text:
+  at a 1/2 readback scale, Source text under about 10 px cap height falls
+  below the probed floor; SPG-12/SPG-14 decide readback scale or an upscaled
+  tile pass. Per-frame cost is one model run per tile (2 to 8 for common
+  sizes) plus a `Session::run` allocation each; `spg-cli bench` measures it.
+  Recognition (SPG-07) consumes these boxes; rotated text gets an
+  axis-aligned box, so SPG-07 may want the rotated rect later.
+- Review fixes (Greptile, staff review), after merging SPG-03 from `main`:
+  cross-tile merging compared grown boxes, so two adjacent lines seen by two
+  tiles (60x12 kernels 4 px apart grow to 33 px boxes overlapping by 17) were
+  joined into one box, which would hand SPG-07 two lines as one.
+  `db::Candidate` now carries `line`, the fitted rectangle before growth, and
+  `merge_across_tiles()` requires the grown boxes to intersect and the
+  kernels to overlap vertically by `merge_line_overlap`; coverage is
+  unchanged (boxes are still the grown ones). Merging sweeps boxes sorted by
+  top edge and only compares those that overlap vertically, so the uncapped
+  candidate list no longer costs every pair; a seeded test checks it against
+  the all-pairs result on 20 frames of 600 boxes. `tile_overlap` is capped
+  at `tile_size / 2` (639 of 640 meant 564,921 model runs for one 1080p
+  frame). New fixture models built at test time (`text_wrong_shape.onnx`,
+  as many values as the right shape but `[1, 4, 320, 320]`;
+  `text_sqrt.onnx`, NaN on dark pixels) drive `detect()` itself: the wrong
+  shape fails the frame, and a NaN in the second tile fails it even though
+  the first decoded. The thread test now shares the default-provider session
+  too. Mutation checks: comparing grown boxes again failed 3 merge cases;
+  cutting the sweep short failed the all-pairs test; dropping the runtime
+  shape check failed the wrong-shape case. `TextDetectorConfig` documents
+  the large-text recall limit (staff review): text taller than the overlap
+  can be cut by a horizontal tile edge, and SPG-12 must add a large-glyph
+  case. Evidence (dev Mac): `run.sh build` and `test` pass, 137/137, no
+  skips. Not changed: per-frame cost (one model run per tile, 8 at 1080p,
+  28 at 2160p) stays for SPG-10/12 to measure with `spg-cli bench`;
+  `detect()` now documents that it has no deadline or cancel check, so the
+  scheduler must fail a frame closed when the call misses the lookahead
+  deadline. The Check logs for 1ee7ab8 show `ppocr-det-en` cached on all
+  three runners before the test stage and no skipped `detect.*` case, so
+  the model-backed cases run in CI.
+
 ## 2026-10-12 — SPG-15 Settings and watch-list storage (#37)
 
 - Decision / change: plan question 4 resolved with the recommended default.
