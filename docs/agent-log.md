@@ -309,9 +309,20 @@ Template:
 - Eval delta: none. The detector is not wired into a pipeline yet (SPG-10/11),
   and the eval stage was not run here (the eval driver has not landed).
 - Open issues or follow-ups: `Session::run` allocation per call is not
-  measured; leave it to `spg-cli bench` (SPG-11/16). Small faces: a 1080p frame
-  is scaled by 1/3, so faces under about 30 Source px may be missed; if the
-  faces suite shows it, SPG-12 can add tiling or a larger input. The text
+  measured; leave it to `spg-cli bench` (SPG-11/16). Small faces (recall gap,
+  staff review P2): a 1080p frame is scaled by 1/3, so faces under about 30
+  Source px may be missed, and a missed face airs. SPG-12 must treat tiling or
+  a larger input as a recall item, not an option, and the 0.6 score threshold
+  is untuned until then. No recall claim is made for small or distant faces
+  before SPG-12 measures them on the faces suite. The text
   detector (SPG-06) can reuse `render_model_input()` for its tiles.
   `docs/contracts.md` describes `FrameView` as Source space; detectors also
   use it for the readback copy, so lane:policy may want to say so there.
+- Review fixes (Greptile): `decode` also throws `DecodeError` when a kept
+  candidate's raw box values are not finite or its decoded width or height is
+  not positive (a -inf or underflowing log size used to decode to an empty box
+  that clipping dropped silently). `stride_outputs()` checks every run's
+  output shapes are exactly `[1, cells, 1|4]`, since the model may declare
+  dynamic output dimensions and a same-count transposed tensor would otherwise
+  be read as boxes. The test `OwnedFrame` is move-only so its view cannot
+  point into another frame's buffers.

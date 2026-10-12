@@ -52,8 +52,9 @@ struct Candidate {
 //   center = ((col, row) + (dx, dy)) * stride, size = exp(log w, log h) * stride.
 // `outputs` holds strides 8, 16 and 32 in that order. Throws DecodeError when
 // an output size does not match `input`, when a score is not finite, or when a
-// kept candidate's box is not finite (a model that emits NaN or overflows must
-// fail the frame closed, not drop a face).
+// kept candidate's raw box values or decoded box are not finite or its decoded
+// width or height is not positive (a model that emits NaN, infinity, or a size
+// that overflows or underflows must fail the frame closed, not drop a face).
 [[nodiscard]] std::vector<Candidate> decode(std::span<const StrideOutputs, kStrides.size()> outputs, Size input,
                                             float score_threshold);
 

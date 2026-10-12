@@ -8,9 +8,14 @@
 // The whole readback frame is letterboxed (uniform scale, content at the top
 // left, black padding right and bottom) into the model's fixed input, as
 // OpenCV's FaceDetectorYN pads. Every coordinate conversion goes through
-// spg::convert() with the mapping that produced the input. No OBS, no globals,
-// no logging; nothing here touches the network or the disk except opening the
-// model file.
+// spg::convert() with the mapping that produced the input.
+//
+// Known recall gap: one fixed input for the whole frame scales a 1080p source
+// by 1/3, so faces under about 30 Source px may be missed. SPG-12 owns tiling
+// or a larger input; make no recall claim for small faces until then.
+//
+// No OBS, no globals, no logging; nothing here touches the network or the disk
+// except opening the model file.
 
 #include <array>
 #include <cstddef>
@@ -61,6 +66,18 @@ class FaceDetectorError : public std::runtime_error {
 [[nodiscard]] std::vector<Detection> to_source_detections(std::span<const yunet::Candidate> candidates,
                                                           const SpaceMap& map);
 
+// Where each stride's cls, obj and bbox tensors sit in a session's outputs.
+using OutputIndex = std::array<std::array<std::size_t, 3>, yunet::kStrides.size()>;
+
+// Views of one run's outputs in decode() order (strides 8, 16, 32). Throws
+// yunet::DecodeError unless every tensor `index` names exists and has exactly
+// the shape YuNet produces for `input`: [1, cells, 1] for cls and obj and
+// [1, cells, 4] for bbox. The model may declare dynamic output dimensions, so
+// this is what stops a tensor with the right value count in another layout
+// (say [1, 4, cells]) from being read as boxes. The views borrow `outputs`.
+[[nodiscard]] std::array<yunet::StrideOutputs, yunet::kStrides.size()> stride_outputs(
+    std::span<const runtime::Tensor> outputs, const OutputIndex& index, Size input);
+
 class FaceDetector {
  public:
   // Opens `model` with `options` (default providers, CPU fallback, one warmup
@@ -85,7 +102,7 @@ class FaceDetector {
   // Throws on any failure so the caller can fail the frame closed:
   // ContractError for an invalid frame or zero-size source,
   // runtime::RuntimeError when inference fails, yunet::DecodeError when the
-  // outputs are malformed or not finite.
+  // outputs have the wrong shape or size or are not finite.
   [[nodiscard]] std::vector<Detection> detect(const FrameView& frame, Size source) const;
 
   [[nodiscard]] Size input_size() const noexcept { return input_; }
@@ -96,8 +113,7 @@ class FaceDetector {
   runtime::Session session_;
   FaceDetectorConfig config_;
   Size input_;
-  // Index into session outputs of cls, obj, bbox for each stride.
-  std::array<std::array<std::size_t, 3>, yunet::kStrides.size()> output_index_{};
+  OutputIndex output_index_{};
 };
 
 }  // namespace spg::detect

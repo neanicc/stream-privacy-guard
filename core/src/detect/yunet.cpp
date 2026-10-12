@@ -37,6 +37,11 @@ std::vector<Candidate> decode(std::span<const StrideOutputs, kStrides.size()> ou
         continue;
       }
       const std::span<const float> b = out.bbox.subspan(4 * idx, 4);
+      // A raw -inf log size would decode to a zero size, which is_valid()
+      // accepts, so check the raw values as well as the decoded box.
+      if (!std::all_of(b.begin(), b.end(), [](float v) { return std::isfinite(v); })) {
+        throw DecodeError("yunet: non-finite box at stride " + std::to_string(stride));
+      }
       const double cx = (static_cast<double>(idx % cols) + static_cast<double>(b[0])) * step;
       const double cy = (static_cast<double>(idx / cols) + static_cast<double>(b[1])) * step;
       const double w = std::exp(static_cast<double>(b[2])) * step;
@@ -45,6 +50,11 @@ std::vector<Candidate> decode(std::span<const StrideOutputs, kStrides.size()> ou
                       static_cast<float>(h)};
       if (!is_valid(rect)) {
         throw DecodeError("yunet: non-finite box at stride " + std::to_string(stride));
+      }
+      // A kept candidate whose size underflowed to zero would be dropped later
+      // as an empty box; fail the frame closed instead of losing the face.
+      if (!(rect.width > 0.0F) || !(rect.height > 0.0F)) {
+        throw DecodeError("yunet: empty box at stride " + std::to_string(stride));
       }
       candidates.push_back({{rect, Space::ModelInput}, score});
     }

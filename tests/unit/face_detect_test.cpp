@@ -5,6 +5,9 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -160,6 +163,26 @@ TEST_CASE("YuNet decode fails closed on malformed outputs", "[face][decode]") {
     outputs.set(0, 2, 2, 1.0F, 1.0F, {kNaN, 0.0F, 0.0F, 0.0F});
     CHECK_THROWS_AS(outputs.decode(0.6F), DecodeError);
   }
+  SECTION("a kept candidate with an infinite offset") {
+    FakeOutputs outputs({64, 64});
+    outputs.set(0, 2, 2, 1.0F, 1.0F, {0.0F, -kInf, 0.0F, 0.0F});
+    CHECK_THROWS_AS(outputs.decode(0.6F), DecodeError);
+  }
+  SECTION("a kept candidate with a -inf log size (exp gives zero)") {
+    FakeOutputs outputs({64, 64});
+    outputs.set(0, 2, 2, 1.0F, 1.0F, {0.0F, 0.0F, -kInf, 0.0F});
+    CHECK_THROWS_AS(outputs.decode(0.6F), DecodeError);
+    outputs.set(0, 2, 2, 1.0F, 1.0F, {0.0F, 0.0F, 0.0F, -kInf});
+    CHECK_THROWS_AS(outputs.decode(0.6F), DecodeError);
+  }
+  SECTION("a kept candidate whose size underflows to zero") {
+    FakeOutputs outputs({64, 64});
+    outputs.set(0, 2, 2, 1.0F, 1.0F, {0.0F, 0.0F, -1000.0F, 0.0F});
+    CHECK_THROWS_AS(outputs.decode(0.6F), DecodeError);
+    // exp(-110) * 8 is about 1e-47: positive in double, zero as a float.
+    outputs.set(0, 2, 2, 1.0F, 1.0F, {0.0F, 0.0F, 0.0F, -110.0F});
+    CHECK_THROWS_AS(outputs.decode(0.6F), DecodeError);
+  }
   SECTION("an output of the wrong size") {
     FakeOutputs outputs({64, 64});
     outputs.bbox[1].pop_back();
@@ -173,10 +196,85 @@ TEST_CASE("YuNet decode fails closed on malformed outputs", "[face][decode]") {
   }
 }
 
+TEST_CASE("YuNet decode keeps a tiny but positive box", "[face][decode]") {
+  FakeOutputs outputs({64, 64});
+  outputs.set(0, 2, 2, 1.0F, 1.0F, {0.0F, 0.0F, -10.0F, -10.0F});
+  const auto found = outputs.decode(0.6F);
+  REQUIRE(found.size() == 1);
+  CHECK(found[0].box.rect.width > 0.0F);
+  CHECK(found[0].box.rect.height > 0.0F);
+}
+
 TEST_CASE("YuNet decode ignores a garbage box below the threshold", "[face][decode]") {
   FakeOutputs outputs({64, 64});
   outputs.set(0, 2, 2, 0.1F, 0.1F, {kNaN, kInf, 1000.0F, kNaN});
   CHECK(outputs.decode(0.6F).empty());
+}
+
+// Session outputs to decode() input -------------------------------------------
+
+namespace {
+
+// Session outputs for a 64x64 input in YuNet's layout, cls/obj/bbox per stride
+// in that order, so output (3 * s + k) is kind k of stride s.
+std::vector<spg::runtime::Tensor> yunet_tensors() {
+  std::vector<spg::runtime::Tensor> tensors;
+  for (const int stride : spg::detect::yunet::kStrides) {
+    const std::int64_t cells = (64 / stride) * (64 / stride);
+    for (const std::int64_t width : {1, 1, 4}) {
+      tensors.push_back({{1, cells, width}, std::vector<float>(static_cast<std::size_t>(cells * width), 0.0F)});
+    }
+  }
+  return tensors;
+}
+
+spg::detect::OutputIndex in_order() {
+  spg::detect::OutputIndex index{};
+  for (std::size_t s = 0; s < index.size(); ++s) {
+    for (std::size_t k = 0; k < 3; ++k) {
+      index[s][k] = 3 * s + k;
+    }
+  }
+  return index;
+}
+
+}  // namespace
+
+TEST_CASE("Session outputs in YuNet's layout become decode() input", "[face][outputs]") {
+  auto tensors = yunet_tensors();
+  tensors[3 * 1 + 2].data[4 * 5 + 2] = 0.5F;  // stride 16, bbox of cell 5, log w
+  const auto strides = spg::detect::stride_outputs(tensors, in_order(), {64, 64});
+  CHECK(strides[0].cls.size() == 64);
+  CHECK(strides[1].bbox.size() == 4 * 16);
+  CHECK(strides[1].bbox[4 * 5 + 2] == 0.5F);
+  CHECK(strides[2].obj.size() == 4);
+  CHECK(spg::detect::yunet::decode(strides, {64, 64}, 0.6F).empty());
+}
+
+TEST_CASE("Session outputs with the right count but the wrong shape fail closed", "[face][outputs]") {
+  auto tensors = yunet_tensors();
+  SECTION("bbox transposed to [1, 4, cells]") {
+    tensors[3 * 0 + 2].shape = {1, 4, 64};
+  }
+  SECTION("bbox flattened to [1, 4 * cells, 1]") {
+    tensors[3 * 2 + 2].shape = {1, 16, 1};
+  }
+  SECTION("cls as [cells, 1, 1]") {
+    tensors[3 * 1 + 0].shape = {16, 1, 1};
+  }
+  SECTION("obj without its batch dimension") {
+    tensors[3 * 1 + 1].shape = {16, 1};
+  }
+  SECTION("bbox with an extra dimension") {
+    tensors[3 * 2 + 2].shape = {1, 4, 4, 1};
+  }
+  CHECK_THROWS_AS(spg::detect::stride_outputs(tensors, in_order(), {64, 64}), DecodeError);
+}
+
+TEST_CASE("Session outputs missing a tensor fail closed", "[face][outputs]") {
+  auto tensors = yunet_tensors();
+  tensors.pop_back();
+  CHECK_THROWS_AS(spg::detect::stride_outputs(tensors, in_order(), {64, 64}), DecodeError);
 }
 
 // Non-maximum suppression -----------------------------------------------------
@@ -378,10 +476,24 @@ TEST_CASE("Rendering rejects invalid frames and crops", "[face][render]") {
 
   spg::FrameView missing = frame.view;
   missing.planes[0] = nullptr;
-  CHECK_THROWS_AS(render(spg::test::OwnedFrame{{}, missing}), ContractError);
+  CHECK_THROWS_AS(render(spg::test::OwnedFrame{missing}), ContractError);
   spg::FrameView short_stride = frame.view;
   short_stride.strides[0] = 4 * 64 - 1;
-  CHECK_THROWS_AS(render(spg::test::OwnedFrame{{}, short_stride}), ContractError);
+  CHECK_THROWS_AS(render(spg::test::OwnedFrame{short_stride}), ContractError);
+}
+
+TEST_CASE("A synthetic frame moves with its planes and cannot be copied", "[face][render]") {
+  static_assert(!std::is_copy_constructible_v<spg::test::OwnedFrame>);
+  static_assert(!std::is_copy_assignable_v<spg::test::OwnedFrame>);
+  static_assert(std::is_nothrow_move_constructible_v<spg::test::OwnedFrame>);
+  const auto format = GENERATE(spg::PixelFormat::BGRA, spg::PixelFormat::NV12, spg::PixelFormat::I420);
+  CAPTURE(spg::to_string(format));
+  const spg::test::Bgr color{40, 120, 200};
+  std::optional<spg::test::OwnedFrame> original(spg::test::to_frame(spg::test::Canvas(64, 48, color), format));
+  const spg::test::OwnedFrame moved = std::move(*original);
+  original.reset();  // the moved-to view must not point into the original
+  const int tolerance = format == spg::PixelFormat::BGRA ? 0 : 3;
+  check_color(pixel(render(moved), 5, 5), color, tolerance);
 }
 
 TEST_CASE("The input tensor is planar B, G, R with raw byte values", "[face][tensor]") {

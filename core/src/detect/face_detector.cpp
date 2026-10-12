@@ -122,6 +122,32 @@ std::vector<Detection> to_source_detections(std::span<const yunet::Candidate> ca
   return detections;
 }
 
+std::array<yunet::StrideOutputs, yunet::kStrides.size()> stride_outputs(std::span<const runtime::Tensor> outputs,
+                                                                        const OutputIndex& index, Size input) {
+  std::array<yunet::StrideOutputs, yunet::kStrides.size()> strides;
+  for (std::size_t s = 0; s < yunet::kStrides.size(); ++s) {
+    const auto stride = static_cast<std::uint32_t>(yunet::kStrides[s]);
+    const std::int64_t cells =
+        static_cast<std::int64_t>(input.width / stride) * static_cast<std::int64_t>(input.height / stride);
+    std::array<std::span<const float>, kOutputKinds.size()> data;
+    for (std::size_t k = 0; k < kOutputKinds.size(); ++k) {
+      const std::string name = std::string(kOutputKinds[k]) + "_" + std::to_string(stride);
+      if (index[s][k] >= outputs.size()) {
+        throw yunet::DecodeError("yunet: output '" + name + "' is missing from the run");
+      }
+      const runtime::Tensor& tensor = outputs[index[s][k]];
+      const std::array<std::int64_t, 3> want{1, cells, kOutputWidth[k]};
+      if (!std::equal(tensor.shape.begin(), tensor.shape.end(), want.begin(), want.end())) {
+        throw yunet::DecodeError("yunet: output '" + name + "' has shape " + shape_text(tensor.shape) +
+                                 ", expected " + shape_text(want));
+      }
+      data[k] = tensor.data;
+    }
+    strides[s] = {data[0], data[1], data[2]};
+  }
+  return strides;
+}
+
 FaceDetector FaceDetector::open(runtime::Environment& env, const std::filesystem::path& model,
                                 const FaceDetectorConfig& config, const runtime::SessionOptions& options) {
   check_config(config);  // before paying for a session
@@ -144,7 +170,8 @@ FaceDetector::FaceDetector(runtime::Session session, const FaceDetectorConfig& c
       if (found == outputs.end()) {
         throw FaceDetectorError("face detector: model has no output '" + name + "'; is it YuNet?");
       }
-      // Dynamic (-1) dimensions are allowed here; decode() checks real sizes.
+      // Dynamic (-1) dimensions are allowed here; stride_outputs() checks the
+      // real shapes on every run.
       const auto& shape = found->shape;
       const auto matches = [](std::int64_t dim, std::int64_t want) { return dim < 0 || dim == want; };
       if (!found->float32 || shape.size() != 3 || !matches(shape[0], 1) || !matches(shape[1], cells) ||
@@ -167,11 +194,7 @@ std::vector<Detection> FaceDetector::detect(const FrameView& frame, Size source)
   const std::array<runtime::TensorView, 1> inputs{{{tensor, shape}}};
   const std::vector<runtime::Tensor> outputs = session_.run(inputs);
 
-  std::array<yunet::StrideOutputs, yunet::kStrides.size()> strides;
-  for (std::size_t s = 0; s < strides.size(); ++s) {
-    strides[s] = {outputs.at(output_index_[s][0]).data, outputs.at(output_index_[s][1]).data,
-                  outputs.at(output_index_[s][2]).data};
-  }
+  const auto strides = stride_outputs(outputs, output_index_, input_);
   std::vector<yunet::Candidate> candidates = yunet::decode(strides, input_, config_.score_threshold);
   candidates = yunet::suppress(std::move(candidates), config_.nms_iou_threshold, config_.top_k);
   return to_source_detections(candidates, map);

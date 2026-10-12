@@ -82,8 +82,23 @@ class Canvas {
 
 // Owns the planes a FrameView points into. Rows carry `kPad` extra bytes
 // filled with 0xFF, so a reader that ignores the stride sees white garbage.
+//
+// Move-only: view.planes points into `planes`, so a copy would read the
+// original's buffers and dangle once it is gone. Moving a vector keeps its
+// buffer, so a moved-to frame's view stays valid.
 struct OwnedFrame {
   static constexpr std::uint32_t kPad = 13;
+
+  OwnedFrame() = default;
+  // Owns no planes; `unowned` points wherever the caller says (for tests of
+  // invalid views).
+  explicit OwnedFrame(const FrameView& unowned) : view(unowned) {}
+  OwnedFrame(const OwnedFrame&) = delete;
+  OwnedFrame& operator=(const OwnedFrame&) = delete;
+  OwnedFrame(OwnedFrame&&) noexcept = default;
+  OwnedFrame& operator=(OwnedFrame&&) noexcept = default;
+  ~OwnedFrame() = default;
+
   std::vector<std::vector<std::uint8_t>> planes;
   FrameView view;
 };
