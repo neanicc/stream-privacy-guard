@@ -123,7 +123,7 @@ std::vector<TextHit> recognize_tracks(const TextRecognizer& recognizer, Recognit
   std::vector<Recognition> read = recognizer.recognize(frame, source, to_read);  // throws before any store
   for (std::size_t k = 0; k < missing.size(); ++k) {
     const std::size_t i = missing[k];
-    cache.store(regions[i].track, prints[i], read[k], now);
+    cache.store(regions[i].track, std::move(prints[i]), read[k], now);
     found[i] = std::move(read[k]);
   }
   std::vector<TextHit> hits(regions.size());

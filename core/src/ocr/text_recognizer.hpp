@@ -94,8 +94,11 @@ void validate(const TextRecognizerConfig& config);
 // What the recognizer read in one region.
 struct Recognition {
   // The texts of the region's views (whole region, each line, rotations),
-  // joined by '\n', and the chunks of one view by ' '. Empty when nothing was
-  // read. Never filtered by score.
+  // joined by '\n', and the chunks of one view by ' ' in reading order. Chunks
+  // overlap (see TextRecognizerConfig::max_width), so text in an overlap is
+  // read twice and text at a seam may be cut there; nothing is de-duplicated.
+  // Text no wider than the overlap is always whole in some chunk. Empty when
+  // nothing was read. Never filtered by score.
   Secret text;
   // Mean probability of every decoded character, in [0, 1]; 0 when empty.
   float score = 0.0F;
@@ -116,7 +119,9 @@ class TextRecognizer {
   // one float32 input (shape undeclared, or [N, 3, H, W] with dynamic or
   // fitting dimensions: N dynamic or 1 with max_batch 1, H == input_height,
   // W dynamic), one float32 output (undeclared, or [N, T, C] with C dynamic or
-  // equal to the alphabet size) and a 'character' metadata dictionary.
+  // equal to the alphabet size) and a 'character' metadata dictionary. The
+  // output must be per-step probabilities (the graph ends in softmax): raw
+  // logits make every recognize() call throw DecodeError, failing closed.
   explicit TextRecognizer(runtime::Session session, const TextRecognizerConfig& config = {});
 
   // Reads each region of `frame`, which holds Readback pixels: the whole
