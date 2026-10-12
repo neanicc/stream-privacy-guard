@@ -15,8 +15,14 @@ namespace spg {
 
 namespace {
 
-constexpr std::size_t kChannels = 3;  // B, G, R; alpha is left alone
+// Blur and pixelate mix all four channels, alpha included: a source with
+// transparency (black text on a transparent background) shows its content in
+// the alpha channel alone, so leaving alpha intact would leave that text
+// readable over whatever is behind the source. Solid fill is opaque.
+constexpr std::size_t kChannels = 4;  // B, G, R, A
 constexpr std::size_t kBytesPerPixel = 4;
+constexpr std::size_t kAlpha = 3;
+constexpr std::uint8_t kOpaque = 255;
 
 std::uint32_t scaled_size(std::uint32_t minimum, float ratio, std::uint32_t side) {
   const double scaled = std::ceil(static_cast<double>(ratio) * static_cast<double>(side));
@@ -74,9 +80,10 @@ void fill(BgraImage& image, const PixelRect& r, const CompositorConfig& config) 
   for (auto y = static_cast<std::size_t>(r.y); y < static_cast<std::size_t>(r.y + r.height); ++y) {
     for (auto x = static_cast<std::size_t>(r.x); x < static_cast<std::size_t>(r.x + r.width); ++x) {
       std::uint8_t* p = pixel_at(image, x, y);
-      for (std::size_t c = 0; c < kChannels; ++c) {
+      for (std::size_t c = 0; c < config.fill_bgr.size(); ++c) {
         p[c] = config.fill_bgr[c];
       }
+      p[kAlpha] = kOpaque;
     }
   }
 }
@@ -123,7 +130,7 @@ void pixelate(BgraImage& image, const PixelRect& r, const CompositorConfig& conf
     const std::size_t ey = std::min(by + block, y0 + h);
     for (std::size_t bx = x0; bx < x0 + w; bx += block) {
       const std::size_t ex = std::min(bx + block, x0 + w);
-      std::uint64_t sums[kChannels] = {0, 0, 0};
+      std::uint64_t sums[kChannels] = {};
       for (std::size_t y = by; y < ey; ++y) {
         for (std::size_t x = bx; x < ex; ++x) {
           const std::uint8_t* p = pixel_at(image, x, y);
@@ -181,6 +188,15 @@ int strength(MaskStyle style) noexcept {
 
 double area_of(const Rect& r) noexcept {
   return static_cast<double>(r.width) * static_cast<double>(r.height);
+}
+
+// Area covered by both rects (0 when they do not overlap).
+double overlap_area(const Rect& a, const Rect& b) noexcept {
+  const double w = std::min(static_cast<double>(a.x) + a.width, static_cast<double>(b.x) + b.width) -
+                   std::max(static_cast<double>(a.x), static_cast<double>(b.x));
+  const double h = std::min(static_cast<double>(a.y) + a.height, static_cast<double>(b.y) + b.height) -
+                   std::max(static_cast<double>(a.y), static_cast<double>(b.y));
+  return w > 0.0 && h > 0.0 ? w * h : 0.0;
 }
 
 void check_source(const MaskRect& rect) {
@@ -270,14 +286,17 @@ std::vector<MaskRect> fit_mask_rects(std::span<const MaskRect> rects, std::size_
   std::vector<MaskRect> out(rects.begin(), rects.end());
   drop_contained(out);
   while (out.size() > capacity) {
-    // The pair whose hull adds the least area beyond the two rects.
+    // The pair whose hull adds the least area beyond what the two rects
+    // already cover together (their union, not the sum of their areas).
     std::size_t best_i = 0;
     std::size_t best_j = 1;
     double best_cost = std::numeric_limits<double>::infinity();
     for (std::size_t i = 0; i < out.size(); ++i) {
       for (std::size_t j = i + 1; j < out.size(); ++j) {
         const Rect h = mask::hull(out[i].box.rect, out[j].box.rect);
-        const double cost = area_of(h) - area_of(out[i].box.rect) - area_of(out[j].box.rect);
+        const Rect& a = out[i].box.rect;
+        const Rect& b = out[j].box.rect;
+        const double cost = area_of(h) - (area_of(a) + area_of(b) - overlap_area(a, b));
         if (cost < best_cost) {
           best_cost = cost;
           best_i = i;

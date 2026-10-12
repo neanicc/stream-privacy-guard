@@ -56,7 +56,9 @@ struct CompositorConfig {
   // shorter side), aligned to the rect's top-left corner, each set to its mean.
   std::uint32_t min_pixel_block = 8;
   float pixel_block_ratio = 0.25F;
-  // Solid fill colour, B, G, R. Alpha is never changed.
+  // Solid fill colour, B, G, R; a filled pixel is always opaque (alpha 255).
+  // Blur and pixelate mix alpha like the colour channels, so a transparent
+  // source's alpha shape does not survive a mask either.
   std::array<std::uint8_t, 3> fill_bgr{0, 0, 0};
 };
 
@@ -67,8 +69,9 @@ void validate(const CompositorConfig& config);
 // At most `capacity` rects that together cover every input rect: each input
 // rect lies inside some output rect, so fitting only adds blur. Rects inside
 // another are dropped; while too many remain, the pair whose hull adds the
-// least area is replaced by that hull, rounded outward to whole pixels and
-// drawn with the stronger style (SolidFill over Pixelate over Blur). Returns
+// least area beyond their union is replaced by that hull, rounded outward to
+// whole pixels and drawn with the stronger style (SolidFill over Pixelate
+// over Blur). Returns
 // the input order otherwise. Throws ContractError for a zero capacity or a
 // rect that is invalid or not in Source space.
 [[nodiscard]] std::vector<MaskRect> fit_mask_rects(std::span<const MaskRect> rects,
@@ -79,7 +82,7 @@ void validate(const CompositorConfig& config);
 //     outward to whole pixels and clipped to the image, with its style, in
 //     order (overlaps are processed again, which only hides more);
 //   BlurSource: the whole image blurred;
-//   SolidFill: the whole image filled;
+//   SolidFill: the whole image filled, opaque;
 //   HoldLastScanned: the caller shows the re-emitted frame instead; drawing
 //     it here blurs the whole image, as does a plan with fallback set but
 //     action None. The compositor never shows a frame that failed closed.

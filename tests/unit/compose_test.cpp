@@ -54,21 +54,34 @@ bool same_pixel(const BgraImage& a, const BgraImage& b, std::uint32_t x, std::ui
 }
 
 // Largest difference between horizontally or vertically adjacent pixels of
-// channel 0 inside [x0, x1) x [y0, y1): 255 on the checkerboard.
+// `channel` inside [x0, x1) x [y0, y1): 255 on the checkerboard.
 int max_neighbour_step(const BgraImage& image, std::uint32_t x0, std::uint32_t y0, std::uint32_t x1,
-                       std::uint32_t y1) {
+                       std::uint32_t y1, std::size_t channel = 0) {
   int step = 0;
   for (std::uint32_t y = y0; y < y1; ++y) {
     for (std::uint32_t x = x0; x < x1; ++x) {
       if (x + 1 < x1) {
-        step = std::max(step, std::abs(px(image, x, y)[0] - px(image, x + 1, y)[0]));
+        step = std::max(step, std::abs(px(image, x, y)[channel] - px(image, x + 1, y)[channel]));
       }
       if (y + 1 < y1) {
-        step = std::max(step, std::abs(px(image, x, y)[0] - px(image, x, y + 1)[0]));
+        step = std::max(step, std::abs(px(image, x, y)[channel] - px(image, x, y + 1)[channel]));
       }
     }
   }
   return step;
+}
+
+// Black everywhere, with the detail in alpha only: a 1-pixel checkerboard of
+// opaque and transparent cells, as black text on a transparent background
+// looks to the compositor.
+BgraImage alpha_checkerboard(std::uint32_t w, std::uint32_t h) {
+  BgraImage image{w, h, std::vector<std::uint8_t>(static_cast<std::size_t>(w) * h * 4, 0)};
+  for (std::uint32_t y = 0; y < h; ++y) {
+    for (std::uint32_t x = 0; x < w; ++x) {
+      image.pixels[(static_cast<std::size_t>(y) * w + x) * 4 + 3] = ((x + y) % 2 == 0) ? 255 : 0;
+    }
+  }
+  return image;
 }
 
 bool covered_by(const spg::Rect& inner, const std::vector<MaskRect>& outs) {
@@ -152,7 +165,7 @@ TEST_CASE("compose blurs inside each rect and nowhere else", "[compose]") {
       if (!in_a && !in_b) {
         REQUIRE(same_pixel(image, before, x, y));
       }
-      // Alpha is never touched.
+      // A uniform alpha blurs to itself.
       REQUIRE(px(image, x, y)[3] == 200);
     }
   }
@@ -193,7 +206,8 @@ TEST_CASE("compose fills solid rects with the configured colour", "[compose]") {
       CHECK(px(image, x, y)[0] == 1);
       CHECK(px(image, x, y)[1] == 2);
       CHECK(px(image, x, y)[2] == 3);
-      CHECK(px(image, x, y)[3] == 200);
+      // Filled pixels are opaque.
+      CHECK(px(image, x, y)[3] == 255);
     }
   }
 }
@@ -275,11 +289,73 @@ TEST_CASE("compose fills rects too thin to blur or pixelate", "[compose]") {
           REQUIRE(px(image, x, y)[0] == 1);
           REQUIRE(px(image, x, y)[1] == 2);
           REQUIRE(px(image, x, y)[2] == 3);
+          REQUIRE(px(image, x, y)[3] == 255);
         } else {
           REQUIRE(same_pixel(image, before, x, y));
         }
-        REQUIRE(px(image, x, y)[3] == 200);
       }
     }
   }
+}
+
+TEST_CASE("compose hides detail carried in the alpha channel", "[compose]") {
+  // Black text on a transparent background is readable over a light scene
+  // through its alpha alone; every mask and fallback must hide that shape.
+  const BgraImage before = alpha_checkerboard(64, 48);
+  SECTION("blur") {
+    BgraImage image = before;
+    MaskPlan plan;
+    plan.rects = {rect(8, 8, 40, 24)};
+    spg::compose(image, plan, FallbackAction::None);
+    CHECK(max_neighbour_step(image, 8, 8, 48, 32, 3) <= 8);
+    CHECK(std::abs(px(image, 20, 20)[3] - 127) <= 8);
+    // Outside the rect alpha is as it was.
+    CHECK(same_pixel(image, before, 0, 0));
+    CHECK(same_pixel(image, before, 63, 47));
+  }
+  SECTION("pixelate") {
+    BgraImage image = before;
+    MaskPlan plan;
+    plan.rects = {rect(0, 0, 32, 32, MaskStyle::Pixelate)};
+    spg::compose(image, plan, FallbackAction::None);
+    CHECK(max_neighbour_step(image, 0, 0, 32, 32, 3) == 0);
+  }
+  SECTION("solid fill rect") {
+    BgraImage image = before;
+    MaskPlan plan;
+    plan.rects = {rect(4, 4, 8, 8, MaskStyle::SolidFill)};
+    spg::compose(image, plan, FallbackAction::None);
+    for (std::uint32_t y = 4; y < 12; ++y) {
+      for (std::uint32_t x = 4; x < 12; ++x) {
+        REQUIRE(px(image, x, y)[3] == 255);
+      }
+    }
+  }
+  SECTION("BlurSource fallback") {
+    BgraImage image = before;
+    MaskPlan plan;
+    plan.fallback = true;
+    spg::compose(image, plan, FallbackAction::BlurSource);
+    CHECK(max_neighbour_step(image, 0, 0, 64, 48, 3) <= 8);
+  }
+  SECTION("SolidFill fallback") {
+    BgraImage image = before;
+    MaskPlan plan;
+    plan.fallback = true;
+    spg::compose(image, plan, FallbackAction::SolidFill);
+    for (std::size_t i = 3; i < image.pixels.size(); i += 4) {
+      REQUIRE(image.pixels[i] == 255);
+    }
+  }
+}
+
+TEST_CASE("fit_mask_rects counts overlapping area once", "[compose]") {
+  // a and b overlap in 81 px, so their hull adds only 2 px beyond what they
+  // already cover; a and c touch and their hull adds nothing. Summing the
+  // areas would count the overlap twice and merge a with b.
+  const std::vector<MaskRect> in{rect(0, 0, 10, 10), rect(1, 1, 10, 10), rect(0, 10, 10, 10)};
+  const std::vector<MaskRect> out = spg::fit_mask_rects(in, 2);
+  REQUIRE(out.size() == 2);
+  CHECK(out[0].box.rect == spg::Rect{0, 0, 10, 20});
+  CHECK(out[1] == in[1]);
 }
