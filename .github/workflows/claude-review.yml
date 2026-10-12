@@ -1,0 +1,42 @@
+# Staff review on every PR using the repo's spg-staff-review skill.
+# HUMAN-OWNED (.github/**). Requires the CLAUDE_CODE_OAUTH_TOKEN secret
+# (run `claude setup-token`) and the Claude GitHub App. See docs/ci.md.
+name: Claude staff review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            /spg-staff-review Review PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+            Base: origin/${{ github.base_ref }}. Head SHA: ${{ github.event.pull_request.head.sha }}.
+            Posting is authorized for this run: publish the complete report as ONE new PR comment with
+            `gh pr comment ${{ github.event.pull_request.number }} --body-file <file>`, following the
+            "Automation output" section of the skill exactly, using the head SHA above. Write the body to a
+            file under /tmp; do not modify repository files, push, approve, request changes, merge or post
+            anything else.
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Read,Grep,Glob,Write,Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git merge-base *),Bash(git status *),Bash(gh pr view *),Bash(gh pr diff *),Bash(gh pr checks *),Bash(gh pr comment *)"

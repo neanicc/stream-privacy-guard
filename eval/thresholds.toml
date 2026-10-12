@@ -1,0 +1,30 @@
+# HUMAN-OWNED. Agents must not edit this file.
+# Enforced by .claude/settings.json deny rules, the "Protected paths" CI guard,
+# and the autopilot merge gate. Ali may change targets; record the reason in
+# docs/agent-log.md in the same PR. Metric definitions: docs/eval.md.
+# These are initial targets chosen before any measurement.
+
+schema = 1
+coverage_tau = 0.90
+
+[suite.text]
+required_in = ["ci", "local"]
+watchlist_pair_recall_min = 0.97
+watchlist_first_frame_recall_min = 0.95
+pii_pair_recall_min = 0.90
+leak_frame_rate_max = 0.02
+clean_frame_blur_area_max = 0.03
+decoy_blur_rate_max = 0.25
+
+[suite.faces]
+required_in = ["local"]
+face_pair_recall_min = 0.90
+leak_frame_rate_max = 0.05
+clean_frame_blur_area_max = 0.03
+
+[suite.realtime]
+required_in = ["local"]
+resolution = "1920x1080"
+fps = 60
+fail_closed_frame_rate_max = 0.01
+p95_detection_latency_ms_max = 400

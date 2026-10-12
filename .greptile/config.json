@@ -1,0 +1,18 @@
+{
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax", "style"],
+  "autoReview": ["open"],
+  "statusCheck": true,
+  "confidenceScoreSection": { "included": true, "collapsible": false, "defaultOpen": true },
+  "summarySection": { "included": true, "collapsible": true, "defaultOpen": false },
+  "ignorePatterns": "docs/agent-log.md\n**/*.png\n**/*.lock\n",
+  "instructions": "Stream Privacy Guard is a real-time OBS filter that blurs faces, user watch-listed strings and structured PII before frames are encoded. It must fail closed. Read AGENTS.md and docs/plan.md for invariants. Prioritize: frames that could air unblurred, render-thread blocking, data races and lifetime bugs in OBS callbacks, coordinate-space mistakes, unbounded queues or memory, watch-list text reaching logs or errors, and unpinned downloads. Most PRs are written by autonomous agents: be specific, cite the line, and skip praise.",
+  "rules": [
+    { "id": "fail-closed", "rule": "A code path that can release or render a frame that has not completed a detection cycle, without applying the configured fail-closed fallback, is a high-severity bug.", "scope": ["core/**", "plugin/**"], "severity": "high" },
+    { "id": "no-secret-logging", "rule": "Watch-list entries, recognized text and matched strings must never be logged, formatted into errors or exceptions, shown in debug overlays, or written to disk. Only reason codes may be emitted.", "scope": ["core/**", "plugin/**", "cli/**"], "severity": "high" },
+    { "id": "render-thread", "rule": "Code called from the OBS video render callback must not block on locks held by worker threads, allocate per frame on the hot path without justification, or wait on inference.", "scope": ["plugin/**"], "severity": "high" },
+    { "id": "no-weakened-checks", "rule": "Flag any change that loosens a test assertion, tolerance, timeout, eval scoring rule, or makes scripts/ci/run.sh or eval scoring succeed without exercising the pipeline.", "scope": ["tests/**", "eval/**", "scripts/**"], "severity": "high" },
+    { "id": "pinned-artifacts", "rule": "Every downloaded model, dataset or binary dependency must be pinned by exact version or URL and verified by SHA-256, with its license recorded in the manifest.", "scope": ["models/**", "deps/**", "scripts/**", "CMakeLists.txt", "**/CMakeLists.txt"], "severity": "high" },
+    { "id": "coordinate-spaces", "rule": "Boxes must carry their coordinate space and convert only through the geometry module; flag ad-hoc scaling between readback, model-input and source coordinates.", "scope": ["core/**", "plugin/**"], "severity": "medium" }
+  ]
+}

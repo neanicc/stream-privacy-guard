@@ -1,0 +1,168 @@
+# Pull request and main checks: docs/ci.md
+# HUMAN-OWNED (.github/**). Agents change behavior through scripts/ci/run.sh,
+# never by editing this file.
+name: Check
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  merge_group:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+defaults:
+  run:
+    shell: bash
+jobs:
+  agent-files:
+    name: Agent files and docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate skills, discovery links, agents and doc links
+        run: python3 scripts/check_agent_files.py
+
+  workflows:
+    name: Workflow validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install checksum-verified actionlint
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            --output actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz' | sha256sum --check
+          tar -xzf actionlint.tar.gz actionlint
+      - name: Validate all GitHub Actions workflows
+        run: '"$RUNNER_TEMP/actionlint" -color'
+
+  guard:
+    name: Protected paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the human-approved label for human-owned paths
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HUMAN_APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'human-approved') }}
+        run: |
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          # --no-renames lists both sides of a rename, so moving a protected file is caught.
+          changed=$(git diff --no-renames --name-only "$merge_base" "$HEAD_SHA")
+          protected=$(printf '%s\n' "$changed" | grep -E '^(eval/thresholds\.toml|\.github/|\.claude/|\.greptile/|\.agents/|scripts/agent/|scripts/bootstrap/|AGENTS\.md$|CLAUDE\.md$|LICENSE$)' || true)
+          if [[ -z "$protected" ]]; then
+            echo "No human-owned paths changed."
+            exit 0
+          fi
+          echo "Human-owned paths changed:"
+          printf '%s\n' "$protected" | sed 's/^/  /'
+          if [[ "$HUMAN_APPROVED" == "true" ]]; then
+            echo "::notice::human-approved label present."
+            exit 0
+          fi
+          echo "::error::This PR changes human-owned paths. A human must review it and add the human-approved label."
+          exit 1
+
+  build:
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Restore dependency and model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/spg
+          key: spg-${{ runner.os }}-${{ hashFiles('deps/manifest.json', 'models/manifest.json', 'CMakeLists.txt', 'buildspec.json') }}
+          restore-keys: spg-${{ runner.os }}-
+      - name: Set up toolchain and dependencies
+        run: bash scripts/ci/run.sh setup
+      - name: Build
+        run: bash scripts/ci/run.sh build
+      - name: Test
+        run: bash scripts/ci/run.sh test
+      - name: Package
+        run: bash scripts/ci/run.sh package
+      - name: Upload packages
+        if: ${{ success() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  eval:
+    name: Synthetic eval (CI suites)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Restore dependency and model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/spg
+          key: spg-eval-${{ runner.os }}-${{ hashFiles('deps/manifest.json', 'models/manifest.json', 'CMakeLists.txt', 'buildspec.json') }}
+          restore-keys: spg-eval-${{ runner.os }}-
+      - name: Run CI eval suites against eval/thresholds.toml
+        run: bash scripts/ci/run.sh eval
+      - name: Upload synthetic eval report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eval-report
+          path: eval-out/report.*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Branch rules require this job by name.
+  check:
+    if: ${{ always() }}
+    needs: [agent-files, workflows, guard, build, eval]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every check to succeed
+        env:
+          RESULTS: >-
+            ${{ needs.agent-files.result }} ${{ needs.workflows.result }}
+            ${{ needs.guard.result }} ${{ needs.build.result }} ${{ needs.eval.result }}
+        run: |
+          for result in $RESULTS; do
+            if [[ "$result" != success ]]; then
+              echo "::error::A required job did not succeed ($result)."
+              exit 1
+            fi
+          done

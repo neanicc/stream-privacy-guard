@@ -1,0 +1,45 @@
+# Build output
+build/
+build_*/
+out/
+_deps/
+cmake-build-*/
+compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# Eval output and caches; models, deps and datasets live in $SPG_CACHE_DIR
+eval-out/
+.spg-cache/
+*.onnx
+*.ort
+
+# Never commit captures, recordings or debug frames
+/recordings/
+/captures/
+/debug-frames/
+*.mkv
+*.mp4
+*.mov
+*.flv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local agent state
+.claude/settings.local.json
+.claude/worktrees/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
