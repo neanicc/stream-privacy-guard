@@ -259,6 +259,7 @@ struct Harness {
   void adopt_none(FallbackMode fallback = FallbackMode::BlurSource) {
     spg::plugin::PipelineSpec spec;
     spec.fallback = fallback;
+    spec.ring_budget_bytes = budget;
     pipeline.adopt(spec, clock.now());
   }
 
@@ -636,6 +637,58 @@ TEST_CASE("a capture past the VRAM budget gets no texture and the frame is cover
   const spg::plugin::PipelineCounters& counters = h.pipeline.counters();
   CHECK(counters.over_budget > 0);
   CHECK(counters.capture_failures >= counters.over_budget);
+}
+
+TEST_CASE("at the VRAM budget an idle texture is reused, not freed and recreated", "[plugin][pipeline][budget]") {
+  Harness h;
+  h.budget = 6 * k720Bytes;  // 100 ms at 10 ms ticks needs 14: the ring runs at the cap
+  h.adopt(face_config(), face_between({0, 0, 10, 10}, 0, 0));
+  for (std::int64_t t = 1000; t < 1300; t += 10) {
+    h.step(t);
+  }
+  REQUIRE(h.pipeline.ring_bytes() == h.budget);
+  const std::size_t freed_before = h.gpu.freed.size();
+  const int captures_before = h.gpu.captures;
+  for (std::int64_t t = 1300; t < 1800; t += 10) {
+    h.step(t);
+    REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  }
+  CHECK(h.gpu.captures > captures_before);    // frames still get textures
+  CHECK(h.gpu.freed.size() == freed_before);  // each into an idle slot's texture
+}
+
+TEST_CASE("at the VRAM budget a larger capture frees other idle textures before its own", "[plugin][pipeline][budget]") {
+  constexpr Size kSmall{640, 360};  // a quarter of a 720p texture
+  const std::uint64_t small_bytes = spg::plugin::texture_bytes(kSmall, 32);
+  Harness h(16);
+  h.budget = 8 * small_bytes;  // two 720p frames: the one on screen and the capture
+  h.adopt(face_config(), face_between({0, 0, 10, 10}, 0, 0));
+  for (std::int64_t t = 1000; t < 1300; t += 10) {
+    h.step(t, kSmall);  // the lookahead fills the ring
+  }
+  h.adopt_none();  // the buffered frames drain and their textures go idle
+  for (std::int64_t t = 1300; t < 1500; t += 10) {
+    h.step(t, kSmall);
+  }
+  REQUIRE(h.pipeline.ring().held() <= 2);  // the frame on screen (and the one before it)
+  REQUIRE(h.pipeline.ring_bytes() > 4 * small_bytes);  // with idle textures
+  REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  // A 720p frame does not fit beside every idle small texture: the other idle
+  // ones are freed, and the warm one is grown in place, not freed and recreated.
+  const std::uint64_t refused = h.pipeline.counters().over_budget;  // while the lookahead filled the ring
+  const std::size_t freed_before = h.gpu.freed.size();
+  const DrawPlan& first = h.step(1500);
+  REQUIRE(first.kind == DrawKind::BlurWhole);  // the live frame, in the slot it was captured to
+  const std::vector<std::size_t> freed(h.gpu.freed.begin() + static_cast<std::ptrdiff_t>(freed_before),
+                                       h.gpu.freed.end());
+  CHECK_FALSE(freed.empty());
+  CHECK(std::find(freed.begin(), freed.end(), first.slot) == freed.end());
+  REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  CHECK(h.pipeline.counters().over_budget == refused);
+  for (std::int64_t t = 1510; t < 1700; t += 10) {
+    h.step(t);
+    REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  }
 }
 
 TEST_CASE("a budget that fits the lookahead never refuses a frame", "[plugin][pipeline][budget]") {
@@ -1235,6 +1288,7 @@ TEST_CASE("the frame ring counts holders and trims idle textures", "[plugin][pip
   ring.release(*a);  // a double release is ignored
   CHECK(ring.holders(*a) == 0);
   CHECK(ring.held() == 2);
+  CHECK(ring.peek() == a);
   CHECK(ring.acquire() == a);  // the warm slot is reused first
   ring.release(*a);
   ring.release(*b);

@@ -78,4 +78,21 @@ std::string describe(const LookaheadFit& fit) {
   return line;
 }
 
+bool RefitSchedule::due(Size source, Duration interval, std::uint64_t now_ns) const noexcept {
+  if (source.width == 0 || source.height == 0 || (source == checked_ && interval == interval_)) {
+    return false;  // nothing new to fit (a hidden source keeps its fit)
+  }
+  return now_ns >= retry_at_ns_;
+}
+
+void RefitSchedule::done(Size source, Duration interval) noexcept {
+  checked_ = source;
+  interval_ = interval;
+  retry_at_ns_ = 0;
+}
+
+void RefitSchedule::failed(std::uint64_t now_ns) noexcept {
+  retry_at_ns_ = now_ns + kRefitRetryNs;  // checked_ unchanged: due again then
+}
+
 }  // namespace spg::plugin

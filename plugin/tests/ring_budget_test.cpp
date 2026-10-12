@@ -126,8 +126,8 @@ TEST_CASE("a fitted lookahead always fits and is the longest that does", "[plugi
       REQUIRE(ring_frames_needed(fit.lookahead, interval) <= fit.budget_frames);
     }
     if (fit.shortened) {
-      // One more frame of lookahead would not fit.
-      REQUIRE(ring_frames_needed(fit.lookahead + interval, interval) > fit.budget_frames);
+      // The fit is in whole milliseconds: one more millisecond would not fit.
+      REQUIRE(ring_frames_needed(fit.lookahead + 1ms, interval) > fit.budget_frames);
     }
   }
 }
@@ -163,4 +163,28 @@ TEST_CASE("the budget log line names sizes and durations only", "[plugin][budget
   CHECK(line.find("512 MiB holds 64 frames of 1920x1080 (7.9 MiB each)") != std::string::npos);
   const std::string restored = describe(fit_lookahead(500ms, k512MiB, k1080, bgra(k1080), k60fps));
   CHECK(restored.find("lookahead of 500 ms fits again") != std::string::npos);
+}
+
+TEST_CASE("a refit is due once per new size or frame rate, and retried after a failure", "[plugin][budget]") {
+  using spg::plugin::kRefitRetryNs;
+  spg::plugin::RefitSchedule refits;
+  constexpr std::uint64_t t0 = 5'000'000'000ULL;
+  CHECK_FALSE(refits.due(Size{0, 0}, k60fps, t0));  // hidden: keeps its fit
+  REQUIRE(refits.due(k1080, k60fps, t0));
+  refits.done(k1080, k60fps);
+  CHECK_FALSE(refits.due(k1080, k60fps, t0 + 1));  // nothing new
+  CHECK(refits.due(k1080, k30fps, t0 + 1));        // the frame rate changed
+  REQUIRE(refits.due(k2160, k60fps, t0 + 1));      // resized
+  // The refit fails: the source stays covered, so it is tried again (not
+  // forgotten), but not on every frame.
+  refits.failed(t0 + 1);
+  CHECK_FALSE(refits.due(k2160, k60fps, t0 + 2));
+  CHECK_FALSE(refits.due(k2160, k60fps, t0 + kRefitRetryNs));
+  REQUIRE(refits.due(k2160, k60fps, t0 + 1 + kRefitRetryNs));
+  refits.failed(t0 + 1 + kRefitRetryNs);  // fails again
+  CHECK_FALSE(refits.due(k2160, k60fps, t0 + 2 + kRefitRetryNs));
+  REQUIRE(refits.due(k2160, k60fps, t0 + 1 + 2 * kRefitRetryNs));
+  refits.done(k2160, k60fps);  // succeeds
+  CHECK_FALSE(refits.due(k2160, k60fps, t0 + 2 + 2 * kRefitRetryNs));
+  CHECK(refits.due(k1080, k60fps, t0 + 2 + 2 * kRefitRetryNs));  // the next resize is not delayed
 }

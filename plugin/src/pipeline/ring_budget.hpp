@@ -78,4 +78,26 @@ class BudgetNotice {
 // The log line for `fit`: sizes and durations only, never frame content.
 [[nodiscard]] std::string describe(const LookaheadFit& fit);
 
+// How often the filter's video tick retries a refit that failed.
+inline constexpr std::uint64_t kRefitRetryNs = 1'000'000'000ULL;
+
+// When the filter's video tick refits the lookahead (FilterRender::tick):
+// once for each new source size or frame rate, and after a refit that failed
+// (the source is then covered whole) again every kRefitRetryNs until one
+// succeeds, so the cover does not outlast the failure. Video thread only.
+class RefitSchedule {
+ public:
+  // A refit should be tried now. Never for a hidden (0x0) source.
+  [[nodiscard]] bool due(Size source, Duration interval, std::uint64_t now_ns) const noexcept;
+  // `source` and `interval` are fitted: not due again until either changes.
+  void done(Size source, Duration interval) noexcept;
+  // The refit failed: due again from now_ns + kRefitRetryNs.
+  void failed(std::uint64_t now_ns) noexcept;
+
+ private:
+  Size checked_;
+  Duration interval_{};
+  std::uint64_t retry_at_ns_ = 0;
+};
+
 }  // namespace spg::plugin

@@ -51,7 +51,8 @@ class FilterRender {
   void publish(const std::optional<PolicyConfig>& policy, FallbackMode fallback, long long vram_budget_mb) noexcept;
   // The filter's video_tick: after a resize or a frame rate change, rebuilds
   // the scheduler (a new generation) if the lookahead that fits the budget
-  // changed. Never on the render path.
+  // changed. A rebuild that fails covers everything and is retried every
+  // kRefitRetryNs (RefitSchedule). Never on the render path.
   void tick() noexcept;
   void set_debug_overlay(bool on) noexcept { overlay_.store(on, std::memory_order_relaxed); }
 
@@ -78,11 +79,13 @@ class FilterRender {
   Duration published_lookahead_{};  // what the scheduler got, after the fit
   bool have_published_ = false;
   bool publish_failed_ = false;
+  // The failure was a refit of the published settings (still the ones to
+  // run), not a settings change: tick() retries it.
+  bool refit_failed_ = false;
   BudgetNotice budget_notice_;
 
-  // Video thread only (tick()): what the last fit check saw.
-  Size ticked_source_;
-  Duration ticked_interval_{};
+  // Video thread only (tick()).
+  RefitSchedule refits_;
 
   std::atomic<bool> overlay_{false};
   // Render thread only.

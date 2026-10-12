@@ -77,8 +77,9 @@ fall back to a shorter lookahead with a visible warning"). The setting
 `plugin/src/pipeline/ring_budget.cpp` and unit-tested.
 
 - **Cost of a frame:** width x height x the ring format's bytes per pixel
-  (`gs_get_format_bpp(GS_BGRA)` = 4), at the source's base size now: 7.9 MiB
-  at 1080p, 31.6 MiB at 2160p. Driver padding is not counted.
+  (`gs_get_format_bpp(GS_BGRA)` returns 32 bits, so 4 bytes), at the
+  source's base size now: 7.9 MiB at 1080p, 31.6 MiB at 2160p. Driver
+  padding is not counted.
 - **Frames a lookahead needs:** `floor(lookahead / frame interval) + 1` frames
   inside the window, plus the frame on screen, the last clean frame and one
   frame of timing slack (`kRingReserveSlots` = 3). 500 ms at 60 fps needs 34.
@@ -95,14 +96,20 @@ fall back to a shorter lookahead with a visible warning"). The setting
   frame rate changes. A different result builds a new scheduler off the
   render path, handed over like any settings change, so the old one's
   buffered frames still air with their masks and the switch rules above
-  apply. A hidden (0x0) source keeps its last fit.
+  apply. A hidden (0x0) source keeps its last fit. A refit that fails
+  (allocation, a worker thread that cannot start) covers the whole source
+  and is retried once a second until one succeeds (`RefitSchedule`); a
+  failed settings change is not, since the old settings must not run again.
 - **Fail closed:** a shorter lookahead only gives scans less time; frames
   not scanned within it get the fallback as always. The scheduler's
   retroactive window is clamped to the shorter lookahead.
 - **Hard cap per capture:** `Pipeline` counts the bytes of every ring
   texture it has allocated (held or idle) at the size it was captured. A
-  capture that would pass the budget frees the idle textures first; if it
-  still does not fit, the frame gets no texture, is counted
+  capture into an idle slot replaces that slot's texture, so only the
+  difference counts and a ring at the budget reuses textures instead of
+  recreating them. A capture that would pass the budget frees the other
+  idle textures first, then the one it would reuse; if it still does not
+  fit, the frame gets no texture, is counted
   (`PipelineCounters::over_budget`) and is drawn as opaque black when
   released (`Cover::NoTexture`). This covers the time between a resize and
   the refitted generation, and the overlap of two generations after a

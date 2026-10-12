@@ -100,6 +100,7 @@ void FilterRender::publish(const std::optional<PolicyConfig>& policy, FallbackMo
                            long long vram_budget_mb) noexcept {
   try {
     const std::lock_guard lock(publish_mutex_);
+    refit_failed_ = false;  // new settings: a failure now is not retried with the old ones
     publish_locked(policy, fallback, static_cast<std::uint64_t>(clamp_vram_budget_mb(vram_budget_mb)) * kBytesPerMiB);
   } catch (...) {
     // No scheduler for these settings: cover everything until one is built.
@@ -150,6 +151,7 @@ void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, Fal
   have_published_ = true;
   host_.offer(std::move(spec));
   publish_failed_ = false;
+  refit_failed_ = false;
   if (budget_notice_.update(fit)) {
     // One line per change: shortened, shortened to another value, restored.
     try {
@@ -164,22 +166,35 @@ void FilterRender::publish_locked(const std::optional<PolicyConfig>& policy, Fal
 void FilterRender::tick() noexcept {
   const Size source = source_size();
   const Duration interval = video_frame_interval();
-  if (source.width == 0 || source.height == 0 || (source == ticked_source_ && interval == ticked_interval_)) {
-    return;  // nothing new to fit (a hidden source keeps its fit)
+  const std::uint64_t now = os_gettime_ns();
+  if (!refits_.due(source, interval, now)) {
+    return;
   }
+  bool first_failure = false;
   try {
     const std::unique_lock lock(publish_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) {
       return;  // a publish is running and fits the budget itself; check next tick
     }
-    ticked_source_ = source;
-    ticked_interval_ = interval;
-    if (have_published_ && !publish_failed_) {
-      publish_locked(published_, published_fallback_, published_budget_);
+    // After a failed settings change there is nothing to refit (the old
+    // settings must not run again); a failed refit is retried.
+    if (have_published_ && (!publish_failed_ || refit_failed_)) {
+      try {
+        publish_locked(published_, published_fallback_, published_budget_);
+      } catch (...) {
+        first_failure = !refit_failed_;
+        refit_failed_ = true;  // cleared by a publish that succeeds
+        throw;
+      }
     }
+    refits_.done(source, interval);
   } catch (...) {
+    // Everything is covered until a refit or a settings change succeeds.
     host_.fail();
-    log(LOG_WARNING, "could not start detection for these settings: covering the whole source");
+    refits_.failed(now);
+    if (first_failure) {
+      log(LOG_WARNING, "could not start detection for these settings: covering the whole source");
+    }
   }
 }
 

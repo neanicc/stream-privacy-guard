@@ -1456,3 +1456,20 @@ Template:
   budget not applied on adopt, fit one frame too long. The GPU side
   (`gs_get_format_bpp`, `video_tick`) needs a graphics context and is
   covered only by the live check.
+- Review fixes (PR #59, after merging `main` at `8d409b5`): (1) at the
+  budget, a capture into an idle slot counted that slot's bytes twice, so
+  every frame freed and recreated a texture on the graphics thread. The
+  check now subtracts the bytes of the slot `FrameRing::peek()` names and
+  frees the other idle textures before the warm one. (2) A refit in
+  `video_tick` that failed (allocation, a worker that cannot start)
+  covered the source until the next settings change, because the size was
+  recorded first and `publish_failed_` blocked later refits. `RefitSchedule`
+  now retries it once a second until one succeeds; a failed settings
+  change is still not retried with the old settings. (3) The longest-fit
+  property test checks one more millisecond, not one more frame. (4)
+  plugin-render.md says `gs_get_format_bpp` returns bits. 3 new cases
+  (`[budget]`); `scripts/ci/run.sh build` (no warnings) and `test`:
+  314/314 on the dev Mac. Mutations: counting the reused slot again and
+  freeing every idle texture each failed one of the new pipeline cases; a
+  fit 1 ms short failed the property test. The retry wiring in
+  `FilterRender::tick` needs libobs and is covered only by the live check.

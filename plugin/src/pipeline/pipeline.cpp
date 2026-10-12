@@ -536,7 +536,16 @@ void Pipeline::trim_idle(std::size_t max_idle) noexcept {
 
 std::optional<std::size_t> Pipeline::acquire_slot(Size source) {
   const std::uint64_t need = texture_bytes(source, gpu_->bits_per_pixel());
-  const auto fits = [&] { return need <= ring_budget_ && ring_bytes_ <= ring_budget_ - need; };
+  // The capture replaces the texture of the slot it would get (an idle one is
+  // reused in place), so that slot's bytes are not counted twice.
+  const auto fits = [&] {
+    const std::optional<std::size_t> next = ring_.peek();
+    const std::uint64_t others = ring_bytes_ - (next ? slot_bytes_[*next] : 0);
+    return need <= ring_budget_ && others <= ring_budget_ - need;
+  };
+  if (!fits()) {
+    trim_idle(1);  // the other idle textures go first; the warm one is kept for this capture
+  }
   if (!fits()) {
     trim_idle(0);  // idle textures go before a frame does
   }
