@@ -106,7 +106,10 @@ endif()
 # has an older onnxruntime.dll in System32). OpenCV is linked statically.
 if(WIN32)
   # libobs loads a module with its own directory added to the DLL search path.
-  spg_copy_runtime_dlls(obs-spg)
+  # Only ONNX Runtime: libobs's own DLLs belong to OBS, never to the plugin.
+  add_custom_command(TARGET obs-spg POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:spg::onnxruntime>" "$<TARGET_FILE_DIR:obs-spg>"
+    VERBATIM)
 elseif(APPLE)
   # Inside the bundle, found through the module's only rpath, so the build
   # tree loads the copy a package would ship (plugin.loads checks it). libobs
