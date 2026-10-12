@@ -896,7 +896,7 @@ Template:
   emit them. Evidence: unit tests pass under AppleClang, GCC 13 and GCC 14 on
   the dev Mac; each fix was mutated back and failed its new test.
 
-## 2026-10-12 — SPG-14 Lookahead buffer, readback and GPU blur (#PR)
+## 2026-10-12 — SPG-14 Lookahead buffer, readback and GPU blur (#52)
 
 - Decision / change: the filter's `video_render` now runs the lookahead
   pipeline ([plugin-render.md](plugin-render.md)). Once per video frame time
