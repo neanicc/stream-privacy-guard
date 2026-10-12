@@ -443,6 +443,67 @@ Template:
   mode too. Follow-up for SPG-11: remove the `PipelineUnavailable` / `NOT RUN`
   path in the PR that wires `spg-cli run`.
 
+## 2026-10-12 — SPG-09 Tracker and temporal hold (#33)
+
+- Decision / change: `spg::Tracker` (`core/include/spg/tracker.hpp`,
+  `core/src/track/tracker.cpp`, [tracker.md](tracker.md)). Greedy IoU
+  association per kind against the predicted or last box, constant-velocity
+  prediction from box centers (first measurement as is, then smoothed), margin
+  and hold. Every detection is held on its own rather than only the track's
+  latest box: the mask for frame time t is the union, over detections seen in
+  [t - hold, t], of the hull of the box and the box moved at its velocity for
+  min(t - seen, max_prediction), grown by the margin and rounded outward to
+  whole pixels. This makes the AGENTS.md hold invariant literal (a detection's
+  region stays covered for the full hold even after the track is re-confirmed
+  elsewhere) and makes updates purely additive, at the cost of a trail behind
+  a moving object for the hold. Recall over precision; the clean-frame budget
+  is unaffected because trails only follow detections.
+- Whole-pixel mask rects: float rects narrowed independently can miss a larger
+  rect's edge by one ulp, which broke strict containment in the property test;
+  integer edges within +-2^23 are exact in float and match what
+  `enclosing_pixels()` blurs (at most 1 px extra per edge).
+- Late or same-frame detections are held but do not move the track. Resize:
+  `rescale()` merges each held box with its scaled box and widens the velocity
+  range, so masks only grow; detections after a resize must use the new size.
+- Clock: hold and prediction use frame time; the injected `Clock` only drives
+  `prune()`, which keeps a held detection until `seen + hold + retain`
+  (`retain` = lookahead) so buffered frames can still be queried.
+- Defaults (no plan value, placeholders for SPG-12 tuning): `iou_threshold`
+  0.3, `velocity_smoothing` 0.5, `max_prediction` 500 ms; hold 750 ms (plan)
+  and margin 4 px + 0.25 * min(w, h) (SPG-02 placeholder) come from
+  `PolicyConfig`. No hold or margin floor: zero stays valid, as #28 owns that.
+- Evidence (automated, dev Mac, macOS arm64): `run.sh setup`, `build` (no
+  warnings) and `test` pass, 66 tests, 12 of them tracker cases. The property
+  case runs 2000 seeded scenes (moving objects of both kinds, missed cycles,
+  late deliveries, unqueried frames, resizes in about 30%, zero holds) and checks
+  the hold, monotone-in-time and additive-update properties. A mutation check
+  (hold only the latest box, exclusive hold end, half margin, wrong velocity
+  range on resize, pruning without `retain`, prediction without the hull) made
+  at least one tracker test fail for each mutation.
+- Eval delta: none measured. Nothing calls the tracker until SPG-10/11, and the
+  eval stage is not landed (`eval/run_eval.py` is SPG-03).
+- Open issues or follow-ups: SPG-10 applies retroactive masking and decides what
+  happens to detections in flight across a resize; SPG-12 tunes margin, IoU,
+  smoothing and prediction horizon, and whether margin should grow while a
+  track coasts; IoU fails for objects moving more than about half their size per
+  detection cycle (new track, still held, no prediction).
+- Review fixes: a 2x upscale shrank a held mask, because `rescale()` recomputed
+  the margin from the merged box and `margin_px` does not scale (a 40 px box's
+  `[-14, 54]`, scaled `[-28, 108]`, became `[-24, 104]`). Each held detection
+  now keeps its margin per axis, and a resize grows it to cover the scaled
+  margin plus one scaled pixel of rounding, with velocities rounded outward;
+  tests now require the scaled old masks after a resize. `masks()` merges each
+  track's held detections into at most `max_rects_per_track` (default 8) fixed
+  time buckets, so output and work stay bounded for long holds without removing
+  coverage, and gains a buffer overload. The monotone-in-time property check
+  moved into the scene, where nothing it compares has been pruned. Velocity is
+  still unbounded for very short confirmation intervals; that only over-blurs
+  and is left to SPG-12 (#13). The injected clock must share the frames'
+  `FrameClock` time base (documented on `Tracker`; SPG-10 must keep it). A
+  mutation check (fresh margin on resize, no rounding slack, unstable bucket
+  grouping, buckets without hulls, prediction shrinking over time) made at
+  least one tracker test fail for each mutation.
+
 ## 2026-10-12 — SPG-06 Text detector (#35)
 
 - Decision / change: `TextDetector` in `spg-detect` (`core/src/detect/`,
