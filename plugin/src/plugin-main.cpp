@@ -6,6 +6,7 @@
 #include "pipeline/reaper.hpp"
 #include "plugin-support.hpp"
 #include "spg-filter.hpp"
+#include "spg/secure_memory.hpp"
 #include "spg/version.hpp"
 
 #include <string_view>
@@ -26,6 +27,9 @@ bool obs_module_load(void) {
   const std::string_view core_version = spg::version();
   spg::plugin::log(LOG_INFO, "loaded version %s (spg-core %.*s); detection not built yet, filter fails closed",
                    spg::plugin::kPluginVersion, static_cast<int>(core_version.size()), core_version.data());
+  // Where watch-list text is kept out of crash dumps (docs/settings.md).
+  spg::plugin::log(LOG_INFO, "watch-list memory: crash-dump exclusion: %s",
+                   spg::native_secure_platform().dump_exclusion_method());
   return true;
 }
 

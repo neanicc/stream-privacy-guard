@@ -896,6 +896,96 @@ Template:
   emit them. Evidence: unit tests pass under AppleClang, GCC 13 and GCC 14 on
   the dev Mac; each fix was mutated back and failed its new test.
 
+## 2026-10-12 — SPG-15b Watch-list text out of crash dumps and the undo stack (#38)
+
+- Decision / change: a small protected heap in spg-core
+  (`core/include/spg/secure_memory.hpp`, `core/src/secure/`) instead of a
+  per-allocation `mmap`: page-aligned anonymous regions, 64 KiB shared by
+  nine size classes (16 to 4096 bytes) plus one region per larger block.
+  Each region is excluded from crash dumps before use
+  (`madvise(MADV_DONTDUMP)` on Linux, `WerRegisterExcludedMemoryBlock` on
+  Windows, nothing exists on macOS), locked with `mlock`/`VirtualLock` (best
+  effort; a refusal is counted, not fatal), and every block is zeroed on
+  release (`SecureZeroMemory`, or `memset` behind a compiler barrier). The OS
+  calls sit behind an injectable `SecureMemoryPlatform` so tests record them.
+  `SecureHeap::process()` is a never-destroyed function-local static: a
+  standard allocator needs one shared heap, and leaking it keeps a `Secret`
+  in static storage safe at exit (recorded exception to "no globals").
+  `Secret` now stores its bytes there (never inline), `Secret(std::string)`
+  zeroes the string it consumed, and `Secret::copy_of(string_view)` copies
+  without a temporary. The policy engine's compiled entries, its folded,
+  matching and reversed temporaries and the PII digit views use
+  `SecureAllocator`; matching behavior is unchanged. The plugin's store
+  reads and writes the file with unbuffered `read`/`write` (`_read`/`_write`
+  and `_commit` on Windows) straight from protected memory. Undo stack:
+  in OBS 32.1.2 the properties view records a filter undo step from the live
+  settings 500 ms after the last edit, but runs a property's modified
+  callback synchronously on each edit, so the masked field now has one that
+  moves the text into `FilterState::pending_entry` (a `Secret`), overwrites
+  the libobs item in place and erases the key; Add uses it. Settings, and so
+  every undo snapshot and save, hold only `watchlist_ref`, `watchlist_count`
+  and the plain settings. A side effect: a scene collection save while the
+  user types no longer clears what was typed. Limits (Qt and libobs copies
+  of each keystroke, short-string buffers on the stack, dumps WER does not
+  write, macOS) are in `docs/settings.md`, "Watch-list text in memory".
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang):
+  `scripts/ci/run.sh build` and `test` pass, 174/174 ctest tests. New unit
+  cases: a recording platform shows map, exclude and lock before a block is
+  handed out, and unlock, include and unmap when a large block is freed; the
+  wipe observer sees every released block all zero (small, large, `Secret`
+  destroyed and reassigned); refused exclusion or locking keeps the heap
+  working and is counted; a failed map throws `std::bad_alloc`; the policy
+  engine's entries are live blocks of the process heap; on Linux
+  `/proc/self/smaps` must show `dd` on the mapping holding a `Secret` (CI
+  only), on Windows WER registration must succeed, on macOS the method is
+  `none`. `plugin.loads` replays the OBS 32.1.2 `ControlChanged` sequence
+  key by key and checks the undo snapshots `FilterChangeUndoRedo` would
+  store. Mutation checks: not registering the callback failed 8
+  `plugin.loads` checks; not resetting `pending_entry` on a property build
+  failed 2; a no-op wipe failed 4 unit cases; skipping exclusion failed 2.
+- Eval delta: none expected (allocator change only). The eval stage was not
+  run locally (the agent sandbox refuses that command); CI runs it.
+- Open issues or follow-ups: live check in OBS on the dev Mac (human, steps
+  added to `docs/live-check.md`): typing, undo and redo in the real Qt view.
+  Not verified anywhere: that WER leaves the regions out of a real crash
+  dump on Windows, or that a Linux core file omits them (the `dd` flag is
+  checked, not a core file).
+- Review fixes (Greptile and staff review on `40e98ad`): (1) the store reads
+  the watch-list through one descriptor to end of file, capped one byte past
+  the size limit, instead of trusting an earlier `file_size()`; a file that
+  grew between the two could be cut at a line end and load as a shorter
+  list. (2) Add rejects a field a script set to the empty string instead of
+  falling back to text typed earlier. (3) Size classes now reach 16 KiB
+  (eleven classes), so `evaluate()`'s temporaries for a line of up to 4096
+  code points reuse shared blocks with no system call, and a large block's
+  map, exclude, lock and their undo calls run outside the heap's mutex.
+  (4) `docs/policy.md` records that `std::bad_alloc` from the engine must
+  make the caller apply the fallback. (5) `append_utf8` is shared with
+  `to_utf8` (templated over the string type). Mutation checks: restoring
+  the old Add fallback failed 2 `plugin.loads` checks; mapping a large
+  region under the lock failed the new lock-scope unit case (after its 5 s
+  wait, no hang). The read race itself is not reproducible without a hook
+  between stat and open; the new case reads a ~127 KB list across every
+  buffer growth.
+- Review fixes (staff review on `a2ff5a4`): a new shared region is now also
+  mapped, excluded and locked outside the heap's mutex (a concurrent grow of
+  the same class just adds both regions to the free list), and the
+  large-block "not ours" path no longer decrements the live-block count.
+  Merged `origin/main` (SPG-07, #41; its log entry first, in merge order).
+  Measured `evaluate()` before (main, plain `std::u32string`) and after on
+  the dev Mac with 10 synthetic entries: single-threaded unchanged (~26 µs
+  per 170-character line, ~440-450 µs per 3000 characters); four threads at
+  once, 170 characters: ~28 to ~33 µs from the shared lock; 3000
+  characters: unchanged. Recorded in `docs/policy.md` for the scheduler
+  ticket. Mutation check: mapping a shared region under the lock failed the
+  lock-scope unit case.
+- Review fix (staff review on `f18d74a`): `WerRegisterExcludedMemoryBlock`
+  and its undo (Windows 10 1703 and later) are resolved from `kernel32.dll`
+  with `GetProcAddress` instead of imported through `wer.lib`, so an older
+  Windows loads the plugin and reports dump exclusion `none` instead of
+  failing to load the DLL. The Windows branch was syntax-checked locally
+  against a stub `windows.h` only; the Windows CI job is the build evidence.
+
 ## 2026-10-12 — SPG-14 Lookahead buffer, readback and GPU blur (#52)
 
 - Decision / change: the filter's `video_render` now runs the lookahead
