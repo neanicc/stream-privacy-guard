@@ -682,7 +682,7 @@ Template:
   `docs/settings.md`). Mutation checks: reverting (1) failed 2 `plugin.loads`
   checks, reverting the fallback in (2) failed 4, dropping the release failed 1.
 
-## 2026-10-12 — SPG-07 Text recognizer (#PR)
+## 2026-10-12 — SPG-07 Text recognizer (#41)
 
 - Decision / change: `spg-ocr` (`core/src/ocr/`, lane:vision) reads the
   detector's Source-space text regions with the pinned PP-OCRv4 English
