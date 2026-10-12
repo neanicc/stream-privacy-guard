@@ -24,9 +24,19 @@ target_compile_definitions(spg-unit-tests PRIVATE
   SPG_EXPECTED_VERSION="${PROJECT_VERSION}"
   SPG_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 spg_target_defaults(spg-unit-tests)
-catch_discover_tests(spg-unit-tests TEST_PREFIX "unit." DISCOVERY_MODE PRE_TEST)
+# Each unit test takes well under a second; the timeout turns a hang (such as
+# a render-facing scheduler call waiting on a stalled stage) into a failure.
+catch_discover_tests(spg-unit-tests TEST_PREFIX "unit." DISCOVERY_MODE PRE_TEST
+  PROPERTIES TIMEOUT 300)
 # Tracker and temporal hold (SPG-09).
 target_sources(spg-unit-tests PRIVATE unit/tracker_test.cpp)
+# Scheduler, lookahead and fail-closed release (SPG-10). The mask helper tests
+# include core/src/mask/ directly.
+target_sources(spg-unit-tests PRIVATE
+  unit/lookahead_test.cpp
+  unit/lookahead_property_test.cpp
+  unit/scheduler_test.cpp)
+target_include_directories(spg-unit-tests PRIVATE "${PROJECT_SOURCE_DIR}/core/src")
 
 # Prebuilt dependencies link, load and run ------------------------------------
 if(SPG_WITH_DEPS)
