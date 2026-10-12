@@ -63,6 +63,10 @@ void validate(const Params& params);
 struct Candidate {
   Box box;  // Space::ModelInput, axis-aligned; may reach past the map edge
   float score = 0.0F;  // mean probability inside the fitted rectangle, [0, 1]
+  // Space::ModelInput: the fitted rectangle's axis-aligned bounds before
+  // growth (the text kernel). Growth can make the boxes of two adjacent lines
+  // overlap; their kernels do not, so merging compares these.
+  Box line;
 };
 
 // Text boxes in `prob`, a row-major map of `map.width * map.height`

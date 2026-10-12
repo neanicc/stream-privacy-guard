@@ -146,6 +146,35 @@ TEST_CASE("TextDetector reports a missing model and refuses a model that is not 
                   TextDetectorError);
 }
 
+// Fixture models whose output dims are symbolic pass the open-time check, so
+// only detect() can catch what they return. Neither needs the pinned model.
+TextDetector fixture_detector(const char* file) {
+  return TextDetector::open(shared_env(), fs::path(SPG_RUNTIME_FIXTURES) / file, {}, cpu_only());
+}
+
+TEST_CASE("TextDetector fails the frame when the model returns the wrong shape", "[text][detector]") {
+  // [1, 4, 320, 320]: as many values as [1, 1, 640, 640], so db::decode alone
+  // would read it as a probability map.
+  const TextDetector wrong = fixture_detector("text_wrong_shape.onnx");
+  const auto frame = spg::test::to_frame(Canvas(1216, 640, {245, 245, 245}), spg::PixelFormat::BGRA);
+  CHECK_THROWS_AS(wrong.detect(frame.view, {1216, 640}), spg::detect::db::DecodeError);
+}
+
+TEST_CASE("TextDetector fails the frame on a non-finite output, even after a good tile", "[text][detector]") {
+  // 1216x640 is two tiles, x = 0 and x = 576. sqrt(channel mean) is finite on
+  // a light frame, so both tiles decode; a dark patch only the second tile
+  // sees makes that tile's output NaN, and the whole frame must fail rather
+  // than return the first tile's boxes.
+  const TextDetector sqrt_model = fixture_detector("text_sqrt.onnx");
+  REQUIRE(spg::detect::tile_crops({1216, 640}, 640, 64).size() == 2);
+  Canvas canvas(1216, 640, {245, 245, 245});
+  const auto light = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
+  CHECK_FALSE(sqrt_model.detect(light.view, {1216, 640}).empty());
+  canvas.rect(1180, 300, 1200, 320, {0, 0, 0});
+  const auto dark_patch = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
+  CHECK_THROWS_AS(sqrt_model.detect(dark_patch.view, {1216, 640}), spg::detect::db::DecodeError);
+}
+
 TEST_CASE("TextDetector opens the pinned PP-OCR detector", "[text][detector][model]") {
   SPG_REQUIRE_PPOCR_DET();
   CHECK(detector().session().provider() == Provider::Cpu);
@@ -298,12 +327,17 @@ TEST_CASE("TextDetector gives the same answer from several threads", "[text][det
   }
   const auto frame = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
   const Size source{1920, 1080};
-  const auto expected = detector().detect(frame.view, source);
+  // The CPU session and the default-provider one (CoreML on the dev Mac) are
+  // each shared by four threads.
+  const bool accelerated = GENERATE(false, true);
+  INFO((accelerated ? "default providers" : "cpu"));
+  const TextDetector& shared = detector(accelerated);
+  const auto expected = shared.detect(frame.view, source);
   REQUIRE(expected.size() >= 4);
   std::vector<std::vector<spg::Detection>> results(4);
   std::vector<std::thread> threads;
   for (std::size_t t = 0; t < results.size(); ++t) {
-    threads.emplace_back([&, t] { results[t] = detector().detect(frame.view, source); });
+    threads.emplace_back([&, t] { results[t] = shared.detect(frame.view, source); });
   }
   for (std::thread& thread : threads) {
     thread.join();

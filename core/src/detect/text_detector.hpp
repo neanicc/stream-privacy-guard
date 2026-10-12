@@ -41,11 +41,19 @@ struct TextDetectorConfig {
   // 640 matches the manifest's warmup shape.
   std::uint32_t tile_size = 640;
   // Minimum overlap between neighbouring tiles, in readback pixels. Lines up
-  // to this tall are never cut by a horizontal tile edge. Less than tile_size.
+  // to this tall are never cut by a horizontal tile edge. At most
+  // tile_size / 2, which keeps the pixels scanned per frame under four times
+  // the frame (a larger overlap multiplies model runs without bound).
+  //
+  // Known recall limit: a line taller than the overlap can be cut by a
+  // horizontal tile edge, and one taller than tile_size never fits a tile;
+  // its parts are found only if their strokes still score over
+  // db.box_threshold. SPG-12 measures large glyphs on the text suite and
+  // decides between a larger overlap and a downscaled whole-frame pass.
   std::uint32_t tile_overlap = 64;
-  // Boxes from different tiles are merged when they intersect and their
-  // vertical overlap is at least this fraction of the shorter one (the same
-  // line seen by two tiles). In (0, 1].
+  // Boxes from different tiles are merged when they intersect and their text
+  // kernels (db::Candidate::line) overlap vertically by at least this
+  // fraction of the shorter kernel (the same line seen by two tiles). In (0, 1].
   float merge_line_overlap = 0.5F;
   db::Params db;
 };
@@ -76,23 +84,30 @@ void validate(const TextDetectorConfig& config);
 // DetPreProcess: OpenCV BGR, mean and std 0.5).
 [[nodiscard]] std::vector<float> to_text_input_tensor(const BgrImage& image);
 
-// A Source-space text box and the tile it came from.
+// A Source-space text box, the tile it came from, and its text kernel
+// (db::Candidate::line) in Source space, unclipped, used only for merging.
 struct TileDetection {
   Detection detection;
   std::size_t tile = 0;
+  Rect line;
 };
 
-// Converts one tile's candidates to Source-space text detections with
-// spg::convert(), clips them to the source and drops any wholly outside it.
+// Converts one tile's candidates (box and kernel) to Source space with
+// spg::convert(), clips the boxes to the source and drops any wholly outside
+// it.
 [[nodiscard]] std::vector<TileDetection> tile_to_source(std::span<const db::Candidate> candidates,
                                                         const SpaceMap& map, std::size_t tile);
 
 // Links two boxes from different tiles when they intersect with positive area
-// and overlap vertically by at least `line_overlap` of the shorter one (the
-// same line seen by two tiles), and replaces every linked group by its union
-// with the group's highest score. Boxes from the same tile are never linked
-// directly; DBNet already separated them. Returns the boxes sorted top to
-// bottom, then left to right.
+// and their kernels overlap vertically by at least `line_overlap` of the
+// shorter kernel (the same line seen by two tiles), and replaces every linked
+// group by its union with the group's highest score. Grown boxes are not
+// compared vertically: growth can make two adjacent lines' boxes overlap by
+// half, and joining them would hand recognition two lines as one box. Boxes
+// from the same tile are never linked directly; DBNet already separated them.
+// Only boxes that overlap vertically are compared (a sweep in y), so a dense
+// frame does not cost every pair. Returns the boxes sorted top to bottom,
+// then left to right.
 [[nodiscard]] std::vector<Detection> merge_across_tiles(std::span<const TileDetection> detections,
                                                         float line_overlap);
 

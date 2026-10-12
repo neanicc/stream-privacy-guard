@@ -517,3 +517,28 @@ Template:
   sizes) plus a `Session::run` allocation each; `spg-cli bench` measures it.
   Recognition (SPG-07) consumes these boxes; rotated text gets an
   axis-aligned box, so SPG-07 may want the rotated rect later.
+- Review fixes (Greptile, staff review), after merging SPG-03 from `main`:
+  cross-tile merging compared grown boxes, so two adjacent lines seen by two
+  tiles (60x12 kernels 4 px apart grow to 33 px boxes overlapping by 17) were
+  joined into one box, which would hand SPG-07 two lines as one.
+  `db::Candidate` now carries `line`, the fitted rectangle before growth, and
+  `merge_across_tiles()` requires the grown boxes to intersect and the
+  kernels to overlap vertically by `merge_line_overlap`; coverage is
+  unchanged (boxes are still the grown ones). Merging sweeps boxes sorted by
+  top edge and only compares those that overlap vertically, so the uncapped
+  candidate list no longer costs every pair; a seeded test checks it against
+  the all-pairs result on 20 frames of 600 boxes. `tile_overlap` is capped
+  at `tile_size / 2` (639 of 640 meant 564,921 model runs for one 1080p
+  frame). New fixture models built at test time (`text_wrong_shape.onnx`,
+  as many values as the right shape but `[1, 4, 320, 320]`;
+  `text_sqrt.onnx`, NaN on dark pixels) drive `detect()` itself: the wrong
+  shape fails the frame, and a NaN in the second tile fails it even though
+  the first decoded. The thread test now shares the default-provider session
+  too. Mutation checks: comparing grown boxes again failed 3 merge cases;
+  cutting the sweep short failed the all-pairs test; dropping the runtime
+  shape check failed the wrong-shape case. `TextDetectorConfig` documents
+  the large-text recall limit (staff review): text taller than the overlap
+  can be cut by a horizontal tile edge, and SPG-12 must add a large-glyph
+  case. Evidence (dev Mac): `run.sh build` and `test` pass, 137/137, no
+  skips. Not changed: per-frame cost (one model run per tile, 8 at 1080p)
+  stays for SPG-10/12 to measure with `spg-cli bench`.

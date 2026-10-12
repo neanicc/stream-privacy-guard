@@ -45,6 +45,37 @@ float box_score(const cv::Mat& pred, const cv::RotatedRect& rect) {
   return static_cast<float>(cv::mean(roi, mask)[0]);
 }
 
+// Axis-aligned bounds of `rect` in map pixels. Map index i covers [i, i + 1),
+// so the far edges gain one pixel; narrowing to float rounds outward.
+Rect pixel_bounds(const cv::RotatedRect& rect) {
+  std::array<cv::Point2f, 4> corners;
+  rect.points(corners.data());
+  double x0 = corners[0].x;
+  double x1 = corners[0].x;
+  double y0 = corners[0].y;
+  double y1 = corners[0].y;
+  for (const cv::Point2f& p : corners) {
+    x0 = std::min(x0, static_cast<double>(p.x));
+    x1 = std::max(x1, static_cast<double>(p.x));
+    y0 = std::min(y0, static_cast<double>(p.y));
+    y1 = std::max(y1, static_cast<double>(p.y));
+  }
+  const auto down = [](double v) {
+    auto f = static_cast<float>(v);
+    return static_cast<double>(f) > v ? std::nextafter(f, -std::numeric_limits<float>::infinity()) : f;
+  };
+  const auto span = [](float origin, double far) {
+    auto length = static_cast<float>(far - static_cast<double>(origin));
+    while (static_cast<double>(origin) + static_cast<double>(length) < far) {
+      length = std::nextafter(length, std::numeric_limits<float>::infinity());
+    }
+    return length;
+  };
+  const float left = down(x0);
+  const float top = down(y0);
+  return {left, top, span(left, x1 + 1.0), span(top, y1 + 1.0)};
+}
+
 }  // namespace
 
 void validate(const Params& params) {
@@ -112,35 +143,8 @@ std::vector<Candidate> decode(std::span<const float> prob, Size map, const Param
     const cv::RotatedRect grown(rect.center, cv::Size2f(static_cast<float>(w + 2.0 * distance),
                                                         static_cast<float>(h + 2.0 * distance)),
                                 rect.angle);
-    std::array<cv::Point2f, 4> corners;
-    grown.points(corners.data());
-    double x0 = corners[0].x;
-    double x1 = corners[0].x;
-    double y0 = corners[0].y;
-    double y1 = corners[0].y;
-    for (const cv::Point2f& p : corners) {
-      x0 = std::min(x0, static_cast<double>(p.x));
-      x1 = std::max(x1, static_cast<double>(p.x));
-      y0 = std::min(y0, static_cast<double>(p.y));
-      y1 = std::max(y1, static_cast<double>(p.y));
-    }
-    // Map index i covers [i, i + 1): the far edges gain one pixel. Round
-    // outward when narrowing to float.
-    const auto down = [](double v) {
-      auto f = static_cast<float>(v);
-      return static_cast<double>(f) > v ? std::nextafter(f, -std::numeric_limits<float>::infinity()) : f;
-    };
-    const float left = down(x0);
-    const float top = down(y0);
-    const auto span = [](float origin, double far) {
-      auto length = static_cast<float>(far - static_cast<double>(origin));
-      while (static_cast<double>(origin) + static_cast<double>(length) < far) {
-        length = std::nextafter(length, std::numeric_limits<float>::infinity());
-      }
-      return length;
-    };
-    const Rect box{left, top, span(left, x1 + 1.0), span(top, y1 + 1.0)};
-    candidates.push_back({{box, Space::ModelInput}, std::clamp(score, 0.0F, 1.0F)});
+    candidates.push_back({{pixel_bounds(grown), Space::ModelInput}, std::clamp(score, 0.0F, 1.0F),
+                          {pixel_bounds(rect), Space::ModelInput}});
   }
   return candidates;
 }

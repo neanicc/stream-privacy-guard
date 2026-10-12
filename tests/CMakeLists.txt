@@ -80,6 +80,7 @@ if(SPG_WITH_DEPS)
   add_custom_command(
     OUTPUT "${_spg_runtime_fixtures}/scale_static.onnx" "${_spg_runtime_fixtures}/scale_dynamic.onnx"
            "${_spg_runtime_fixtures}/not_a_model.onnx" "${_spg_runtime_fixtures}/models.txt"
+           "${_spg_runtime_fixtures}/text_wrong_shape.onnx" "${_spg_runtime_fixtures}/text_sqrt.onnx"
     COMMAND Python3::Interpreter -I "${_spg_runtime_fixture_script}"
             --out "${_spg_runtime_fixtures}"
             --manifest "${PROJECT_SOURCE_DIR}/models/manifest.json"

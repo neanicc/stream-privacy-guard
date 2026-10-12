@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -55,6 +57,9 @@ Detection text_box(Rect rect, float score = 0.9F) {
   return {{rect, Space::Source}, spg::DetectionKind::TextRegion, score, spg::DetectorId::PpOcrDet};
 }
 
+// A box from `tile` whose kernel spans the box (merging compares kernels).
+TileDetection on_tile(Rect rect, std::size_t tile, float score = 0.9F) { return {text_box(rect, score), tile, rect}; }
+
 }  // namespace
 
 // --- DBNet post-processing ---------------------------------------------------
@@ -86,6 +91,13 @@ TEST_CASE("db::decode finds a filled block and grows it by the unclip distance",
   CHECK(box.rect.width == Approx(61.0F + 2.0F * distance).margin(1e-3));
   CHECK(box.rect.height == Approx(13.0F + 2.0F * distance).margin(1e-3));
   CHECK(contains(box.rect, {20.0F, 10.0F, 60.0F, 12.0F}));
+  // The kernel is the fitted rectangle before growth, far edges plus one.
+  const Box& line = found[0].line;
+  CHECK(line.space == Space::ModelInput);
+  CHECK(line.rect.x == Approx(20.0F).margin(1e-3));
+  CHECK(line.rect.y == Approx(10.0F).margin(1e-3));
+  CHECK(line.rect.width == Approx(61.0F).margin(1e-3));
+  CHECK(line.rect.height == Approx(13.0F).margin(1e-3));
 }
 
 TEST_CASE("db::decode keeps separate lines separate", "[text][db]") {
@@ -263,9 +275,11 @@ TEST_CASE("Tile boxes map to Source space through the tile's mapping", "[text][t
   CHECK(map.model_input->scale_x() == 1.0);
   CHECK(map.model_input->pad_x() == 0.0);
   const std::vector<db::Candidate> candidates{
-      {{{10, 20, 30, 8}, Space::ModelInput}, 0.8F},
-      {{{600, 520, 100, 100}, Space::ModelInput}, 0.7F},  // partly in the letterbox padding
-      {{{10, 560, 30, 30}, Space::ModelInput}, 0.9F},     // wholly in the padding
+      {{{10, 20, 30, 8}, Space::ModelInput}, 0.8F, {{12, 22, 26, 4}, Space::ModelInput}},
+      // partly in the letterbox padding
+      {{{600, 520, 100, 100}, Space::ModelInput}, 0.7F, {{620, 540, 60, 60}, Space::ModelInput}},
+      // wholly in the padding
+      {{{10, 560, 30, 30}, Space::ModelInput}, 0.9F, {{12, 562, 26, 26}, Space::ModelInput}},
   };
   const auto found = spg::detect::tile_to_source(candidates, map, 3);
   REQUIRE(found.size() == 2);
@@ -273,8 +287,11 @@ TEST_CASE("Tile boxes map to Source space through the tile's mapping", "[text][t
   CHECK(found[0].detection.kind == spg::DetectionKind::TextRegion);
   CHECK(found[0].detection.detector == spg::DetectorId::PpOcrDet);
   CHECK(found[0].detection.box == Box{{660, 40, 60, 16}, Space::Source});
-  // Clipped to the source: x from 1840 to 1920, y from 1040 to 1080.
+  CHECK(found[0].line == Rect{664, 44, 52, 8});
+  // Clipped to the source: x from 1840 to 1920, y from 1040 to 1080. The
+  // kernel is converted but not clipped; it is only compared.
   CHECK(found[1].detection.box == Box{{1840, 1040, 80, 40}, Space::Source});
+  CHECK(found[1].line == Rect{1880, 1080, 120, 120});
 }
 
 TEST_CASE("A frame smaller than a tile is scaled up uniformly", "[text][tiles]") {
@@ -284,19 +301,21 @@ TEST_CASE("A frame smaller than a tile is scaled up uniformly", "[text][tiles]")
   CHECK(mapping.scale_x() == 2.0);
   CHECK(mapping.scale_y() == 2.0);
   const spg::SpaceMap map{spg::ReadbackMapping({320, 160}, {320, 160}), mapping};
-  const std::vector<db::Candidate> candidates{{{{100, 50, 40, 20}, Space::ModelInput}, 0.8F}};
+  const std::vector<db::Candidate> candidates{
+      {{{100, 50, 40, 20}, Space::ModelInput}, 0.8F, {{104, 54, 32, 12}, Space::ModelInput}}};
   const auto found = spg::detect::tile_to_source(candidates, map, 0);
   REQUIRE(found.size() == 1);
   CHECK(found[0].detection.box == Box{{50, 25, 20, 10}, Space::Source});
+  CHECK(found[0].line == Rect{52, 27, 16, 6});
 }
 
 // --- Merging ----------------------------------------------------------------------
 
 TEST_CASE("merge_across_tiles unites one line seen by two tiles", "[text][merge]") {
   const std::vector<TileDetection> boxes{
-      {text_box({100, 50, 560, 20}, 0.7F), 0},  // cut at the tile edge
-      {text_box({600, 52, 300, 18}, 0.9F), 1},  // the rest, overlapping
-      {text_box({100, 200, 80, 20}, 0.8F), 0},  // another line
+      on_tile({100, 50, 560, 20}, 0, 0.7F),  // cut at the tile edge
+      on_tile({600, 52, 300, 18}, 1, 0.9F),  // the rest, overlapping
+      on_tile({100, 200, 80, 20}, 0, 0.8F),  // another line
   };
   const auto merged = spg::detect::merge_across_tiles(boxes, 0.5F);
   REQUIRE(merged.size() == 2);
@@ -307,31 +326,155 @@ TEST_CASE("merge_across_tiles unites one line seen by two tiles", "[text][merge]
 
 TEST_CASE("merge_across_tiles leaves same-tile boxes and different lines apart", "[text][merge]") {
   SECTION("same tile, overlapping") {
-    const std::vector<TileDetection> boxes{{text_box({0, 0, 50, 20}), 0}, {text_box({40, 2, 50, 20}), 0}};
+    const std::vector<TileDetection> boxes{on_tile({0, 0, 50, 20}, 0), on_tile({40, 2, 50, 20}, 0)};
     CHECK(spg::detect::merge_across_tiles(boxes, 0.5F).size() == 2);
   }
   SECTION("different tiles, lines touching at their margins") {
-    const std::vector<TileDetection> boxes{{text_box({0, 0, 50, 20}), 0}, {text_box({40, 15, 50, 20}), 1}};
+    const std::vector<TileDetection> boxes{on_tile({0, 0, 50, 20}, 0), on_tile({40, 15, 50, 20}, 1)};
     CHECK(spg::detect::merge_across_tiles(boxes, 0.5F).size() == 2);
   }
   SECTION("different tiles, edges only touching") {
-    const std::vector<TileDetection> boxes{{text_box({0, 0, 50, 20}), 0}, {text_box({50, 0, 50, 20}), 1}};
+    const std::vector<TileDetection> boxes{on_tile({0, 0, 50, 20}, 0), on_tile({50, 0, 50, 20}, 1)};
+    CHECK(spg::detect::merge_across_tiles(boxes, 0.5F).size() == 2);
+  }
+  SECTION("different tiles, grown boxes overlapping by half but kernels apart") {
+    // Two adjacent lines: the grown boxes overlap vertically by 17 of 33 px,
+    // the 13 px kernels not at all.
+    const std::vector<TileDetection> boxes{
+        {text_box({60, 90, 80, 33}), 0, {70, 100, 60, 13}},
+        {text_box({60, 106, 80, 33}), 1, {70, 116, 60, 13}},
+    };
     CHECK(spg::detect::merge_across_tiles(boxes, 0.5F).size() == 2);
   }
   SECTION("chains merge transitively") {
-    const std::vector<TileDetection> boxes{{text_box({0, 0, 60, 20}), 0},
-                                           {text_box({50, 0, 60, 20}), 1},
-                                           {text_box({100, 0, 60, 20}), 0}};
+    const std::vector<TileDetection> boxes{on_tile({0, 0, 60, 20}, 0), on_tile({50, 0, 60, 20}, 1),
+                                           on_tile({100, 0, 60, 20}, 0)};
     const auto merged = spg::detect::merge_across_tiles(boxes, 0.5F);
     REQUIRE(merged.size() == 1);
     CHECK(merged[0].box.rect == Rect{0, 0, 160, 20});
   }
 }
 
+TEST_CASE("Two adjacent lines seen by two tiles stay two boxes; a line across the seam is one",
+          "[text][merge]") {
+  // A 1216x640 frame read back unscaled: tiles at x = 0 and x = 576. Two 60x12
+  // kernels 4 px apart sit in the tile overlap, so both tiles decode both; a
+  // third line runs from x = 400 to 900, across the seam.
+  const Size frame{1216, 640};
+  const auto crops = spg::detect::tile_crops(frame, 640, 64);
+  REQUIRE(crops.size() == 2);
+  REQUIRE(crops[1].x == 576.0F);
+  const spg::ReadbackMapping readback(frame, frame);
+  std::vector<TileDetection> found;
+  for (std::size_t t = 0; t < crops.size(); ++t) {
+    Map map({640, 640});
+    const auto offset = static_cast<std::uint32_t>(crops[t].x);
+    map.fill(576 - offset, 100, 60, 12, 0.9F);
+    map.fill(576 - offset, 116, 60, 12, 0.9F);
+    const std::uint32_t seam_start = std::max<std::uint32_t>(400, offset);
+    const std::uint32_t seam_end = std::min<std::uint32_t>(900, offset + 640);
+    map.fill(seam_start - offset, 300, seam_end - seam_start, 12, 0.9F);
+    const auto candidates = db::decode(map.prob, map.size);
+    REQUIRE(candidates.size() == 3);
+    const spg::SpaceMap space{readback, spg::detect::tile_input_mapping(crops[t], 640)};
+    const auto boxes = spg::detect::tile_to_source(candidates, space, t);
+    found.insert(found.end(), boxes.begin(), boxes.end());
+  }
+  const auto merged = spg::detect::merge_across_tiles(found, 0.5F);
+  REQUIRE(merged.size() == 3);
+  const Rect upper{576, 100, 60, 12};
+  const Rect lower{576, 116, 60, 12};
+  CHECK(contains(merged[0].box.rect, upper));
+  CHECK_FALSE(contains(merged[0].box.rect, lower));
+  CHECK(contains(merged[1].box.rect, lower));
+  CHECK_FALSE(contains(merged[1].box.rect, upper));
+  CHECK(contains(merged[2].box.rect, {400, 300, 500, 12}));
+}
+
+TEST_CASE("merge_across_tiles matches the all-pairs result on dense frames", "[text][merge]") {
+  // Reference: link every pair from different tiles whose boxes intersect and
+  // whose kernels overlap vertically by half the shorter, then unite.
+  const auto reference = [](const std::vector<TileDetection>& boxes) {
+    std::vector<std::size_t> group(boxes.size());
+    std::iota(group.begin(), group.end(), std::size_t{0});
+    const auto find = [&](std::size_t i) {
+      while (group[i] != i) {
+        i = group[i];
+      }
+      return i;
+    };
+    for (std::size_t i = 0; i < boxes.size(); ++i) {
+      for (std::size_t j = i + 1; j < boxes.size(); ++j) {
+        const Rect hit = spg::intersection(boxes[i].detection.box.rect, boxes[j].detection.box.rect);
+        const Rect& a = boxes[i].line;
+        const Rect& b = boxes[j].line;
+        const double over = std::min(static_cast<double>(a.y) + a.height, static_cast<double>(b.y) + b.height) -
+                            std::max(static_cast<double>(a.y), static_cast<double>(b.y));
+        if (boxes[i].tile != boxes[j].tile && hit.width > 0.0F && hit.height > 0.0F &&
+            over >= 0.5 * std::min(a.height, b.height)) {
+          group[find(j)] = find(i);
+        }
+      }
+    }
+    std::vector<std::vector<std::size_t>> members(boxes.size());
+    for (std::size_t i = 0; i < boxes.size(); ++i) {
+      members[find(i)].push_back(i);
+    }
+    std::vector<Rect> united;
+    for (const auto& m : members) {
+      if (m.empty()) {
+        continue;
+      }
+      double x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (const std::size_t i : m) {
+        const Rect& r = boxes[i].detection.box.rect;
+        x0 = std::min(x0, static_cast<double>(r.x));
+        y0 = std::min(y0, static_cast<double>(r.y));
+        x1 = std::max(x1, static_cast<double>(r.x) + r.width);
+        y1 = std::max(y1, static_cast<double>(r.y) + r.height);
+      }
+      united.push_back({static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(x1 - x0),
+                        static_cast<float>(y1 - y0)});
+    }
+    return united;
+  };
+  const auto key = [](const Rect& r) { return std::tuple{r.y, r.x, r.height, r.width}; };
+  std::mt19937 rng(3506);
+  std::uniform_int_distribution<int> pos(0, 1900);
+  std::uniform_int_distribution<int> row(0, 1060);
+  std::uniform_int_distribution<int> width(8, 300);
+  std::uniform_int_distribution<int> height(6, 40);
+  std::uniform_int_distribution<std::size_t> tile(0, 7);
+  for (int trial = 0; trial < 20; ++trial) {
+    std::vector<TileDetection> boxes;
+    for (int i = 0; i < 600; ++i) {
+      const auto x = static_cast<float>(pos(rng));
+      const auto y = static_cast<float>(row(rng));
+      const auto h = static_cast<float>(height(rng));
+      const Rect box{x, y, static_cast<float>(width(rng)), h};
+      boxes.push_back({text_box(box), tile(rng), {x + 2.0F, y + h / 3.0F, box.width - 4.0F, h / 3.0F}});
+    }
+    const auto merged = spg::detect::merge_across_tiles(boxes, 0.5F);
+    std::vector<Rect> got;
+    for (const Detection& d : merged) {
+      got.push_back(d.box.rect);
+    }
+    std::vector<Rect> want = reference(boxes);
+    std::sort(got.begin(), got.end(), [&](const Rect& a, const Rect& b) { return key(a) < key(b); });
+    std::sort(want.begin(), want.end(), [&](const Rect& a, const Rect& b) { return key(a) < key(b); });
+    REQUIRE(got.size() == want.size());
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      CHECK(got[i].x == want[i].x);
+      CHECK(got[i].y == want[i].y);
+      CHECK(got[i].width == Approx(want[i].width).margin(1e-3));
+      CHECK(got[i].height == Approx(want[i].height).margin(1e-3));
+    }
+  }
+}
+
 TEST_CASE("merge_across_tiles sorts top to bottom, then left to right", "[text][merge]") {
-  const std::vector<TileDetection> boxes{{text_box({300, 10, 10, 10}), 0},
-                                         {text_box({5, 40, 10, 10}), 0},
-                                         {text_box({100, 10, 10, 10}), 0}};
+  const std::vector<TileDetection> boxes{on_tile({300, 10, 10, 10}, 0), on_tile({5, 40, 10, 10}, 0),
+                                         on_tile({100, 10, 10, 10}, 0)};
   const auto merged = spg::detect::merge_across_tiles(boxes, 0.5F);
   REQUIRE(merged.size() == 3);
   CHECK(merged[0].box.rect.x == 100.0F);
@@ -368,6 +511,15 @@ TEST_CASE("TextDetectorConfig is validated", "[text][config]") {
   CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
   config = {};
   config.tile_overlap = 640;
+  CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
+  // Overlap is capped at half a tile: 639 of 640 would mean 1281 x 441 model
+  // runs for one 1920x1080 frame.
+  config = {};
+  config.tile_overlap = 320;
+  CHECK_NOTHROW(spg::detect::validate(config));
+  config.tile_overlap = 321;
+  CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
+  config.tile_overlap = 639;
   CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
   config = {};
   config.merge_line_overlap = 0.0F;

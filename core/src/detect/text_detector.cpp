@@ -94,13 +94,19 @@ Rect unite(const Rect& a, const Rect& b) {
   return {x0, y0, span(x0, x1), span(y0, y1)};
 }
 
-bool same_line(const Rect& a, const Rect& b, float line_overlap) {
-  const Rect overlap = intersection(a, b);
+// Whether two boxes are the same line: the grown boxes intersect with positive
+// area and the kernels overlap vertically by at least `line_overlap` of the
+// shorter kernel.
+bool same_line(const TileDetection& a, const TileDetection& b, float line_overlap) {
+  const Rect overlap = intersection(a.detection.box.rect, b.detection.box.rect);
   if (!(overlap.width > 0.0F && overlap.height > 0.0F)) {
     return false;
   }
-  const float shorter = std::min(a.height, b.height);
-  return overlap.height >= line_overlap * shorter;
+  const double top = std::max(static_cast<double>(a.line.y), static_cast<double>(b.line.y));
+  const double bottom = std::min(static_cast<double>(a.line.y) + a.line.height,
+                                 static_cast<double>(b.line.y) + b.line.height);
+  const double shorter = std::min(a.line.height, b.line.height);
+  return shorter > 0.0 && bottom - top >= static_cast<double>(line_overlap) * shorter;
 }
 
 }  // namespace
@@ -109,8 +115,8 @@ void validate(const TextDetectorConfig& config) {
   if (config.tile_size < kInputDivisor || config.tile_size > kMaxTile || config.tile_size % kInputDivisor != 0) {
     throw TextDetectorError("text detector: tile_size must be a multiple of 32 in [32, 8192]");
   }
-  if (config.tile_overlap >= config.tile_size) {
-    throw TextDetectorError("text detector: tile_overlap must be less than tile_size");
+  if (config.tile_overlap > config.tile_size / 2) {
+    throw TextDetectorError("text detector: tile_overlap must be at most tile_size / 2");
   }
   if (!(std::isfinite(config.merge_line_overlap) && config.merge_line_overlap > 0.0F &&
         config.merge_line_overlap <= 1.0F)) {
@@ -176,7 +182,7 @@ std::vector<TileDetection> tile_to_source(std::span<const db::Candidate> candida
     Detection detection{{*clipped, Space::Source}, DetectionKind::TextRegion,
                         std::clamp(candidate.score, 0.0F, 1.0F), DetectorId::PpOcrDet};
     validate(detection);
-    detections.push_back({detection, tile});
+    detections.push_back({detection, tile, convert(candidate.line, Space::Source, map).rect});
   }
   return detections;
 }
@@ -192,10 +198,18 @@ std::vector<Detection> merge_across_tiles(std::span<const TileDetection> detecti
     }
     return i;
   };
-  for (std::size_t i = 0; i < n; ++i) {
-    for (std::size_t j = i + 1; j < n; ++j) {
-      if (detections[i].tile != detections[j].tile &&
-          same_line(detections[i].detection.box.rect, detections[j].detection.box.rect, line_overlap)) {
+  // Sweep in y: two boxes can intersect with positive area only when the lower
+  // one starts above the upper one's bottom edge.
+  const auto rect = [&](std::size_t i) -> const Rect& { return detections[i].detection.box.rect; };
+  std::vector<std::size_t> by_top(n);
+  std::iota(by_top.begin(), by_top.end(), std::size_t{0});
+  std::sort(by_top.begin(), by_top.end(), [&](std::size_t a, std::size_t b) { return rect(a).y < rect(b).y; });
+  for (std::size_t k = 0; k < n; ++k) {
+    const std::size_t i = by_top[k];
+    const double bottom = static_cast<double>(rect(i).y) + rect(i).height;
+    for (std::size_t m = k + 1; m < n && static_cast<double>(rect(by_top[m]).y) < bottom; ++m) {
+      const std::size_t j = by_top[m];
+      if (detections[i].tile != detections[j].tile && same_line(detections[i], detections[j], line_overlap)) {
         parent[root(j)] = root(i);
       }
     }
