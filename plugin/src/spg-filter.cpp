@@ -8,6 +8,7 @@
 #include "settings/watchlist_store.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -109,6 +110,7 @@ FilterSettings read_settings(obs_data_t *settings) {
   RawFilterSettings raw;
   raw.lookahead_ms = obs_data_get_int(settings, kLookaheadKey);
   raw.hold_ms = obs_data_get_int(settings, kHoldKey);
+  raw.vram_budget_mb = obs_data_get_int(settings, kVramBudgetKey);
   raw.categories = CategorySet{};
   for (const Category category : kAllCategories) {
     if (obs_data_get_bool(settings, category_key(category).c_str())) {
@@ -122,6 +124,7 @@ FilterSettings read_settings(obs_data_t *settings) {
   const FilterSettings clean = sanitize(raw);
   set_int_if_changed(settings, kLookaheadKey, clean.lookahead_ms);
   set_int_if_changed(settings, kHoldKey, clean.hold_ms);
+  set_int_if_changed(settings, kVramBudgetKey, clean.vram_budget_mb);
   set_string_if_changed(settings, kSensitivityKey, to_string(clean.sensitivity));
   set_string_if_changed(settings, kFallbackKey, spg::to_string(clean.fallback));
   return clean;
@@ -174,7 +177,7 @@ WatchlistSnapshot snapshot(FilterState &state) {
 void publish_render_locked(FilterState &state) noexcept {
   if (state.render != nullptr) {
     state.render->set_debug_overlay(state.settings.debug_overlay);
-    state.render->publish(state.policy, state.settings.fallback);
+    state.render->publish(state.policy, state.settings.fallback, state.settings.vram_budget_mb);
   }
 }
 
@@ -406,6 +409,7 @@ void filter_get_defaults(obs_data_t *settings) {
   obs_data_set_default_string(settings, kSensitivityKey, to_string(Sensitivity::Standard).data());
   obs_data_set_default_int(settings, kLookaheadKey, kDefaultLookaheadMs);
   obs_data_set_default_int(settings, kHoldKey, kDefaultHoldMs);
+  obs_data_set_default_int(settings, kVramBudgetKey, kDefaultVramBudgetMb);
   obs_data_set_default_string(settings, kFallbackKey, spg::to_string(FallbackMode::BlurSource).data());
   obs_data_set_default_bool(settings, kDebugOverlayKey, false);
   obs_data_set_default_int(settings, kWatchlistCountKey, 0);
@@ -653,6 +657,25 @@ void add_render_status(obs_properties_t *props, const FilterState &state) {
     line += std::string(" ") + text("SPG.Render.Last") + " " + cover_name(status.last_cover) + ".";
   }
   add_info(props, kRenderStatusKey, line.c_str(), status.covered > 0 ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
+
+  // The VRAM budget (docs/plugin-render.md): a shortened lookahead, and
+  // frames that got no ring texture within the budget.
+  std::string budget;
+  const LookaheadFit &fit = status.fit;
+  if (fit.shortened) {
+    const auto ms = [](Duration d) { return std::to_string(std::chrono::floor<std::chrono::milliseconds>(d).count()); };
+    budget = std::string(text("SPG.Budget.Shortened")) + " " + ms(fit.requested) + " ms " + text("SPG.Budget.To") +
+             " " + ms(fit.lookahead) + " ms, " + text("SPG.Budget.Holds") + " " + std::to_string(fit.budget_frames) +
+             " " + text("SPG.Budget.FramesOf") + " " + std::to_string(fit.frame.width) + "x" +
+             std::to_string(fit.frame.height) + " (" + std::to_string(fit.budget_bytes / kBytesPerMiB) + " MiB). " +
+             text("SPG.Budget.Advice");
+  }
+  if (status.over_budget > 0) {
+    budget += (budget.empty() ? "" : " ") + std::to_string(status.over_budget) + " " + text("SPG.Budget.Refused");
+  }
+  if (!budget.empty()) {
+    add_info(props, kBudgetStatusKey, budget.c_str(), OBS_TEXT_INFO_WARNING);
+  }
 }
 
 obs_properties_t *filter_get_properties(void *data) {
@@ -706,6 +729,11 @@ obs_properties_t *filter_get_properties(void *data) {
                                                             static_cast<int>(kMaxLookaheadMs), 50);
   obs_property_int_set_suffix(lookahead, " ms");
   obs_property_set_long_description(lookahead, text("SPG.Lookahead.Help"));
+  obs_property_t *budget = obs_properties_add_int(props, kVramBudgetKey, text("SPG.VramBudget"),
+                                                  static_cast<int>(kMinVramBudgetMb),
+                                                  static_cast<int>(kMaxVramBudgetMb), 64);
+  obs_property_int_set_suffix(budget, " MiB");
+  obs_property_set_long_description(budget, text("SPG.VramBudget.Help"));
   // The filter delays video only; a filter cannot delay audio (SPG-13 spike).
   add_info(props, kAudioKey, text("SPG.Audio"), OBS_TEXT_INFO_WARNING);
   obs_property_t *hold = obs_properties_add_int_slider(props, kHoldKey, text("SPG.Hold"), static_cast<int>(kMinHoldMs),
@@ -750,6 +778,15 @@ void filter_video_render(void *data, gs_effect_t * /*effect*/) {
   }
 }
 
+// Video thread, before rendering: refits the lookahead to the VRAM budget
+// after a resize (a new scheduler generation, never on the render path).
+void filter_video_tick(void *data, float /*seconds*/) {
+  const auto *state = static_cast<const FilterState *>(data);
+  if (state->render != nullptr) {
+    state->render->tick();
+  }
+}
+
 obs_source_info make_filter_info() noexcept {
   obs_source_info info{};
   info.id = kFilterId;
@@ -763,6 +800,7 @@ obs_source_info make_filter_info() noexcept {
   info.get_defaults = filter_get_defaults;
   info.get_properties = filter_get_properties;
   info.video_render = filter_video_render;
+  info.video_tick = filter_video_tick;
   return info;
 }
 

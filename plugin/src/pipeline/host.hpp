@@ -24,6 +24,9 @@ struct RenderStatus {
   std::uint64_t clean = 0;    // plans drawn with only their masks
   std::uint64_t covered = 0;  // plans drawn covered whole
   Cover last_cover = Cover::None;
+  std::uint64_t over_budget = 0;  // frames given no texture by the VRAM budget
+  // The lookahead fit of the latest generation (FilterRender fills it).
+  LookaheadFit fit;
 };
 
 class PipelineHost {
@@ -70,6 +73,7 @@ class PipelineHost {
   std::atomic<std::uint64_t> clean_{0};
   std::atomic<std::uint64_t> covered_{0};
   std::atomic<std::uint8_t> last_cover_{0};
+  std::atomic<std::uint64_t> over_budget_{0};
 };
 
 }  // namespace spg::plugin

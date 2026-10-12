@@ -87,7 +87,11 @@ DrawKind checked_kind(const DrawPlan& plan, const SlotContents& slot) noexcept {
 }
 
 Pipeline::Pipeline(FrameGpu& gpu, std::size_t ring_capacity, Retire retire, Size max_readback)
-    : gpu_(&gpu), retire_(std::move(retire)), max_readback_(max_readback), ring_(ring_capacity) {
+    : gpu_(&gpu),
+      retire_(std::move(retire)),
+      max_readback_(max_readback),
+      ring_(ring_capacity),
+      slot_bytes_(ring_capacity, 0) {
   gens_.emplace_back();
   gens_.back().id = next_generation_++;
 }
@@ -132,6 +136,9 @@ void Pipeline::adopt(PipelineSpec& spec, Timestamp now) {
   next.fallback = spec.fallback;
   next.hold = spec.hold;
   next.covered_until = covered_until;
+  // The budget applies to captures from now on; textures already held (the
+  // old generation's buffered frames) are kept until released.
+  ring_budget_ = spec.ring_budget_bytes;
   staged_.reset();      // a readback of the old generation's frame
   forget_last_clean();  // re-emits name frames of one generation
   retire_drained();
@@ -194,7 +201,7 @@ const DrawPlan& Pipeline::tick(Timestamp t, Size source) {
     mark_discontinuity();
   }
 
-  std::optional<std::size_t> slot = ring_.acquire();
+  std::optional<std::size_t> slot = acquire_slot(source);
   live_serial_ = 0;
   if (slot) {
     const std::uint64_t serial = next_serial_++;
@@ -514,14 +521,46 @@ void Pipeline::drop_buffered(Generation& gen) noexcept {
   gen.buffered.clear();
 }
 
-void Pipeline::trim_idle() noexcept {
+void Pipeline::trim_idle(std::size_t max_idle) noexcept {
   try {
-    for (const std::size_t slot : ring_.trim(kMaxIdleSlots)) {
+    for (const std::size_t slot : ring_.trim(max_idle)) {
       gpu_->free_slot(slot);
+      ring_bytes_ -= slot_bytes_[slot];
+      slot_bytes_[slot] = 0;
     }
   } catch (...) {
-    // Allocation failure: the idle textures stay until a later tick.
+    // Allocation failure: the idle textures stay until a later tick (and
+    // stay counted against the budget).
   }
+}
+
+std::optional<std::size_t> Pipeline::acquire_slot(Size source) {
+  const std::uint64_t need = texture_bytes(source, gpu_->bits_per_pixel());
+  // The capture replaces the texture of the slot it would get (an idle one is
+  // reused in place), so that slot's bytes are not counted twice.
+  const auto fits = [&] {
+    const std::optional<std::size_t> next = ring_.peek();
+    const std::uint64_t others = ring_bytes_ - (next ? slot_bytes_[*next] : 0);
+    return need <= ring_budget_ && others <= ring_budget_ - need;
+  };
+  if (!fits()) {
+    trim_idle(1);  // the other idle textures go first; the warm one is kept for this capture
+  }
+  if (!fits()) {
+    trim_idle(0);  // idle textures go before a frame does
+  }
+  if (!fits()) {
+    ++counters_.over_budget;
+    return std::nullopt;  // no texture: the frame is covered whole
+  }
+  const std::optional<std::size_t> slot = ring_.acquire();
+  if (slot) {
+    // Counted at this size from now on, whether or not the capture succeeds
+    // (a failed capture may still have allocated the texture).
+    ring_bytes_ = ring_bytes_ - slot_bytes_[*slot] + need;
+    slot_bytes_[*slot] = need;
+  }
+  return slot;
 }
 
 }  // namespace spg::plugin

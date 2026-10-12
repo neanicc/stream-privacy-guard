@@ -28,6 +28,11 @@
 //     most kMaxGenerations schedulers are live.
 //   * Schedulers are never destroyed here (their destructors wait for
 //     workers); they go to the `retire` callback.
+//   * VRAM budget (SPG-14c): ring textures never total more than the
+//     generation's ring_budget_bytes at their actual size and format. A
+//     capture that would exceed it frees idle textures first; if it still
+//     does not fit the frame gets no texture and is covered whole when
+//     released. Frames already buffered keep their textures.
 
 #include <array>
 #include <chrono>
@@ -41,6 +46,7 @@
 
 #include "pipeline/frame_ring.hpp"
 #include "pipeline/readback_pool.hpp"
+#include "pipeline/ring_budget.hpp"
 #include "spg/geometry.hpp"
 #include "spg/lookahead.hpp"
 #include "spg/mask.hpp"
@@ -111,6 +117,8 @@ class FrameGpu {
   virtual void unmap(std::size_t surface) = 0;
   // Frees an idle slot's texture.
   virtual void free_slot(std::size_t slot) = 0;
+  // Bits per pixel of the ring textures' format (BGRA: 32), for the budget.
+  [[nodiscard]] virtual std::uint32_t bits_per_pixel() const noexcept = 0;
 };
 
 enum class DrawKind : std::uint8_t {
@@ -174,6 +182,8 @@ struct PipelineSpec {
   FallbackMode fallback = FallbackMode::BlurSource;
   // The scheduler's hold, so the next generation covers its first frames.
   Duration hold{};
+  // VRAM the lookahead ring may hold (ring_budget.hpp), from this generation on.
+  std::uint64_t ring_budget_bytes = kNoRingBudget;
 };
 
 struct PipelineCounters {
@@ -181,6 +191,7 @@ struct PipelineCounters {
   std::uint64_t released = 0;
   std::uint64_t readbacks = 0;         // readbacks handed to a scheduler
   std::uint64_t capture_failures = 0;  // frames kept without a texture
+  std::uint64_t over_budget = 0;       // of those, refused by the VRAM budget
   // Output frames drawn, by the Cover of the plan each tick ends with
   // (Cover::None: clean). Frames released and replaced within the same tick
   // never aired and are not counted; a plan repeated for a tick with no
@@ -219,6 +230,9 @@ class Pipeline {
   [[nodiscard]] const PipelineCounters& counters() const noexcept { return counters_; }
   [[nodiscard]] std::size_t generations() const noexcept { return gens_.size(); }
   [[nodiscard]] const FrameRing& ring() const noexcept { return ring_; }
+  // Bytes of the ring textures allocated now (held and idle), and the limit.
+  [[nodiscard]] std::uint64_t ring_bytes() const noexcept { return ring_bytes_; }
+  [[nodiscard]] std::uint64_t ring_budget() const noexcept { return ring_budget_; }
   // Test seam: runs inside adopt() at the step that can throw (allocation).
   void set_adopt_fault(std::function<void()> fault) { adopt_fault_ = std::move(fault); }
   // Idle textures kept for reuse beyond those in use.
@@ -283,12 +297,17 @@ class Pipeline {
   void drop_buffered(Generation& gen) noexcept;
   void count_display() noexcept;
   void retire(std::unique_ptr<FrameScheduler> scheduler) noexcept;
-  void trim_idle() noexcept;
+  void trim_idle(std::size_t max_idle = kMaxIdleSlots) noexcept;
+  // A ring slot for a capture at `source`, within the VRAM budget.
+  std::optional<std::size_t> acquire_slot(Size source);
 
   FrameGpu* gpu_;
   Retire retire_;
   Size max_readback_;
   FrameRing ring_;
+  std::vector<std::uint64_t> slot_bytes_;  // texture bytes per slot (0: none)
+  std::uint64_t ring_bytes_ = 0;           // sum of slot_bytes_
+  std::uint64_t ring_budget_ = kNoRingBudget;
   ReadbackPool pool_;
   std::deque<Generation> gens_;  // retiring ones first; back() is current
   std::uint64_t next_generation_ = 1;
