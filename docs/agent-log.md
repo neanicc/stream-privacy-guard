@@ -327,7 +327,7 @@ Template:
   be read as boxes. The test `OwnedFrame` is move-only so its view cannot
   point into another frame's buffers.
 
-## 2026-10-12 — SPG-09 Tracker and temporal hold (#PR)
+## 2026-10-12 — SPG-09 Tracker and temporal hold (#33)
 
 - Decision / change: `spg::Tracker` (`core/include/spg/tracker.hpp`,
   `core/src/track/tracker.cpp`, [tracker.md](tracker.md)). Greedy IoU
