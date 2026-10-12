@@ -195,3 +195,41 @@ Template:
   interpret `fuzzy`; SPG-09 owns the margin formula; SPG-03 should read the
   committed fixtures in `tests/fixtures/contracts/` to keep the Python side in
   step with the C++ parser.
+
+## 2026-10-12 — SPG-08 Policy engine (#PR)
+
+- Decision / change: `spg::PolicyEngine` (`core/include/spg/policy.hpp`,
+  `core/src/policy/`) turns recognized text into a `Verdict` of reason codes;
+  rules in `docs/policy.md`. Choices the plan left open: (1) no ICU or other new
+  dependency; folding uses a generated table (`make_fold_table.py`, Python
+  3.13 / Unicode 15.1) covering Latin, Greek, Cyrillic, combining marks,
+  super/subscripts, letterlike and enclosed forms, ligatures, fullwidth and
+  mathematical alphanumerics, mapping each to casefold(NFKC) without
+  diacritics. It is not full NFKC. (2) OCR confusions merged in matching form:
+  0/o, 1/i/l/|, 5/s, 8/b; punctuation separates words. (3) Fuzzy rules on the
+  SPG-02 limits: an entry shorter than `min_partial_chars` matches whole words
+  only (otherwise a 3-letter name with i->l merging hits "all" inside common
+  words); a longer entry matches anywhere, even inside a handle; a partial
+  reveal is a prefix from a word start or a suffix to a word end of at least
+  `min_partial_chars`, with its own `k(m)` edit budget. (4) PII: NANP needs
+  3-3-4 group breaks (a "2026-10-12 12" timestamp otherwise read as a phone);
+  cards are Luhn plus 13-19 digits with no issuer check; tokens are a fixed
+  prefix list including Twitch stream keys. (5) An entry with no letters or
+  digits after normalization makes the engine throw (by index) rather than be
+  silently ignored. (6) `LogSink` (a `std::function`) is injected rather than a
+  global logger. Placeholder fuzzy defaults (2, 0.2, 6) kept per the issue.
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21):
+  `scripts/ci/run.sh setup`, `build` (warnings as errors) and `test` pass, 72
+  ctest tests; the new `[policy]` cases cover normalization, matching,
+  partials, every PII validator with near misses, and the sentinel test.
+  Mutation checks: logging the normalized entry, quoting it in a
+  `ContractError`, or writing a hit to `std::clog` each failed the sentinel
+  test; dropping the whole-word rule or the suffix partial failed the matcher
+  tests.
+- Eval delta: none measurable; no pipeline stage calls the engine yet and the
+  CI stage prints `THRESHOLDS: NOT RUN`.
+- Open issues or follow-ups: SPG-12 should measure the six-character, one-edit
+  partial rule and short-entry collisions against the clean-frame budget;
+  SPG-03's generator should emit NANP-valid phones (area code and exchange
+  2-9, 3-3-4 grouping) or the scorer will count misses this validator rejects
+  by design; postcodes and non-US address forms are not detected.

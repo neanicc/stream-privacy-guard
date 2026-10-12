@@ -23,6 +23,7 @@ and this page together. A breaking JSON change bumps `schema`.
 | `detection.hpp` | `Track` | Id, Source-space box, velocity (Source px/s), last confirmed time, hold expiry, kind. |
 | `mask.hpp` | `MaskPlan`, `MaskRect` | For one frame timestamp: Source-space rects with a style (`blur`, `pixelate`, `solid_fill`) and a `fallback` flag. |
 | `policy_config.hpp` | `PolicyConfig` | Enabled categories, watch-list, fuzzy limits, lookahead/retro/hold, margin, fallback mode, mask style. |
+| `policy.hpp` | `PolicyEngine`, `LogSink` | Turns recognized text into a `Verdict` under a `PolicyConfig`; rules in [policy.md](policy.md). `LogSink` receives diagnostic lines that never contain text. |
 | `ground_truth.hpp` | `GroundTruthFrame` | Eval ground truth for one frame. |
 | `secret.hpp` | `Secret` | Watch-list entries and OCR text. |
 | `error.hpp` | `ContractError` | Thrown for any contract violation. |
@@ -129,8 +130,9 @@ Every field except `schema` is optional and defaults to the value shown.
 | `fallback` | `blur_source` (default), `hold_last_scanned` or `solid_fill`. There is no fail-open mode. `hold_last_scanned` re-emits the last frame released after a complete scan, exactly as released with its masks applied; it never emits the unscanned frame or an unmasked copy of an earlier one. When there is no such frame for the current source size and content (the first frames after the filter starts, or after the source is resized or switched), it applies `blur_source` instead; SPG-10 implements and tests this. |
 | `mask_style` | `blur`, `pixelate` or `solid_fill`. |
 
-The fuzzy and margin numbers are starting points; SPG-08 and SPG-09 tune them
-against the eval and update this page. `0` is a valid value for `lookahead_ms`,
+The fuzzy and margin numbers are starting points. SPG-08 implemented the matcher
+that reads `fuzzy` ([policy.md](policy.md)) and kept these values; SPG-12 and
+SPG-09 tune them against the eval and update this page. `0` is a valid value for `lookahead_ms`,
 `hold_ms`, `margin_px` and `margin_ratio` and turns that protection off
 (`lookahead_ms: 0` leaves no retroactive window). Whether to impose a floor is
 open for SPG-09 and SPG-10 to settle against the eval.
