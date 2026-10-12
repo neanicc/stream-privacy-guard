@@ -1402,7 +1402,7 @@ Template:
   outside this ticket. The coverage-assumption risk in scheduler.md (content
   that appears and disappears between cycles) is unchanged.
 
-## 2026-10-12 — SPG-17 Packaging and docs (#PR)
+## 2026-10-12 — SPG-17 Packaging and docs (#63)
 
 - Decision / change: `scripts/package.sh` (called by `scripts/ci/run.sh
   package`) installs a new CMake component, `obs-spg`
