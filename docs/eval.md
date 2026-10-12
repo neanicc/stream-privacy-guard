@@ -43,6 +43,9 @@ These settle what the metric definitions leave open. The scorer is
   a plan without a frame, or two plans for one timestamp make the input
   unscorable, which prints `THRESHOLDS: FAIL`. A missing frame is never
   scored as blurred or as clean.
+- Each sequence's ground truth must hold exactly frames 0..n-1 for the frame
+  count `suite.json` declares; otherwise the suite is unscorable. Pairing alone
+  would accept a ground truth and a plan file shortened alike.
 - An instance is visible on a frame when its visibility is above 0 and its
   box, clipped to the frame, has area. Coverage is measured on that clipped box
   against the union of the plan's rects clipped to the frame.
@@ -58,6 +61,11 @@ These settle what the metric definitions leave open. The scorer is
 - `p95_detection_latency_ms` is the nearest-rank 95th percentile of per-cycle
   latencies that a realtime run supplies; `fail_closed_frame_rate` counts plans
   with `fallback: true`.
+- A `fallback: true` plan covers every instance on its frame and counts as a
+  fully blurred frame against the clean-frame budget. Only the realtime suite
+  limits `fail_closed_frame_rate`, so in the text and faces suites the
+  clean-frame budget is the only brake on a pipeline that falls back often.
+  The realtime suite must run in local mode once SPG-11/16 land.
 - Every key in a `[suite.*]` table other than `required_in`, `resolution` and
   `fps` must be `<metric>_min` or `<metric>_max` for a metric the scorer
   computes; anything else is an error, so a typo cannot silently drop a limit.
@@ -127,9 +135,9 @@ suite it generates before it scores a pipeline.
 scripts/ci/run.sh eval            # CI mode: text suite only
 scripts/ci/run.sh eval --local    # all suites, required for acceptance
 
-eval/generate.py text --out eval-out/text --profile ci           # one suite
-eval/score.py --mode ci --suite text=eval-out/text               # plans in the suite directory
-eval/score.py --mode ci --suite text=eval-out/text --reference noop
+python3 eval/generate.py text --out eval-out/text --profile ci   # one suite
+python3 eval/score.py --mode ci --suite text=eval-out/text       # plans in the suite directory
+python3 eval/score.py --mode ci --suite text=eval-out/text --reference noop
 ```
 
 `run.sh eval` calls `eval/run_eval.py`, which generates the suites for the

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Generate an eval suite: PNG frames, ground truth and the suite's policy config.
 
-    eval/generate.py text --out eval-out/text --seed 1 --profile ci
-    eval/generate.py faces --out eval-out/faces --seed 1 --profile full   # fetches the dataset
+    python3 eval/generate.py text --out eval-out/text --seed 1 --profile ci
+    python3 eval/generate.py faces --out eval-out/faces --seed 1 --profile full   # fetches the dataset
 
-The same seed and profile always give byte-identical ground truth. Pillow and
-the faces dataset are fetched on first use into $SPG_CACHE_DIR (pinned and
-hash-verified; see eval/spg_eval/fetch.py). Nothing printed names an item's text.
+The same seed and profile always give byte-identical ground truth.
+Regenerating into an existing output replaces each sequence's frames and
+removes mask plans left next to them. Pillow and the faces dataset are fetched
+on first use into $SPG_CACHE_DIR (pinned and hash-verified; see
+eval/spg_eval/fetch.py). Nothing printed names an item's text.
 """
 from __future__ import annotations
 

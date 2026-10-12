@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Score mask plans against generated suites and eval/thresholds.toml (docs/eval.md).
 
-    eval/score.py --mode ci --suite text=eval-out/text                   # plans next to the suite
-    eval/score.py --mode ci --suite text=eval-out/text --plans text=DIR  # plans elsewhere
-    eval/score.py --mode ci --suite text=eval-out/text --reference noop  # a reference pipeline
+    python3 eval/score.py --mode ci --suite text=eval-out/text                   # plans next to the suite
+    python3 eval/score.py --mode ci --suite text=eval-out/text --plans text=DIR  # plans elsewhere
+    python3 eval/score.py --mode ci --suite text=eval-out/text --reference noop  # a reference pipeline
 
 Prints one line per metric limit, then exactly one of `THRESHOLDS: PASS` or
 `THRESHOLDS: FAIL`. Exit status 0 on PASS, 1 on FAIL (including unscorable

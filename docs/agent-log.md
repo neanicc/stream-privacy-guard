@@ -385,3 +385,14 @@ Template:
   more fonts and styles (pinned) would make the text suite harder. LFW crops
   can include part of a second, unlabeled face; harmless for recall, but a
   dataset with per-face boxes (WIDER FACE) would allow tighter crops.
+- Review fixes (Greptile, staff review): `load_truth()` requires each
+  sequence's ground truth to hold exactly frames 0..n-1 for the count in
+  `suite.json`, since a ground truth and plan file shortened alike would pair
+  cleanly; the contract reader range-checks numbers before `math.isfinite`, so
+  a 400-digit integer is a contract error rather than an `OverflowError`;
+  regenerating into an existing output deletes old frame PNGs and mask plans
+  in each sequence, and `run_eval.py` clears its plans directory before the
+  pipeline runs. Docs call the scripts through `python3`. A fallback frame
+  counts as covered in the text and faces suites with no fail-closed limit
+  there; `docs/eval.md` records that the realtime suite must run in local
+  mode once SPG-11/16 land.
