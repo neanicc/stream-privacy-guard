@@ -765,3 +765,22 @@ Template:
   under the lock) for many detections. SPG-12 measures retro back-projection
   for moving text and whether a short secret between two scans is missed
   (the coverage rule assumes content seen at `t` persists to the next scan).
+- Review fixes (PR #40, after the first Check and staff review): (1) a null
+  detector for an enabled category now fails the cycle
+  (`ScanFailure::MissingStage`) instead of completing with no detections, and
+  `DetectorAdapter` and `EnginePolicy` reject null pointers; (2) a readback is
+  scanned for the buffered frame its timestamp names (a mapped stage surface
+  lags one frame), never credited to the frame pushed with it; (3) a result
+  that lands after a resize keeps its scaled margin, in the tracker and in
+  retroactive rects; (4) a complete result that `complete()` cannot fully
+  apply fails closed every frame it could have masked
+  (`FallbackReason::ApplyFailed`: buffered frames from `ts - retro`, frames
+  pushed up to `ts + hold`); (5) `take_job()` cannot throw (in-flight slots
+  reserved, a job it cannot record is dropped); (6) the duplicate
+  `SchedulerConfig::categories` is gone, `scan.categories` gates the stages;
+  (7) the threaded timeout helper releases the stalled stage before failing,
+  so a regression fails instead of hanging. The ubuntu-24.04 Check failure was
+  two GCC-only warnings under `-Werror` in the new tests
+  (`-Wsign-conversion`, `-Wrange-loop-construct`); AppleClang and MSVC do not
+  emit them. Evidence: unit tests pass under AppleClang, GCC 13 and GCC 14 on
+  the dev Mac; each fix was mutated back and failed its new test.

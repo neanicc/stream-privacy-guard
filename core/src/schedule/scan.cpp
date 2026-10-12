@@ -95,10 +95,16 @@ ScanResult run_scan(const ScanStages& stages, const ScanJob& job, const ScanLimi
   if (job.readback == nullptr) {
     return failed(ScanFailure::InvalidOutput);
   }
+  const bool want_faces = limits.categories.contains(Category::Face);
+  const bool want_text = any_text_category(limits.categories);
+  // A category that is enabled but cannot be scanned is not a clean scan.
+  if ((want_faces && stages.faces == nullptr) || (want_text && stages.text == nullptr)) {
+    return failed(ScanFailure::MissingStage);
+  }
   const FrameView& frame = job.readback->view();
   ScanResult result;
   try {
-    if (stages.faces != nullptr && limits.categories.contains(Category::Face)) {
+    if (want_faces) {
       std::vector<Detection> faces;
       try {
         faces = stages.faces->detect(frame, job.source);
@@ -111,7 +117,7 @@ ScanResult run_scan(const ScanStages& stages, const ScanJob& job, const ScanLimi
       result.detections.insert(result.detections.end(), faces.begin(), faces.end());
     }
 
-    if (stages.text != nullptr && any_text_category(limits.categories)) {
+    if (want_text) {
       std::vector<Detection> regions;
       try {
         regions = stages.text->detect(frame, job.source);

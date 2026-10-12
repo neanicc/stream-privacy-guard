@@ -8,7 +8,7 @@ fail-closed, retroactive-masking and temporal-hold invariants from
 
 | Piece | What it is |
 | --- | --- |
-| `run_scan()` | One detection cycle over one readback frame: faces, text regions, recognition, policy. Never throws; any exception or invalid output makes the cycle incomplete. |
+| `run_scan()` | One detection cycle over one readback frame: faces, text regions, recognition, policy. Never throws; any exception, invalid output or missing detector for an enabled category makes the cycle incomplete. |
 | `Lookahead` | Single-threaded state machine: the frame ring, the bounded scan queue, cadence, coverage, retroactive masks, release and fallback. Tests and offline tools drive it directly with a `ManualClock`. |
 | `Scheduler` | `Lookahead` behind a mutex plus a pool of worker threads that call `run_scan()`. This is what the plugin (SPG-14) uses. |
 
@@ -20,11 +20,18 @@ A frame with timestamp `t` is released once the clock reaches `t + lookahead`
 these hold; otherwise it gets the fallback:
 
 1. A **complete** cycle on a frame with time `ts` in `[t, t + retro]` finished
-   before the release. "Complete" means every stage that ran returned valid
-   output: an exception of any type (`runtime::RuntimeError` such as
-   `InferenceFailed`, `DecodeError`, `ContractError`, `bad_alloc`, or a
-   non-`std` throw), a detection that fails `validate()` or has the wrong kind,
-   or a recognizer returning the wrong number of texts makes it incomplete.
+   before the release. "Complete" means every enabled category had its
+   detector and every stage that ran returned valid output: a null detector
+   for an enabled category (`ScanFailure::MissingStage`, for example a model
+   that failed to load), an exception of any type (`runtime::RuntimeError`
+   such as `InferenceFailed`, `DecodeError`, `ContractError`, `bad_alloc`, or
+   a non-`std` throw), a detection that fails `validate()` or has the wrong
+   kind, or a recognizer returning the wrong number of texts makes it
+   incomplete. A frame whose cycle result could not be fully applied (an
+   allocation or tracker failure in `complete()`) fails closed
+   (`FallbackReason::ApplyFailed`), as do the other frames that result could
+   have masked: buffered frames from `ts - retro` on, and frames pushed up to
+   `ts + hold`.
 2. That cycle scanned the **same content**: no resize and no
    `mark_discontinuity()` between the two frames.
 3. The release is no later than `t + lookahead + release_grace`. A later
@@ -45,6 +52,20 @@ Rule 1 is the coverage rule from the plan and the SPG-08b note: a cycle counts
 for frames up to `retro` before it, because its boxes are applied to them
 retroactively. A cycle *before* a frame does not count: content that appears
 after the last scan would otherwise air unscanned.
+
+This rule assumes that content visible at `t` is still visible at `ts`. A
+secret that appears and disappears entirely between two cycles on one segment
+is never seen, yet the frames around it are released clean. The property test
+encodes the same assumption in its oracle, so it does not establish leak
+safety. This is a tracked risk for SPG-12 (scroll and slide-in sequences) and
+SPG-16 (cadence against `bench`): a shorter `retro` or a faster cadence
+narrows the window.
+
+The readback a cycle scans is matched to a buffered frame by timestamp, not
+by the push it arrived with. A mapped stage surface usually holds the
+previous frame (plan section 7), so `push(t, size, readback)` with
+`readback.timestamp == t_prev` queues a cycle on `t_prev`. A readback whose
+timestamp matches no buffered frame with a valid timestamp is not scanned.
 
 ## Masks
 
@@ -68,9 +89,11 @@ they merge into one hull (more blur, never less).
 
 A push with a new source size rescales the tracker (`Tracker::rescale`, masks
 only grow) and starts a new segment. A cycle that was in flight across the
-resize returns boxes in the old size. They are applied as the hull of the box
-scaled to every size since, so frames of each size stay covered; for
-retroactive rects, the box is hulled with its scaling to that frame's size.
+resize returns boxes in the old size. Each is held as the hull of the box and
+of its grown mask scaled to every size since, so frames of each size keep the
+scaled margin, as `Tracker::rescale` does for boxes held before the resize.
+A retroactive rect on a frame of another size is the hull of the box and its
+scaling grown in that size, and of the grown mask scaled.
 The cycle does not count as a scan of new-size frames (rule 2). Up to 64
 resizes are remembered; a result from before that is treated as incomplete.
 
@@ -99,7 +122,12 @@ rejected.
 bookkeeping; workers hold it only to take a job and to apply a result, never
 while a stage runs, so the render thread never waits on inference. `push`
 copies the readback into an `OwnedFrame` outside the lock, and only when the
-cadence wants a scan. The queue holds at most `queue_capacity` jobs; a new job
+cadence wants a scan. That copy allocates and copies one readback on the
+render thread per queued scan (every frame at the default `scan_interval` of
+0), and `release_due` waits for the mutex while a worker applies a result,
+whose cost grows with detections times buffered frames. Neither waits on
+inference, but SPG-16 must measure the p99 of the render-facing calls; a
+pooled readback buffer would remove the allocation. The queue holds at most `queue_capacity` jobs; a new job
 pushes out the oldest, and workers take the newest. The clock is read from
 worker threads (the tracker prunes on update), so it must be thread-safe
 (`SteadyClock` is; `ManualClock` is not).
@@ -124,8 +152,11 @@ scheduler.release_due(released);  // compose each: rects, or the fallback action
 ```
 
 `DetectorAdapter<spg::detect::FaceDetector>` (and `TextDetector`) adapts the
-SPG-05/06 detectors without making `spg-core` depend on them. Without a
-recognizer or policy every text region is masked. Recognized text longer than
+SPG-05/06 detectors without making `spg-core` depend on them; it and
+`EnginePolicy` reject a null pointer with `ContractError`. A detector may be
+left null only when `scan.categories` disables its categories; otherwise
+every cycle fails and every frame gets the fallback. Without a recognizer or
+policy every text region is masked. Recognized text longer than
 `scan.max_text_bytes` (512) is not passed to the policy; its region is masked.
 Offline, `spg-cli` (SPG-11) can drive `Lookahead` directly: push, take a job,
 `run_scan()`, `complete()`, `release_due()`.
@@ -134,7 +165,7 @@ Offline, `spg-cli` (SPG-11) can drive `Lookahead` directly: push, take a job,
 
 | Setting | Default | Source |
 | --- | --- | --- |
-| `lookahead`, `retro`, `hold`, margin, fallback, mask style, categories | from `PolicyConfig` | plan section 4 |
+| `lookahead`, `retro`, `hold`, margin, fallback, mask style, `scan.categories` | from `PolicyConfig` | plan section 4 |
 | `workers` | 2 | SPG-10 starting point |
 | `queue_capacity` | 1 (the newest frame) | plan section 4 ("workers process the newest readback frame") |
 | `scan_interval` | 0 (offer every frame) | SPG-10 starting point; SPG-16 tunes cadence against `bench` |

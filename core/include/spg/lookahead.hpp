@@ -31,9 +31,6 @@ struct SchedulerConfig {
   Duration retro = std::chrono::milliseconds{500};
   FallbackMode fallback = FallbackMode::BlurSource;
   MaskStyle mask_style = MaskStyle::Blur;
-  // Gates the stages (Face gates the face detector) and nothing else; the
-  // policy limits text reasons itself.
-  CategorySet categories = CategorySet::all();
   // Hold and margin. `retain` is raised to at least lookahead + release_grace
   // so held detections outlive every frame that may still ask for them.
   TrackerConfig tracker;
@@ -50,6 +47,8 @@ struct SchedulerConfig {
   // Retroactive rects kept per buffered frame; past this they merge into one
   // hull (more blur, never less).
   std::size_t max_retro_rects = 64;
+  // scan.categories gates the stages (Face gates the face detector) and
+  // nothing else; the policy limits text reasons itself.
   ScanLimits scan;
   // Frame timestamps must be within this of clock.now() when pushed, and must
   // increase; otherwise the clock and frames do not share one time base and
@@ -86,6 +85,7 @@ enum class FallbackReason : std::uint8_t {
   NotScanned,    // no complete cycle covered the frame before its release
   LateRelease,   // released after timestamp + lookahead + release_grace
   BadTimestamp,  // not increasing, or outside clock_tolerance of the clock
+  ApplyFailed,   // a complete cycle's boxes could not all be applied to it
 };
 
 struct ReleasedFrame {
@@ -125,7 +125,11 @@ struct SchedulerStats {
 //     grown by the margin, to every buffered frame with time in
 //     [ts - retro, ts) (scaled across a resize, hulled with the unscaled box).
 //   * Hold: plan rects include Tracker::masks(t), so a detection stays masked
-//     for the hold; a resize or a late cycle only adds coverage.
+//     for the hold; a resize or a late cycle only adds coverage, and a box
+//     from before a resize keeps its scaled margin.
+//   * A complete cycle whose result cannot be fully applied (an allocation
+//     or tracker failure) fails closed every frame it could have masked:
+//     buffered frames from ts - retro on, and frames pushed up to ts + hold.
 //   * Frames are released once each, in push order, never before
 //     t + lookahead unless the buffer is over max_buffered_frames.
 //
@@ -140,14 +144,22 @@ class Lookahead {
   // caller can skip the readback copy otherwise.
   [[nodiscard]] bool wants_scan(Timestamp t) const noexcept;
 
-  // Buffers the frame with timestamp `t` and Source size `source`. Queues a
-  // scan of `readback` when one is given and the cadence allows. A size change
-  // starts a new segment and rescales held detections. Throws ContractError
-  // for a zero source size (changing nothing).
+  // Buffers the frame with timestamp `t` and Source size `source`. A size
+  // change starts a new segment and rescales held detections. Throws
+  // ContractError for a zero source size (changing nothing).
+  //
+  // When `readback` is given and the cadence allows, queues a scan of it for
+  // the buffered frame whose timestamp equals readback->view().timestamp:
+  // the frame being pushed, or an earlier one when the readback lags (a
+  // mapped stage surface holds the previous frame). A readback that matches
+  // no buffered frame with a valid timestamp is not scanned, and nothing is
+  // scanned when the pushed frame's own timestamp is bad.
   FrameId push(Timestamp t, Size source, std::shared_ptr<const OwnedFrame> readback = nullptr);
 
-  // The newest queued job, if any.
-  [[nodiscard]] std::optional<ScanJob> take_job();
+  // The newest queued job, if any. Never throws: if the job cannot be
+  // recorded as in flight it is dropped (counted in scans_dropped) and its
+  // frames fail closed unless another cycle covers them.
+  [[nodiscard]] std::optional<ScanJob> take_job() noexcept;
 
   // Applies a finished job. An incomplete result covers nothing. Throws
   // ContractError for a job that was not taken or was already completed.
@@ -178,9 +190,12 @@ class Lookahead {
     std::uint64_t segment = 0;
     bool covered = false;
     bool bad_timestamp = false;
+    bool apply_failed = false;
     std::vector<Rect> retro;
   };
 
+  [[nodiscard]] const FrameRecord* find_frame(Timestamp t) const noexcept;
+  void apply(const ScanJob& job, const ScanResult& result);
   void add_retro(FrameRecord& frame, const Rect& rect) const;
   [[nodiscard]] FallbackAction fallback_action(const FrameRecord& frame, FrameId& reemit) const noexcept;
 
@@ -197,6 +212,9 @@ class Lookahead {
   bool have_frame_ = false;
   Timestamp last_pushed_{};
   std::optional<Timestamp> last_queued_;
+  // Frames pushed with t at or before this fail closed (ApplyFailed): a
+  // result that could not be applied may have been held up to here.
+  std::optional<Timestamp> apply_failed_until_;
   FrameId next_frame_ = 1;
   std::uint64_t next_job_ = 1;
   // Last frame released with FallbackAction::None, for HoldLastScanned.

@@ -81,7 +81,9 @@ bool Scheduler::wants_scan(Timestamp t) const {
 
 FrameId Scheduler::push(Timestamp t, Size source, const FrameView* readback) {
   std::shared_ptr<const OwnedFrame> copy;
-  if (readback != nullptr && wants_scan(t)) {
+  // The readback may lag the pushed frame; the cadence and the coverage go
+  // by the frame it shows.
+  if (readback != nullptr && wants_scan(readback->timestamp)) {
     try {
       copy = OwnedFrame::copy(*readback);
     } catch (...) {
@@ -124,6 +126,7 @@ void Scheduler::run_worker(std::shared_ptr<Shared> shared, std::size_t index) {
     if (shared->stop) {
       break;
     }
+    // Never throws: a job it cannot record as in flight is dropped.
     std::optional<ScanJob> job = shared->lookahead.take_job();
     if (!job.has_value()) {
       continue;

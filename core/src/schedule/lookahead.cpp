@@ -39,7 +39,6 @@ SchedulerConfig SchedulerConfig::from_policy(const PolicyConfig& policy) {
   config.retro = policy.retro;
   config.fallback = policy.fallback;
   config.mask_style = policy.mask_style;
-  config.categories = policy.categories;
   config.scan.categories = policy.categories;
   config.tracker = TrackerConfig::from_policy(policy);
   return config;
@@ -70,7 +69,11 @@ void validate(const SchedulerConfig& config) {
 }
 
 Lookahead::Lookahead(const Clock& clock, SchedulerConfig config)
-    : clock_(&clock), config_(validated(config)), tracker_(clock, tracker_config(config_)) {}
+    : clock_(&clock), config_(validated(config)), tracker_(clock, tracker_config(config_)) {
+  // The Scheduler never has more than `workers` jobs in flight, so take_job()
+  // does not allocate there.
+  in_flight_.reserve(config_.workers);
+}
 
 bool Lookahead::wants_scan(Timestamp t) const noexcept {
   return !last_queued_.has_value() || t - *last_queued_ >= config_.scan_interval;
@@ -106,6 +109,7 @@ FrameId Lookahead::push(Timestamp t, Size source, std::shared_ptr<const OwnedFra
   record.size_epoch = first_epoch_ + sizes_.size() - 1;
   record.segment = segment_;
   record.bad_timestamp = bad;
+  record.apply_failed = apply_failed_until_.has_value() && t <= *apply_failed_until_;
   frames_.push_back(record);
   ++stats_.frames_pushed;
 
@@ -116,33 +120,63 @@ FrameId Lookahead::push(Timestamp t, Size source, std::shared_ptr<const OwnedFra
   have_frame_ = true;
   last_pushed_ = t;
 
-  if (readback != nullptr && wants_scan(t)) {
+  if (readback == nullptr) {
+    return record.id;
+  }
+  // The readback shows the frame its timestamp names, which may be an earlier
+  // one than this push. Coverage goes to that frame; a readback of a frame
+  // that is no longer buffered is not scanned.
+  const Timestamp shown = readback->view().timestamp;
+  const FrameRecord* target = find_frame(shown);
+  if (target != nullptr && wants_scan(shown)) {
     if (queue_.size() >= config_.queue_capacity) {
       queue_.pop_front();
       ++stats_.scans_dropped;
     }
     ScanJob job;
     job.seq = next_job_++;
-    job.frame = record.id;
-    job.frame_time = t;
-    job.source = source;
+    job.frame = target->id;
+    job.frame_time = target->t;
+    job.source = target->source;
     job.readback = std::move(readback);
-    job.size_epoch = record.size_epoch;
-    job.segment = record.segment;
+    job.size_epoch = target->size_epoch;
+    job.segment = target->segment;
     queue_.push_back(std::move(job));
-    last_queued_ = t;
+    last_queued_ = shown;
     ++stats_.scans_queued;
   }
   return record.id;
 }
 
-std::optional<ScanJob> Lookahead::take_job() {
+const Lookahead::FrameRecord* Lookahead::find_frame(Timestamp t) const noexcept {
+  // Frames with a valid timestamp are pushed in increasing time.
+  for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
+    if (it->bad_timestamp) {
+      continue;
+    }
+    if (it->t == t) {
+      return &*it;
+    }
+    if (it->t < t) {
+      break;
+    }
+  }
+  return nullptr;
+}
+
+std::optional<ScanJob> Lookahead::take_job() noexcept {
   if (queue_.empty()) {
     return std::nullopt;
   }
-  ScanJob job = std::move(queue_.back());
+  try {
+    in_flight_.push_back(queue_.back().seq);
+  } catch (...) {
+    queue_.pop_back();
+    ++stats_.scans_dropped;
+    return std::nullopt;
+  }
+  std::optional<ScanJob> job(std::move(queue_.back()));
   queue_.pop_back();
-  in_flight_.push_back(job.seq);
   ++stats_.scans_started;
   return job;
 }
@@ -157,27 +191,48 @@ void Lookahead::complete(const ScanJob& job, const ScanResult& result) {
     ++stats_.scans_failed;
     return;
   }
+  try {
+    apply(job, result);
+  } catch (...) {
+    // Part of the result may be missing from the tracker or from frames an
+    // earlier cycle already covered. Fail closed every frame it could have
+    // masked: retroactively from ts - retro, and held up to ts + hold.
+    const Timestamp from = job.frame_time - config_.retro;
+    for (FrameRecord& frame : frames_) {
+      if (frame.t >= from) {
+        frame.apply_failed = true;
+      }
+    }
+    const Timestamp until = job.frame_time + config_.tracker.hold;
+    if (!apply_failed_until_.has_value() || *apply_failed_until_ < until) {
+      apply_failed_until_ = until;
+    }
+    ++stats_.scans_failed;
+    return;
+  }
+  ++stats_.scans_completed;
+}
 
-  // The tracker works in the current source size. A result from before a
-  // resize is held as the hull of its box scaled to every size since, so
-  // frames of each size stay covered (masks only grow).
+void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
+  const float margin_px = config_.tracker.margin_px;
+  const float margin_ratio = config_.tracker.margin_ratio;
+  // The tracker works in the current source size and adds the margin itself.
+  // A result from before a resize is held as the hull of its box and of its
+  // grown mask scaled to every size since, so frames of each size keep the
+  // scaled margin (masks only grow, as Tracker::rescale does for held boxes).
   const std::uint64_t current = first_epoch_ + sizes_.size() - 1;
   std::vector<Detection> tracked;
   tracked.reserve(result.detections.size());
   for (const Detection& d : result.detections) {
-    Detection grown = d;
+    const Rect mask_here = mask::grow_by_margin(d.box.rect, margin_px, margin_ratio);
+    Detection held = d;
     for (std::uint64_t e = job.size_epoch + 1; e <= current; ++e) {
-      grown.box.rect = mask::hull(grown.box.rect,
-                                  mask::scale_between(d.box.rect, job.source, sizes_[e - first_epoch_]));
+      held.box.rect =
+          mask::hull(held.box.rect, mask::scale_between(mask_here, job.source, sizes_[e - first_epoch_]));
     }
-    tracked.push_back(grown);
+    tracked.push_back(held);
   }
-  try {
-    tracker_.update(job.frame_time, tracked);
-  } catch (...) {
-    ++stats_.scans_failed;
-    return;
-  }
+  tracker_.update(job.frame_time, tracked);
 
   // Retroactive masking: the tracker only covers frames at or after the
   // frame a detection was seen on; earlier buffered frames get the boxes here.
@@ -188,18 +243,22 @@ void Lookahead::complete(const ScanJob& job, const ScanResult& result) {
     }
     if (frame.t < job.frame_time) {
       for (const Detection& d : result.detections) {
-        Rect r = d.box.rect;
+        const Rect mask_here = mask::grow_by_margin(d.box.rect, margin_px, margin_ratio);
+        Rect r = mask_here;
         if (frame.source != job.source) {
-          r = mask::hull(r, mask::scale_between(r, job.source, frame.source));
+          // The hull of the box and its scaling, grown in this size, and the
+          // grown mask scaled (its scaled margin).
+          const Rect both = mask::hull(d.box.rect, mask::scale_between(d.box.rect, job.source, frame.source));
+          r = mask::hull(mask::grow_by_margin(both, margin_px, margin_ratio),
+                         mask::scale_between(mask_here, job.source, frame.source));
         }
-        add_retro(frame, mask::grow_by_margin(r, config_.tracker.margin_px, config_.tracker.margin_ratio));
+        add_retro(frame, r);
       }
     }
     if (frame.segment == job.segment) {
       frame.covered = true;
     }
   }
-  ++stats_.scans_completed;
 }
 
 void Lookahead::add_retro(FrameRecord& frame, const Rect& rect) const {
@@ -259,6 +318,8 @@ void Lookahead::release_due(std::vector<ReleasedFrame>& out) {
 
     if (frame.bad_timestamp) {
       released.reason = FallbackReason::BadTimestamp;
+    } else if (frame.apply_failed) {
+      released.reason = FallbackReason::ApplyFailed;
     } else if (!frame.covered) {
       released.reason = FallbackReason::NotScanned;
     } else if (now > frame.t + config_.lookahead + config_.release_grace) {

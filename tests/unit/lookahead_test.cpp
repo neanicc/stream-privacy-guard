@@ -62,7 +62,21 @@ bool covered_by(const spg::MaskPlan& plan, const Rect& box) {
                      [&](const spg::MaskRect& r) { return spg::mask::contains(r.box.rect, box); });
 }
 
-// Drives a Lookahead frame by frame with inline detection cycles.
+// `limits` without the categories whose detector `stages` lacks.
+spg::ScanLimits served(spg::ScanLimits limits, const spg::ScanStages& stages) {
+  for (const spg::Category c : spg::kAllCategories) {
+    const bool face = c == spg::Category::Face;
+    if ((face && stages.faces == nullptr) || (!face && stages.text == nullptr)) {
+      limits.categories.erase(c);
+    }
+  }
+  return limits;
+}
+
+// Drives a Lookahead frame by frame with inline detection cycles. A cycle
+// scans only the categories its stages serve (a test that leaves out a
+// detector disables its categories); the tests of an enabled category with
+// no detector call run_scan() with the configured limits.
 struct Sim {
   explicit Sim(SchedulerConfig config, spg::ScanStages s = {}) : la(clock, config), stages(std::move(s)) {}
 
@@ -79,7 +93,7 @@ struct Sim {
   std::pair<spg::ScanJob, spg::ScanResult> run() {
     std::optional<spg::ScanJob> job = la.take_job();
     REQUIRE(job.has_value());
-    spg::ScanResult result = spg::run_scan(stages, *job, la.config().scan);
+    spg::ScanResult result = spg::run_scan(stages, *job, served(la.config().scan, stages));
     return {*job, result};
   }
   // Takes, runs and completes the newest job now.
@@ -135,7 +149,7 @@ TEST_CASE("a frame scanned before its deadline is released with its masks", "[sc
 }
 
 TEST_CASE("an unscanned frame fails closed with the configured fallback", "[schedule]") {
-  for (const auto [mode, action] : {std::pair{FallbackMode::BlurSource, FallbackAction::BlurSource},
+  for (const auto& [mode, action] : {std::pair{FallbackMode::BlurSource, FallbackAction::BlurSource},
                                     std::pair{FallbackMode::SolidFill, FallbackAction::SolidFill},
                                     std::pair{FallbackMode::HoldLastScanned, FallbackAction::BlurSource}}) {
     SchedulerConfig config = small_config();
@@ -308,6 +322,72 @@ TEST_CASE("invalid stage output fails the cycle", "[schedule]") {
                                 std::make_shared<spg_test::ScriptedPolicy>()});
 }
 
+TEST_CASE("an enabled category without its detector fails the cycle closed", "[schedule]") {
+  Sim sim(small_config());  // every category enabled
+  sim.push(1000, true);
+  std::optional<spg::ScanJob> job = sim.la.take_job();
+  REQUIRE(job.has_value());
+  const spg::ScanLimits& all = sim.la.config().scan;
+  const auto text = std::make_shared<spg_test::ScriptedDetector>(
+      [](Timestamp, Size) { return std::vector<Detection>{}; });
+  for (const spg::ScanStages& stages : {spg::ScanStages{}, spg::ScanStages{nothing(), nullptr, nullptr, nullptr},
+                                        spg::ScanStages{nullptr, text, nullptr, nullptr}}) {
+    const spg::ScanResult r = spg::run_scan(stages, *job, all);
+    CHECK_FALSE(r.complete);
+    CHECK(r.failure == spg::ScanFailure::MissingStage);
+    CHECK(r.detections.empty());
+  }
+  CHECK(text->calls == 0);
+  sim.la.complete(*job, spg::run_scan(spg::ScanStages{}, *job, all));
+  const auto out = sim.release_at(1100);
+  REQUIRE(out.size() == 1);
+  CHECK(out[0].reason == FallbackReason::NotScanned);
+  CHECK(sim.la.stats().scans_failed == 1);
+
+  // A disabled category may lack its detector.
+  spg::ScanLimits faces_only = all;
+  faces_only.categories = spg::CategorySet{};
+  faces_only.categories.insert(spg::Category::Face);
+  CHECK(spg::run_scan(spg::ScanStages{nothing(), nullptr, nullptr, nullptr}, *job, faces_only).complete);
+}
+
+TEST_CASE("adapters reject a missing detector or policy engine", "[schedule]") {
+  CHECK_THROWS_AS(spg::DetectorAdapter<spg_test::ScriptedDetector>(nullptr), spg::ContractError);
+  CHECK_THROWS_AS(spg::EnginePolicy(nullptr), spg::ContractError);
+  const spg::DetectorAdapter<spg_test::ScriptedDetector> adapter(nothing());
+  const spg_test::TinyFrame frame(at_ms(0));
+  CHECK(adapter.detect(frame.view(), k720).empty());
+}
+
+TEST_CASE("a lagging readback covers the frame it shows, not the frame pushed with it", "[schedule]") {
+  const Rect box{100, 100, 40, 40};
+  Sim sim(small_config(), spg::ScanStages{faces_always(box), nullptr, nullptr, nullptr});
+  const spg::FrameId shown = sim.push(1000, false);
+  // The stage surface mapped while pushing 1010 still holds frame 1000.
+  sim.clock.set(at_ms(1010));
+  const auto lagging = spg::OwnedFrame::copy(spg_test::TinyFrame(at_ms(1000)).view());
+  sim.la.push(at_ms(1010), k720, lagging);
+  {
+    std::optional<spg::ScanJob> job = sim.la.take_job();
+    REQUIRE(job.has_value());
+    CHECK(job->frame == shown);
+    CHECK(job->frame_time == at_ms(1000));
+    sim.la.complete(*job, spg::run_scan(sim.stages, *job, served(sim.la.config().scan, sim.stages)));
+  }
+  // A readback of a frame that is not buffered (released, or never pushed) is
+  // not scanned.
+  sim.clock.set(at_ms(1020));
+  sim.la.push(at_ms(1020), k720, spg::OwnedFrame::copy(spg_test::TinyFrame(at_ms(1015)).view()));
+  CHECK(sim.la.stats().scans_queued == 1);
+  const auto out = sim.release_at(1200);
+  REQUIRE(out.size() == 3);
+  CHECK(out[0].action == FallbackAction::None);
+  CHECK(covered_by(out[0].plan, box));
+  // The cycle on 1000 is before 1010 and 1020: it does not count as their scan.
+  CHECK(out[1].reason == FallbackReason::NotScanned);
+  CHECK(out[2].reason == FallbackReason::NotScanned);
+}
+
 TEST_CASE("text regions are masked unless recognized text is judged safe", "[schedule]") {
   const Rect safe{0, 0, 50, 10};
   const Rect secret{0, 20, 50, 10};
@@ -467,6 +547,70 @@ TEST_CASE("a resize with a cycle in flight only grows masks", "[schedule]") {
     CHECK(out[i].action == FallbackAction::None);
     CHECK(covered_by(out[i].plan, box1080));
   }
+}
+
+TEST_CASE("a result that lands after a resize keeps its scaled margin", "[schedule]") {
+  // 720p -> 1080p is exactly 1.5x. The 720p mask of {100,100,20,20} with a
+  // 4 px margin is {96,96,28,28}; scaled, {144,144,42,42}, ending at 186.
+  const Rect box720{100, 100, 20, 20};
+  const Rect scaled_mask{144, 144, 42, 42};
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 500ms;
+  config.tracker.hold = 750ms;
+  config.tracker.margin_px = 4.0F;
+  config.tracker.margin_ratio = 0.0F;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([=](Timestamp, Size s) {
+                                    std::vector<Detection> out;
+                                    if (s == k720) {
+                                      out.push_back(face_at(box720.x, box720.y, box720.width, box720.height));
+                                    }
+                                    return out;  // gone at 1080p
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  sim.push(1000, false, k720);
+  sim.push(1100, true, k720);
+  auto [job, result] = sim.run();  // in flight at 720p
+  sim.push(1110, false, k1080);
+  sim.la.complete(job, result);  // lands after the resize
+  sim.push(1200, true, k1080);
+  sim.scan_now();  // an empty 1080p cycle covers 1110 and 1200
+  const auto out = sim.release_at(1800);
+  REQUIRE(out.size() == 4);
+  for (std::size_t i = 2; i < 4; ++i) {
+    INFO("frame " << i);
+    CHECK(out[i].action == FallbackAction::None);
+    CHECK(covered_by(out[i].plan, scaled_mask));
+  }
+  // The retroactive rects of 720p frames keep the unscaled mask too.
+  CHECK(covered_by(out[0].plan, Rect{96, 96, 28, 28}));
+}
+
+TEST_CASE("a result that cannot be applied fails closed every frame it could mask", "[schedule]") {
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;  // retro 100 ms, hold 200 ms
+  Sim sim(config, spg::ScanStages{nothing(), nullptr, nullptr, nullptr});
+  sim.push(1000, true);
+  sim.scan_now();  // an empty cycle covers 1000
+  sim.push(1050, true);
+  auto [job, result] = sim.run();
+  // A complete result the tracker rejects (it validates every box first):
+  // the stand-in for any failure while applying, such as bad_alloc. Its
+  // valid box would have masked 1000 retroactively and later frames by hold.
+  result.detections = {face_at(10, 10, 20, 20), face_at(10, 10, -5, 5)};
+  sim.la.complete(job, result);
+  CHECK(sim.la.stats().scans_failed == 1);
+  CHECK(sim.la.stats().scans_completed == 1);
+  sim.push(1100, true);  // within the hold after 1050
+  sim.scan_now();
+  sim.push(1300, true);  // past it
+  sim.scan_now();
+  const auto out = sim.release_at(1900);
+  REQUIRE(out.size() == 4);
+  CHECK(out[0].reason == FallbackReason::ApplyFailed);  // covered before, now missing a box
+  CHECK(out[1].reason == FallbackReason::ApplyFailed);
+  CHECK(out[2].reason == FallbackReason::ApplyFailed);
+  CHECK(out[3].action == FallbackAction::None);
 }
 
 TEST_CASE("a size round trip starts new content that old cycles do not cover", "[schedule]") {

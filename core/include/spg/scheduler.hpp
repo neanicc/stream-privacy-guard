@@ -41,8 +41,10 @@ class Scheduler {
   [[nodiscard]] bool wants_scan(Timestamp t) const;
 
   // Buffers a frame (see Lookahead::push). When `readback` is given and the
-  // cadence allows, copies it (outside the lock) and queues a scan; an
-  // invalid readback or a failed copy just skips the scan. Throws
+  // cadence allows, copies it (outside the lock) and queues a scan for the
+  // buffered frame whose timestamp equals readback->timestamp (this frame,
+  // or an earlier one when the readback lags); an invalid readback, a failed
+  // copy or a readback of no buffered frame just skips the scan. Throws
   // ContractError for a zero source size.
   FrameId push(Timestamp t, Size source, const FrameView* readback = nullptr);
 

@@ -13,6 +13,7 @@
 
 #include "spg/category.hpp"
 #include "spg/detection.hpp"
+#include "spg/error.hpp"
 #include "spg/frame.hpp"
 #include "spg/geometry.hpp"
 #include "spg/policy.hpp"
@@ -36,11 +37,15 @@ class Detector {
 
 // Adapts any type with `std::vector<Detection> detect(const FrameView&, Size)
 // const` (spg::detect::FaceDetector, spg::detect::TextDetector) without making
-// spg-core depend on the detectors.
+// spg-core depend on the detectors. Throws ContractError for a null `impl`.
 template <class Impl>
 class DetectorAdapter final : public Detector {
  public:
-  explicit DetectorAdapter(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {}
+  explicit DetectorAdapter(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {
+    if (impl_ == nullptr) {
+      throw ContractError("scan: DetectorAdapter needs a detector");
+    }
+  }
   [[nodiscard]] std::vector<Detection> detect(const FrameView& readback, Size source) const override {
     return impl_->detect(readback, source);
   }
@@ -71,21 +76,29 @@ class TextPolicy {
   [[nodiscard]] virtual Verdict evaluate(const Secret& text) const = 0;
 };
 
-// The SPG-08 PolicyEngine as a TextPolicy.
+// The SPG-08 PolicyEngine as a TextPolicy. Throws ContractError for a null
+// `engine`.
 class EnginePolicy final : public TextPolicy {
  public:
-  explicit EnginePolicy(std::shared_ptr<const PolicyEngine> engine) : engine_(std::move(engine)) {}
+  explicit EnginePolicy(std::shared_ptr<const PolicyEngine> engine) : engine_(std::move(engine)) {
+    if (engine_ == nullptr) {
+      throw ContractError("scan: EnginePolicy needs a policy engine");
+    }
+  }
   [[nodiscard]] Verdict evaluate(const Secret& text) const override { return engine_->evaluate(text); }
 
  private:
   std::shared_ptr<const PolicyEngine> engine_;
 };
 
-// What a worker runs. Any stage may be null:
+// What a worker runs:
 //   faces       run when `categories` contains Face;
 //   text        run when `categories` contains any text category;
 //   recognizer  reads each text region; without one every region is masked;
 //   policy      judges recognized text; without one every region is masked.
+// A detector may be null only when its categories are disabled: a null
+// detector for an enabled category cannot scan for it, so every cycle fails
+// (ScanFailure::MissingStage) and frames get the fallback.
 // Shared ownership keeps stages alive for a worker still inside a stage call
 // when its scheduler shuts down.
 struct ScanStages {
@@ -132,11 +145,20 @@ struct ScanJob {
   std::uint64_t segment = 0;     // which content (changes on resize or discontinuity)
 };
 
-enum class ScanFailure : std::uint8_t { None, FaceDetector, TextDetector, Recognizer, Policy, InvalidOutput };
+enum class ScanFailure : std::uint8_t {
+  None,
+  FaceDetector,
+  TextDetector,
+  Recognizer,
+  Policy,
+  InvalidOutput,
+  MissingStage,  // an enabled category has no detector
+};
 
 struct ScanResult {
-  // True only when every stage that ran finished and returned valid output.
-  // An incomplete cycle covers no frame.
+  // True only when every enabled category had its detector, and every stage
+  // that ran finished and returned valid output. An incomplete cycle covers
+  // no frame.
   bool complete = false;
   ScanFailure failure = ScanFailure::None;
   // Source-space boxes to mask, in the job's source size: faces, and text

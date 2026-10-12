@@ -90,7 +90,7 @@ struct Pending {
 // Totals over every scene, so the run shows each path was exercised.
 struct Totals {
   std::uint64_t clean = 0, fallback = 0, reemits = 0, late = 0, bad = 0, early = 0, retro_checks = 0,
-                hold_checks = 0, resized_scenes = 0;
+                hold_checks = 0, resized_scenes = 0, lagged_scans = 0;
 };
 
 struct Scene {
@@ -137,7 +137,11 @@ void run_scene(std::uint32_t seed, Totals& totals) {
   const int resize_at = s.chance(0.3) ? static_cast<int>(s.pick(10, frames - 10)) : -1;
   const int switch_at = s.chance(0.15) ? static_cast<int>(s.pick(10, frames - 10)) : -1;
   const bool bad_frames = s.chance(0.1);
-  totals.resized_scenes += (resize_at >= 0 && size_a != size_b) ? 1 : 0;
+  // Readbacks that lag one frame, as a mapped stage surface does.
+  const bool lagged_readbacks = s.chance(0.3);
+  if (resize_at >= 0 && size_a != size_b) {
+    ++totals.resized_scenes;
+  }
   const double fail_rate = s.chance(0.5) ? 0.2 : 0.0;
   const double stall_rate = s.chance(0.3) ? 0.1 : 0.0;
   const std::int64_t max_work_ms = std::max<std::int64_t>(5, 2 * lookahead_ms);
@@ -176,7 +180,6 @@ void run_scene(std::uint32_t seed, Totals& totals) {
   Size size = size_a;
   std::int64_t now_ms = 1000;
   std::int64_t last_good_ms = -1;
-  const auto readback = spg::OwnedFrame::copy(spg_test::TinyFrame(at_ms(0)).view());
 
   const auto finish_due = [&](bool all_ready) {
     // Return workers that are done, in random order.
@@ -230,9 +233,9 @@ void run_scene(std::uint32_t seed, Totals& totals) {
         ++totals.clean;
       } else {
         ++totals.fallback;
-        totals.late += r.reason == spg::FallbackReason::LateRelease ? 1 : 0;
-        totals.bad += r.reason == spg::FallbackReason::BadTimestamp ? 1 : 0;
-        totals.reemits += r.action == FallbackAction::HoldLastScanned ? 1 : 0;
+        totals.late += r.reason == spg::FallbackReason::LateRelease ? 1U : 0U;
+        totals.bad += r.reason == spg::FallbackReason::BadTimestamp ? 1U : 0U;
+        totals.reemits += r.action == FallbackAction::HoldLastScanned ? 1U : 0U;
         switch (config.fallback) {
           case FallbackMode::BlurSource:
             REQUIRE(r.action == FallbackAction::BlurSource);
@@ -301,8 +304,16 @@ void run_scene(std::uint32_t seed, Totals& totals) {
       t_ms = s.chance(0.5) ? now_ms + 5000 : (last_good_ms >= 0 ? last_good_ms : now_ms - 5000);
       bad = true;
     }
-    const bool scan = s.chance(0.7);
-    const spg::FrameId id = la.push(at_ms(t_ms), size, scan ? readback : nullptr);
+    std::shared_ptr<const spg::OwnedFrame> readback;
+    const std::int64_t shown_ms = lagged_readbacks && last_good_ms >= 0 ? last_good_ms : t_ms;
+    if (s.chance(0.7)) {
+      readback = spg::OwnedFrame::copy(spg_test::TinyFrame(at_ms(shown_ms)).view());
+    }
+    const std::uint64_t queued_before = la.stats().scans_queued;
+    const spg::FrameId id = la.push(at_ms(t_ms), size, readback);
+    if (la.stats().scans_queued != queued_before && shown_ms != t_ms) {
+      ++totals.lagged_scans;  // queued for the earlier frame the readback shows
+    }
     pushed[id] = PushedFrame{t_ms, size, segment, bad};
     if (!bad) {
       last_good_ms = t_ms;
@@ -351,6 +362,7 @@ TEST_CASE("no frame is released without a complete scan or the fallback, and mas
   CHECK(totals.retro_checks > 1000);
   CHECK(totals.hold_checks > 1000);
   CHECK(totals.resized_scenes > 100);
+  CHECK(totals.lagged_scans > 1000);
   UNSCOPED_INFO("clean " << totals.clean << " fallback " << totals.fallback << " reemits " << totals.reemits
                          << " late " << totals.late << " bad " << totals.bad << " early " << totals.early
                          << " retro " << totals.retro_checks << " hold " << totals.hold_checks);

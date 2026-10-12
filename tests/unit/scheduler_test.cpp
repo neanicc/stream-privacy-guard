@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -36,13 +37,16 @@ using spg_test::at_ms;
 
 constexpr Size k720{1280, 720};
 
-SchedulerConfig threaded_config() {
+// Enables only `category`, so a test can leave out the other detector.
+SchedulerConfig threaded_config(spg::Category category = spg::Category::Face) {
   SchedulerConfig config;
   config.lookahead = 100ms;
   config.retro = 100ms;
   config.tracker.hold = 200ms;
   config.workers = 2;
   config.shutdown_timeout = 5s;
+  config.scan.categories = spg::CategorySet{};
+  config.scan.categories.insert(category);
   return config;
 }
 
@@ -60,11 +64,17 @@ bool eventually(Pred done, std::chrono::milliseconds timeout = 10s) {
 }
 
 // Runs `f` on another thread and requires it to return within `timeout`:
-// the render thread must never wait on inference.
+// the render thread must never wait on inference. On a timeout, `unblock`
+// releases the stalled stage first, so the failing test ends instead of
+// hanging in the future's destructor.
 template <class F>
-void returns_promptly(F f, std::chrono::milliseconds timeout = 5s) {
+void returns_promptly(F f, const std::function<void()>& unblock, std::chrono::milliseconds timeout = 5s) {
   auto done = std::async(std::launch::async, f);
-  REQUIRE(done.wait_for(timeout) == std::future_status::ready);
+  const bool ready = done.wait_for(timeout) == std::future_status::ready;
+  if (!ready) {
+    unblock();
+  }
+  REQUIRE(ready);
   done.get();
 }
 
@@ -130,7 +140,7 @@ TEST_CASE("a stalled detector never blocks the render thread and its frames fail
       scheduler->release_due(out);
       (void)scheduler->stats();
     }
-  });
+  }, [&] { gate->open(); });
   REQUIRE(out.size() == 41);  // frames 1000 .. 1400 are due by 1500
   for (const ReleasedFrame& r : out) {
     CHECK(r.plan.fallback);
@@ -195,7 +205,7 @@ TEST_CASE("a policy that overruns the deadline fails the frame closed", "[schedu
   const auto recognizer =
       std::make_shared<spg_test::ScriptedRecognizer>([](const Detection&) { return std::string("SECRET"); });
   const auto slow = std::make_shared<spg_test::ScriptedPolicy>([gate] { gate->wait(); });
-  SchedulerConfig config = threaded_config();
+  SchedulerConfig config = threaded_config(spg::Category::Watchlist);
   config.workers = 1;
   spg::Scheduler scheduler(clock, config, spg::ScanStages{nullptr, regions, recognizer, slow});
   const spg_test::TinyFrame frame(at_ms(1000));
@@ -203,7 +213,7 @@ TEST_CASE("a policy that overruns the deadline fails the frame closed", "[schedu
   REQUIRE(gate->wait_for_waiter(10s));
   std::vector<ReleasedFrame> out;
   clock.set(at_ms(1100));
-  returns_promptly([&] { scheduler.release_due(out); });
+  returns_promptly([&] { scheduler.release_due(out); }, [&] { gate->open(); });
   REQUIRE(out.size() == 1);
   CHECK(out[0].plan.fallback);
   gate->open();
@@ -228,6 +238,32 @@ TEST_CASE("the scheduler rejects bad configs and sizes", "[schedule][threads]") 
   scheduler.release_due(out);
   REQUIRE(out.size() == 1);
   CHECK(out[0].plan.fallback);
+}
+
+TEST_CASE("a scheduler missing an enabled detector fails every frame closed", "[schedule][threads]") {
+  spg_test::AtomicClock clock(at_ms(1000));
+  SchedulerConfig config = threaded_config();
+  config.scan.categories = spg::CategorySet::all();
+  const auto faces =
+      std::make_shared<spg_test::ScriptedDetector>([](Timestamp, Size) { return std::vector<Detection>{}; });
+  spg::Scheduler scheduler(clock, config, spg::ScanStages{faces, nullptr, nullptr, nullptr});  // no text
+  for (std::int64_t t = 1000; t < 1100; t += 10) {
+    clock.set(at_ms(t));
+    const spg_test::TinyFrame frame(at_ms(t));
+    const std::uint64_t before = scheduler.stats().scans_failed;
+    scheduler.push(at_ms(t), k720, &frame.view());
+    REQUIRE(eventually([&] { return scheduler.stats().scans_failed > before; }));
+  }
+  std::vector<ReleasedFrame> out;
+  clock.set(at_ms(1300));
+  scheduler.release_due(out);
+  REQUIRE(out.size() == 10);
+  for (const ReleasedFrame& r : out) {
+    CHECK(r.action == FallbackAction::BlurSource);
+    CHECK(r.reason == spg::FallbackReason::NotScanned);
+  }
+  CHECK(scheduler.stats().scans_completed == 0);
+  CHECK(faces->calls == 0);
 }
 
 TEST_CASE("an owned frame copies every plane tightly", "[schedule]") {
