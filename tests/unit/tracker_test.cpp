@@ -85,6 +85,19 @@ bool no_shrink(const std::vector<Box>& before, const std::vector<Box>& after) {
                      [&](const Box& b) { return covered(after, region_of(b.rect)); });
 }
 
+Region scaled(const Region& g, double sx, double sy) {
+  return {g.x0 * sx, g.y0 * sy, g.x1 * sx, g.y1 * sy};
+}
+
+// Every rect of `before`, scaled by (sx, sy) in double, is contained in some
+// rect of `after`: what was blurred before a resize stays blurred after it.
+bool no_shrink_scaled(const std::vector<Box>& before, const std::vector<Box>& after, double sx,
+                      double sy) {
+  return std::all_of(before.begin(), before.end(), [&](const Box& b) {
+    return covered(after, scaled(region_of(b.rect), sx, sy));
+  });
+}
+
 void require_source_boxes(const std::vector<Box>& masks) {
   for (const Box& b : masks) {
     REQUIRE(b.space == Space::Source);
@@ -134,6 +147,8 @@ TEST_CASE("tracker: config comes from the policy and is validated", "[tracker]")
   rejects([](TrackerConfig& c) { c.iou_threshold = 1.5F; });
   rejects([](TrackerConfig& c) { c.velocity_smoothing = 0.0F; });
   rejects([](TrackerConfig& c) { c.velocity_smoothing = std::nanf(""); });
+  rejects([](TrackerConfig& c) { c.max_rects_per_track = 0; });
+  rejects([](TrackerConfig& c) { c.max_rects_per_track = 1025; });
 
   // Zero hold and margin are accepted here (a floor is #28).
   TrackerConfig zero;
@@ -328,6 +343,82 @@ TEST_CASE("tracker: a resize keeps the old masks and adds scaled ones", "[tracke
   CHECK(tracker.tracks().size() == 1);
 }
 
+TEST_CASE("tracker: an upscale keeps the scaled margin and rounding", "[tracker]") {
+  ManualClock clock;
+  const TrackerConfig config;  // 4 px + 0.25 * min(w, h)
+  Tracker tracker(clock, config);
+  tracker.update(at_ms(0), std::vector<Detection>{face(0.0F, 0.0F, 40.0F, 40.0F)});
+  const std::vector<Box> before = tracker.masks(at_ms(100));
+  REQUIRE(before.size() == 1);
+  CHECK(before[0].rect == Rect{-14.0F, -14.0F, 68.0F, 68.0F});
+
+  // 2x: the old mask [-14, 54] scales to [-28, 108]. A fresh margin on the
+  // scaled box (4 + 0.25 * 80 = 24, so [-24, 104]) would uncover 4 px a side.
+  tracker.rescale(Size{960, 540}, Size{1920, 1080});
+  const std::vector<Box> after = tracker.masks(at_ms(100));
+  CHECK(no_shrink_scaled(before, after, 2.0, 2.0));
+  CHECK(covered(after, {-28.0, -28.0, 108.0, 108.0}));
+  CHECK(no_shrink(before, after));
+
+  // A second, anisotropic resize keeps the twice-scaled masks too, and a
+  // moving track keeps its scaled prediction.
+  Tracker moving(clock, config);
+  moving.update(at_ms(0), std::vector<Detection>{face(101.3F, 57.9F, 33.0F, 21.0F)});
+  moving.update(at_ms(100), std::vector<Detection>{face(131.3F, 47.9F, 33.0F, 21.0F)});
+  const std::vector<Box> m0 = moving.masks(at_ms(400));
+  moving.rescale(Size{1280, 720}, Size{1920, 1080});
+  const std::vector<Box> m1 = moving.masks(at_ms(400));
+  CHECK(no_shrink_scaled(m0, m1, 1.5, 1.5));
+  moving.rescale(Size{1920, 1080}, Size{2560, 1080});
+  const std::vector<Box> m2 = moving.masks(at_ms(400));
+  CHECK(no_shrink_scaled(m1, m2, 4.0 / 3.0, 1.0));
+  CHECK(no_shrink_scaled(m0, m2, 2.0, 1.5));
+}
+
+TEST_CASE("tracker: a long hold stays within the rect cap and keeps coverage", "[tracker]") {
+  // 60 s hold, detected at 10 Hz while moving 150 px/s: 600 held detections
+  // whose masks do not contain each other.
+  ManualClock clock;
+  TrackerConfig config;
+  config.hold = milliseconds{60'000};
+  config.margin_px = 0.0F;
+  config.margin_ratio = 0.0F;
+  Tracker tracker(clock, config);
+  std::vector<Detection> fed;
+  for (int i = 0; i < 600; ++i) {
+    clock.set(at_ms(100 * i));
+    const Detection d = face(15.0F * static_cast<float>(i), 0.0F, 30.0F, 30.0F);
+    tracker.update(at_ms(100 * i), std::vector<Detection>{d});
+    fed.push_back(d);
+  }
+  REQUIRE(tracker.tracks().size() == 1);
+  std::vector<Box> reused;
+  for (const std::int64_t ms : {0, 3'000, 29'950, 59'900, 60'050, 119'900}) {
+    INFO("t " << ms << " ms");
+    const std::vector<Box> masks = tracker.masks(at_ms(ms));
+    CHECK(masks.size() <= config.max_rects_per_track);
+    require_source_boxes(masks);
+    for (std::size_t i = 0; i < fed.size(); ++i) {
+      const Timestamp seen = at_ms(100 * static_cast<std::int64_t>(i));
+      if (at_ms(ms) >= seen && at_ms(ms) <= seen + config.hold) {
+        CHECK(covered(masks, required(fed[i].box.rect, config)));
+      }
+    }
+    // The buffer overload returns the same rects and reuses the buffer.
+    tracker.masks(at_ms(ms), reused);
+    CHECK(reused == masks);
+  }
+
+  // One rect per track when capped at 1.
+  config.max_rects_per_track = 1;
+  Tracker single(clock, config);
+  single.update(at_ms(59'800), std::vector<Detection>{face(0.0F, 0.0F, 30.0F, 30.0F)});
+  single.update(at_ms(59'900), std::vector<Detection>{face(15.0F, 0.0F, 30.0F, 30.0F)});
+  const std::vector<Box> one = single.masks(at_ms(59'900));
+  REQUIRE(one.size() == 1);
+  CHECK(covered(one, {0.0, 0.0, 45.0, 30.0}));
+}
+
 // --- Property tests --------------------------------------------------------
 //
 // Seeded random scenes: several objects of both kinds moving at constant or
@@ -373,6 +464,7 @@ class Scene {
     c.iou_threshold = static_cast<float>(uniform(0.1, 0.7));
     c.velocity_smoothing = static_cast<float>(uniform(0.2, 1.0));
     c.max_prediction = milliseconds{uniform_int(0, 800)};
+    c.max_rects_per_track = static_cast<std::size_t>(uniform_int(1, 12));
     return c;
   }
 
@@ -395,9 +487,10 @@ class Scene {
 };
 
 // Coverage the hold guarantees for `fed` in the current coordinates: its own
-// box, grown by the margin, and (after a resize) the scaled box too. The
-// scaled region is computed in double from the original box so float rounding
-// of the expectation cannot hide a shrink.
+// box, grown by the margin, and (after a resize) the scaled box grown by its
+// own margin and the old region scaled with its margin. The scaled regions are
+// computed in double from the original box so float rounding of the
+// expectation cannot hide a shrink.
 std::vector<Region> expected_regions(const Fed& fed, double sx, double sy,
                                      const TrackerConfig& config) {
   std::vector<Region> out{required(fed.box, config)};
@@ -410,6 +503,7 @@ std::vector<Region> expected_regions(const Fed& fed, double sx, double sy,
     const double m = static_cast<double>(config.margin_px) +
                      static_cast<double>(config.margin_ratio) * std::min(x1 - x0, y1 - y0);
     out.push_back({x0 - m, y0 - m, x1 + m, y1 + m});
+    out.push_back(scaled(required(fed.box, config), sx, sy));
   }
   return out;
 }
@@ -434,6 +528,8 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
     double sx = 1.0;
     double sy = 1.0;
     int next_cycle = 0;
+    bool fed_fresh = false;  // a detection was delivered on its own frame
+    int monotone_checks = 0;  // non-empty monotone-in-time comparisons
 
     for (int f = 0; f < frames; ++f) {
       const Timestamp frame_time = spg::timestamp_from_ns(kFrameNs * f);
@@ -469,6 +565,8 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
         sy = static_cast<double>(std::lround(1080.0 * sy)) / 1080.0;
         REQUIRE(no_shrink(before, tracker.masks(probe)));
         REQUIRE(no_shrink(before_now, tracker.masks(frame_time)));
+        REQUIRE(no_shrink_scaled(before, tracker.masks(probe), sx, sy));
+        REQUIRE(no_shrink_scaled(before_now, tracker.masks(frame_time), sx, sy));
         for (Object& o : objects) {
           o.x *= sx;
           o.w *= sx;
@@ -537,6 +635,7 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
         }
         for (const Detection& d : batch) {
           fed.push_back(Fed{d.box.rect, when});
+          fed_fresh = fed_fresh || when == frame_time;
         }
       }
 
@@ -548,6 +647,7 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
         const Timestamp t = oldest + scene.within(config.retain + config.hold);
         const std::vector<Box> masks = tracker.masks(t);
         require_source_boxes(masks);
+        REQUIRE(masks.size() <= tracker.tracks().size() * config.max_rects_per_track);
         for (std::size_t i = 0; i < fed.size(); ++i) {
           if (t < fed[i].seen || t > fed[i].seen + config.hold) {
             continue;
@@ -558,22 +658,41 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
           }
         }
       }
-    }
 
-    // After the scene: freeze retention and check monotonic growth along
-    // frame time between hold expiries of the detections active at t.
-    clock.set(Timestamp{});
-    for (int k = 0; k < 60; ++k) {
-      const Timestamp t = Timestamp{} + scene.within(Duration{kFrameNs * frames});
-      Timestamp limit = t + milliseconds{2000};
-      for (const Fed& fd : fed) {
-        if (fd.seen <= t && t <= fd.seen + config.hold) {
-          limit = std::min(limit, fd.seen + config.hold);
+      // Monotone in frame time, checked while the tracker still holds every
+      // detection the window can see (nothing seen + hold >= oldest has been
+      // pruned): from a t inside a retained detection's hold to a t2 before
+      // any detection active at t expires, masks only grow.
+      std::vector<std::size_t> live;
+      for (std::size_t i = 0; i < fed.size(); ++i) {
+        if (fed[i].seen + config.hold >= oldest) {
+          live.push_back(i);
         }
       }
-      const Timestamp t2 = t + scene.within(limit - t);
-      INFO("t " << spg::to_ns(t) << " -> " << spg::to_ns(t2));
-      REQUIRE(no_shrink(tracker.masks(t), tracker.masks(t2)));
+      for (int k = 0; k < 2 && !live.empty(); ++k) {
+        const int pick = scene.uniform_int(0, static_cast<int>(live.size()) - 1);
+        const Fed& anchor = fed[live[static_cast<std::size_t>(pick)]];
+        const Timestamp lo = std::max(anchor.seen, oldest);
+        const Timestamp t = lo + scene.within(anchor.seen + config.hold - lo);
+        Timestamp limit = t + milliseconds{2000};
+        for (const Fed& fd : fed) {
+          if (fd.seen <= t && t <= fd.seen + config.hold) {
+            limit = std::min(limit, fd.seen + config.hold);
+          }
+        }
+        const Timestamp t2 = t + scene.within(limit - t);
+        INFO("frame " << f << ", t " << spg::to_ns(t) << " -> " << spg::to_ns(t2));
+        const std::vector<Box> at_t = tracker.masks(t);
+        REQUIRE_FALSE(at_t.empty());
+        REQUIRE(no_shrink(at_t, tracker.masks(t2)));
+        ++monotone_checks;
+      }
+    }
+
+    // A positive retention window saw at least one detection delivered on
+    // its own frame, so the monotone check above compared real masks.
+    if (fed_fresh && config.hold + config.retain >= milliseconds{120}) {
+      REQUIRE(monotone_checks > 0);
     }
   }
 }

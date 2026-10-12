@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <tuple>
 #include <utility>
@@ -91,6 +92,52 @@ float to_velocity(double v) noexcept {
   return static_cast<float>(std::clamp(v, -kFloatMax, kFloatMax));
 }
 
+// The largest float at most `v` and the smallest float at least `v` (clamped
+// to the float range), so a scaled velocity range never narrows by rounding.
+float velocity_down(double v) noexcept {
+  float f = to_velocity(v);
+  if (static_cast<double>(f) > v) {
+    f = std::nextafter(f, -kInf);
+  }
+  return f;
+}
+float velocity_up(double v) noexcept {
+  float f = to_velocity(v);
+  if (static_cast<double>(f) < v) {
+    f = std::nextafter(f, kInf);
+  }
+  return f;
+}
+
+// Hull of two whole-pixel rects; exact, since their edges are integers.
+Rect hull(const Rect& a, const Rect& b) noexcept {
+  return pixel_rect(std::min(static_cast<double>(a.x), static_cast<double>(b.x)),
+                    std::min(static_cast<double>(a.y), static_cast<double>(b.y)),
+                    std::max(static_cast<double>(a.x) + static_cast<double>(a.width),
+                             static_cast<double>(b.x) + static_cast<double>(b.width)),
+                    std::max(static_cast<double>(a.y) + static_cast<double>(a.height),
+                             static_cast<double>(b.y) + static_cast<double>(b.height)));
+}
+
+// An unused bucket slot in masks(); real mask rects never have a negative
+// width.
+constexpr Rect kNoRect{0.0F, 0.0F, -1.0F, -1.0F};
+
+bool is_slot_empty(const Rect& r) noexcept {
+  return r.width < 0.0F;
+}
+
+// Floor division for possibly negative nanosecond counts; `b` is positive.
+std::int64_t floor_div(std::int64_t a, std::int64_t b) noexcept {
+  std::int64_t q = a / b;
+  if (a % b != 0 && a < 0) {
+    --q;
+  }
+  return q;
+}
+
+constexpr std::size_t kMaxRectsPerTrackLimit = 1024;
+
 }  // namespace
 
 TrackerConfig TrackerConfig::from_policy(const PolicyConfig& policy) {
@@ -123,6 +170,9 @@ void validate(const TrackerConfig& config) {
   }
   if (!(config.velocity_smoothing > 0.0F && config.velocity_smoothing <= 1.0F)) {
     throw ContractError("tracker config: velocity_smoothing must be in (0, 1]");
+  }
+  if (config.max_rects_per_track < 1 || config.max_rects_per_track > kMaxRectsPerTrackLimit) {
+    throw ContractError("tracker config: max_rects_per_track must be in [1, 1024]");
   }
 }
 
@@ -193,7 +243,7 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     state.track.last_confirmed = frame_time;
     state.track.hold_until = frame_time + config_.hold;
     state.track.kind = detection.kind;
-    state.held.push_back(Held{detection.box.rect, frame_time, {}, {}});
+    state.held.push_back(make_held(detection.box.rect, frame_time, Velocity{}));
     tracks_.push_back(std::move(state));
   }
 
@@ -205,7 +255,7 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
   if (frame_time <= track.last_confirmed) {
     // Late or same-frame detection: it holds, predicted at the track's
     // current velocity, but does not move the track.
-    state.held.push_back(Held{box, frame_time, track.velocity, track.velocity});
+    state.held.push_back(make_held(box, frame_time, track.velocity));
     return;
   }
   const double dt = seconds(frame_time - track.last_confirmed);
@@ -224,52 +274,96 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
   track.box = Box{box, Space::Source};
   track.last_confirmed = frame_time;
   track.hold_until = frame_time + config_.hold;
-  state.held.push_back(Held{box, frame_time, track.velocity, track.velocity});
+  state.held.push_back(make_held(box, frame_time, track.velocity));
+}
+
+Tracker::Held Tracker::make_held(const Rect& box, Timestamp seen,
+                                 Velocity velocity) const noexcept {
+  const double margin =
+      static_cast<double>(config_.margin_px) +
+      static_cast<double>(config_.margin_ratio) *
+          std::min(static_cast<double>(box.width), static_cast<double>(box.height));
+  return Held{box, seen, velocity, velocity, margin, margin};
 }
 
 Rect Tracker::mask_rect(const Held& held, Timestamp t) const noexcept {
   const double dt = seconds(std::clamp(t - held.seen, Duration::zero(), config_.max_prediction));
   const Rect& b = held.box;
-  const double margin = static_cast<double>(config_.margin_px) +
-                        static_cast<double>(config_.margin_ratio) *
-                            std::min(static_cast<double>(b.width), static_cast<double>(b.height));
   // Hull of the box and every box moved by a velocity in [low, high] for dt.
   const double x0 = static_cast<double>(b.x) +
-                    std::min(0.0, static_cast<double>(held.low.dx_per_s) * dt) - margin;
+                    std::min(0.0, static_cast<double>(held.low.dx_per_s) * dt) - held.margin_x;
   const double y0 = static_cast<double>(b.y) +
-                    std::min(0.0, static_cast<double>(held.low.dy_per_s) * dt) - margin;
+                    std::min(0.0, static_cast<double>(held.low.dy_per_s) * dt) - held.margin_y;
   const double x1 = static_cast<double>(b.x) + static_cast<double>(b.width) +
-                    std::max(0.0, static_cast<double>(held.high.dx_per_s) * dt) + margin;
+                    std::max(0.0, static_cast<double>(held.high.dx_per_s) * dt) + held.margin_x;
   const double y1 = static_cast<double>(b.y) + static_cast<double>(b.height) +
-                    std::max(0.0, static_cast<double>(held.high.dy_per_s) * dt) + margin;
+                    std::max(0.0, static_cast<double>(held.high.dy_per_s) * dt) + held.margin_y;
   return pixel_rect(x0, y0, x1, y1);
 }
 
 std::vector<Box> Tracker::masks(Timestamp t) const {
   std::vector<Box> out;
-  std::vector<Rect> rects;
+  masks(t, out);
+  return out;
+}
+
+void Tracker::masks(Timestamp t, std::vector<Box>& out) const {
+  out.clear();
+  // Fixed time buckets: a detection seen at `seen` falls in bucket
+  // floor(seen / width). Detections active at t were seen in [t - hold, t],
+  // which spans at most ceil(hold / width) + 1 <= slots buckets. Bucket
+  // membership never changes, so a bucket's hull only grows as detections
+  // are added or t advances, like the rects it merges.
+  const std::size_t slots = config_.max_rects_per_track;
+  std::int64_t width = 1;
+  if (slots > 1) {
+    const auto n = static_cast<std::int64_t>(slots - 1);
+    width = std::max<std::int64_t>(1, (config_.hold.count() + n - 1) / n);
+  }
+  const std::int64_t first =
+      slots > 1 ? floor_div((t - config_.hold).time_since_epoch().count(), width) : 0;
+
   for (const TrackState& state : tracks_) {
-    rects.clear();
+    const std::size_t start = out.size();
+    out.resize(start + slots, Box{kNoRect, Space::Source});
     for (const Held& held : state.held) {
-      if (t >= held.seen && t <= held.seen + config_.hold) {
-        rects.push_back(mask_rect(held, t));
+      if (t < held.seen || t > held.seen + config_.hold) {
+        continue;
       }
+      const std::int64_t bucket =
+          slots > 1 ? floor_div(held.seen.time_since_epoch().count(), width) - first : 0;
+      // Always in [0, slots) by the bound above; the clamp only guards the
+      // buffer (merging into a neighbor would still keep the coverage).
+      const std::size_t slot = std::min(static_cast<std::size_t>(std::max<std::int64_t>(0, bucket)),
+                                        slots - 1);
+      Rect& r = out[start + slot].rect;
+      const Rect m = mask_rect(held, t);
+      r = is_slot_empty(r) ? m : hull(r, m);
     }
     // Leave out a rect another one contains; of two equal rects keep the
-    // first. The union is unchanged.
-    for (std::size_t i = 0; i < rects.size(); ++i) {
-      bool redundant = false;
-      for (std::size_t j = 0; j < rects.size() && !redundant; ++j) {
-        if (i != j && contains(rects[j], rects[i]) && (j < i || !contains(rects[i], rects[j]))) {
-          redundant = true;
+    // first. Each dropped rect lies inside one still kept, so the union is
+    // unchanged.
+    for (std::size_t i = start; i < start + slots; ++i) {
+      Rect& ri = out[i].rect;
+      if (is_slot_empty(ri)) {
+        continue;
+      }
+      for (std::size_t j = start; j < start + slots; ++j) {
+        const Rect& rj = out[j].rect;
+        if (i != j && !is_slot_empty(rj) && contains(rj, ri) && (j < i || !contains(ri, rj))) {
+          ri = kNoRect;
+          break;
         }
       }
-      if (!redundant) {
-        out.push_back(Box{rects[i], Space::Source});
+    }
+    std::size_t kept = start;
+    for (std::size_t i = start; i < start + slots; ++i) {
+      if (!is_slot_empty(out[i].rect)) {
+        out[kept++] = out[i];
       }
     }
+    out.resize(kept);
   }
-  return out;
 }
 
 void Tracker::rescale(Size from, Size to) {
@@ -287,10 +381,15 @@ void Tracker::rescale(Size from, Size to) {
     return Velocity{to_velocity(static_cast<double>(v.dx_per_s) * sx),
                     to_velocity(static_cast<double>(v.dy_per_s) * sy)};
   };
+  const double margin_px = static_cast<double>(config_.margin_px);
+  const double margin_ratio = static_cast<double>(config_.margin_ratio);
   for (TrackState& state : tracks_) {
     for (Held& held : state.held) {
       // One held box covering both the old and the scaled box, predicted
       // over both velocity ranges, so nothing it covered before is lost.
+      // The old mask, scaled, is the scaled box grown by the scaled margin
+      // plus less than one scaled pixel of outward rounding; the margin grows
+      // to cover that, and to at least the margin of the merged box.
       const Rect s = scaled(held.box);
       const Rect& o = held.box;
       const double x0 = std::min(static_cast<double>(o.x), static_cast<double>(s.x));
@@ -299,13 +398,20 @@ void Tracker::rescale(Size from, Size to) {
                                  static_cast<double>(s.x) + static_cast<double>(s.width));
       const double y1 = std::max(static_cast<double>(o.y) + static_cast<double>(o.height),
                                  static_cast<double>(s.y) + static_cast<double>(s.height));
-      const Velocity low = scaled_velocity(held.low);
-      const Velocity high = scaled_velocity(held.high);
       held.box = narrow_rect(x0, y0, x1, y1);
-      held.low = Velocity{std::min(held.low.dx_per_s, low.dx_per_s),
-                          std::min(held.low.dy_per_s, low.dy_per_s)};
-      held.high = Velocity{std::max(held.high.dx_per_s, high.dx_per_s),
-                           std::max(held.high.dy_per_s, high.dy_per_s)};
+      const double fresh =
+          margin_px + margin_ratio * std::min(static_cast<double>(held.box.width),
+                                              static_cast<double>(held.box.height));
+      held.margin_x = std::max({held.margin_x, sx * (held.margin_x + 1.0), fresh});
+      held.margin_y = std::max({held.margin_y, sy * (held.margin_y + 1.0), fresh});
+      // Scaled velocities rounded outward, so the scaled prediction range
+      // never narrows by a float step.
+      held.low = Velocity{
+          std::min(held.low.dx_per_s, velocity_down(static_cast<double>(held.low.dx_per_s) * sx)),
+          std::min(held.low.dy_per_s, velocity_down(static_cast<double>(held.low.dy_per_s) * sy))};
+      held.high = Velocity{
+          std::max(held.high.dx_per_s, velocity_up(static_cast<double>(held.high.dx_per_s) * sx)),
+          std::max(held.high.dy_per_s, velocity_up(static_cast<double>(held.high.dy_per_s) * sy))};
     }
     // The track itself continues in the new coordinates.
     state.track.box = Box{scaled(state.track.box.rect), Space::Source};

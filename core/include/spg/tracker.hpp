@@ -36,6 +36,12 @@ struct TrackerConfig {
   // Constant-velocity prediction runs at most this far past a detection; the
   // predicted box then stops moving (it still holds until hold expiry).
   Duration max_prediction = std::chrono::milliseconds{500};
+  // Upper bound on the rects masks() returns per track. A track's held
+  // detections are merged, by the frame time they were seen on, into at most
+  // this many fixed time buckets of width ceil(hold / (n - 1)); each bucket
+  // yields the hull of its masks. Merging only adds coverage. 1 merges a
+  // track into one rect.
+  std::size_t max_rects_per_track = 8;
 
   // Hold, margin and retention (lookahead) from `policy`; the rest default.
   [[nodiscard]] static TrackerConfig from_policy(const PolicyConfig& policy);
@@ -45,7 +51,8 @@ struct TrackerConfig {
 
 // Throws ContractError naming the field when a value is out of range: a
 // negative duration, a negative or non-finite margin, an IoU threshold
-// outside (0, 1] or a smoothing weight outside (0, 1]. A zero hold or margin
+// outside (0, 1], a smoothing weight outside (0, 1] or a
+// max_rects_per_track outside [1, 1024]. A zero hold or margin
 // is accepted here; whether to impose a floor is #28 (SPG-08b).
 void validate(const TrackerConfig& config);
 
@@ -59,8 +66,13 @@ void validate(const TrackerConfig& config);
 //   * Prediction: on frame times after td the mask also covers b moved at the
 //     track's estimated velocity for min(t - td, max_prediction), as the hull
 //     of b and the moved box, so between detection cycles the mask only grows.
-//   * Updates only add: masks(t) after update() or rescale() contains every
-//     rect masks(t) returned before, for any t the retention still covers.
+//   * Updates only add: masks(t) after update() contains every rect masks(t)
+//     returned before, for any t the retention still covers.
+//   * Resize: after rescale(from, to), masks(t) contains every rect masks(t)
+//     returned before, both as it was and scaled to the new size (rounded
+//     outward), so content blurred before a resize stays blurred after it.
+//   * Bound: masks(t) returns at most max_rects_per_track rects per live
+//     track, in O(held + max_rects_per_track^2) work per track.
 //
 // Time is frame time (FrameClock nanoseconds). The injected Clock is read only
 // to drop detections whose hold ended more than `retain` ago. Not thread-safe:
@@ -79,15 +91,21 @@ class Tracker {
   // invalid or not in Source space. Then drops expired detections.
   void update(Timestamp frame_time, std::span<const Detection> detections);
 
-  // Source-space rects to mask on the frame with timestamp `t`. A rect that
-  // another rect of the same track contains is left out. Pure: does not read
-  // the clock or change state.
+  // Source-space rects to mask on the frame with timestamp `t`: per track, the
+  // hull of each time bucket's held masks (see max_rects_per_track). A rect
+  // that another rect of the same track contains is left out. Pure: does not
+  // read the clock or change state. Meant for the scheduler or a worker, not
+  // the OBS render path, which only composes precomputed masks.
   [[nodiscard]] std::vector<Box> masks(Timestamp t) const;
+  // As above, into `out` (cleared first), so a caller can reuse its buffer.
+  void masks(Timestamp t, std::vector<Box>& out) const;
 
-  // The source was resized from `from` to `to` pixels. Every held box gains a
-  // scaled copy (rounded outward) and keeps its old one, so masks only grow;
-  // tracks continue in the new coordinates. Throws ContractError when either
-  // size has a zero dimension.
+  // The source was resized from `from` to `to` pixels. Every held box becomes
+  // the hull of its old and scaled box, its margin grows to cover the scaled
+  // old margin plus the old outward rounding, and its velocity range widens to
+  // cover the scaled range, so masks cover both the old and the scaled old
+  // masks; tracks continue in the new coordinates. Throws ContractError when
+  // either size has a zero dimension.
   void rescale(Size from, Size to);
 
   // Drops detections whose hold ended more than `retain` before clock.now(),
@@ -102,13 +120,16 @@ class Tracker {
 
  private:
   // One detection held by a track: its box (Source), the frame time it was
-  // seen on and the range of velocities to predict over (per axis; equal
-  // unless a rescale widened it).
+  // seen on, the range of velocities to predict over (per axis; equal unless
+  // a rescale widened it) and the margin per axis (fixed when it was seen,
+  // grown only by a rescale).
   struct Held {
     Rect box;
     Timestamp seen{};
     Velocity low;
     Velocity high;
+    double margin_x = 0.0;
+    double margin_y = 0.0;
   };
   struct TrackState {
     Track track;
@@ -118,6 +139,7 @@ class Tracker {
 
   [[nodiscard]] Rect predicted(const Track& track, Timestamp t) const noexcept;
   void confirm(TrackState& state, Timestamp frame_time, const Rect& box);
+  [[nodiscard]] Held make_held(const Rect& box, Timestamp seen, Velocity velocity) const noexcept;
   [[nodiscard]] Rect mask_rect(const Held& held, Timestamp t) const noexcept;
 
   const Clock* clock_;

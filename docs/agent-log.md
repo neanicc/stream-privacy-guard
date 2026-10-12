@@ -371,3 +371,17 @@ Template:
   smoothing and prediction horizon, and whether margin should grow while a
   track coasts; IoU fails for objects moving more than about half their size per
   detection cycle (new track, still held, no prediction).
+- Review fixes: a 2x upscale shrank a held mask, because `rescale()` recomputed
+  the margin from the merged box and `margin_px` does not scale (a 40 px box's
+  `[-14, 54]`, scaled `[-28, 108]`, became `[-24, 104]`). Each held detection
+  now keeps its margin per axis, and a resize grows it to cover the scaled
+  margin plus one scaled pixel of rounding, with velocities rounded outward;
+  tests now require the scaled old masks after a resize. `masks()` merges each
+  track's held detections into at most `max_rects_per_track` (default 8) fixed
+  time buckets, so output and work stay bounded for long holds without removing
+  coverage, and gains a buffer overload. The monotone-in-time property check
+  moved into the scene, where nothing it compares has been pruned. Velocity is
+  still unbounded for very short confirmation intervals; that only over-blurs
+  and is left to SPG-12. A mutation check (fresh margin on resize, no rounding
+  slack, unstable bucket grouping, buckets without hulls, prediction shrinking
+  over time) made at least one tracker test fail for each mutation.
