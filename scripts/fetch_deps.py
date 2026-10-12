@@ -14,6 +14,7 @@ Standard library only. Called by `scripts/ci/run.sh setup`.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -26,7 +27,13 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 ROOT = Path(__file__).resolve().parent.parent
 MARKER = ".spg-fetch.json"
@@ -130,10 +137,51 @@ def extract(archive: Path, dest: Path) -> None:
         raise FetchError(f"{archive.name}: cannot unpack safely: {exc}") from exc
 
 
+@contextlib.contextmanager
+def exclusive_lock(path: Path) -> Iterator[None]:
+    """Hold an OS file lock on `path` for the duration of the block.
+
+    Checkouts and worktrees share one $SPG_CACHE_DIR, so two `setup` runs can
+    install the same dependency at once. The OS drops the lock if the holder
+    dies, so a crashed run never leaves the cache locked.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            handle.seek(0)
+            while True:
+                try:
+                    # LK_LOCK retries for about 10 s, then raises; keep waiting.
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    continue
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def install(name: str, version: str, plat: str, entry: dict, cache: Path, unpack: bool) -> str:
     expected = entry["sha256"].lower()
     if len(expected) != 64:
         raise FetchError(f"{name}/{plat}: sha256 must be 64 hex characters")
+    # One lock per dependency and platform covers the cache check, the download,
+    # the unpack and the marker write, so a concurrent run either waits and then
+    # sees the finished install, or installs it itself; it never replaces a
+    # directory another run has just installed.
+    with exclusive_lock(cache / "locks" / f"{name}-{version}-{plat}.lock"):
+        return _install_locked(name, version, plat, entry, cache, unpack, expected)
+
+
+def _install_locked(name: str, version: str, plat: str, entry: dict, cache: Path,
+                    unpack: bool, expected: str) -> str:
     dest = cache / "deps" / name / f"{version}-{plat}"
     marker = dest / MARKER
     if unpack and marker.exists():

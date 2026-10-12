@@ -10,6 +10,8 @@ import json
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -70,6 +72,51 @@ class FetchDepsTest(unittest.TestCase):
         self.assertEqual((dest / "include" / "pkg.h").read_bytes(), b"// header\n")
         marker = json.loads((dest / fetch_deps.MARKER).read_text(encoding="utf-8"))
         self.assertEqual(marker["sha256"], sha)
+
+    def test_concurrent_installs_unpack_once(self) -> None:
+        # Two setups sharing one cache: the second must wait for the first and
+        # reuse its install, not replace the directory the first just wrote.
+        sha = self.seed(make_tar({"pkg-1.0/include/pkg.h": b"// header\n"}))
+        entry = {"url": URL, "sha256": sha, "root": "pkg-1.0"}
+        real_extract = fetch_deps.extract
+        first_inside = threading.Event()
+        release_first = threading.Event()
+        calls = []
+
+        def gated_extract(archive: Path, dest: Path) -> None:
+            calls.append(dest)
+            if len(calls) == 1:
+                first_inside.set()
+                release_first.wait(timeout=10)
+            real_extract(archive, dest)
+
+        results: dict[str, str] = {}
+        errors: list[BaseException] = []
+
+        def run(label: str) -> None:
+            try:
+                results[label] = fetch_deps.install("pkg", "1.0", "linux-x64", entry, self.cache, True)
+            except BaseException as exc:  # surfaced by the assertions below
+                errors.append(exc)
+
+        with mock.patch.object(fetch_deps, "download", self.no_network), \
+                mock.patch.object(fetch_deps, "extract", gated_extract):
+            first = threading.Thread(target=run, args=("first",))
+            first.start()
+            self.assertTrue(first_inside.wait(timeout=10))
+            second = threading.Thread(target=run, args=("second",))
+            second.start()
+            time.sleep(0.3)  # without the lock, the second run reaches extract here
+            release_first.set()
+            first.join(timeout=20)
+            second.join(timeout=20)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("unpacked", results["first"])
+        self.assertIn("cached", results["second"])
+        dest = self.cache / "deps" / "pkg" / "1.0-linux-x64"
+        self.assertEqual((dest / "include" / "pkg.h").read_bytes(), b"// header\n")
 
     def test_refuses_hash_mismatch_and_discards_download(self) -> None:
         good = make_tar({"pkg-1.0/a": b"a"})

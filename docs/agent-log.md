@@ -45,7 +45,11 @@ Template:
   requires it. The `windows-2025` runner now ships Visual Studio 2026 (MSVC
   19.51) and no 2022, so `run.sh build` asks vswhere for the newest Visual Studio
   with C++ tools (`SPG_CMAKE_GENERATOR` overrides); the vc17 OpenCV static libs
-  link fine with it.
+  link fine with it. Review follow-up: `fetch_deps.py` holds a per-dependency
+  OS file lock (`$SPG_CACHE_DIR/locks/`) from the cache check through the
+  marker write, because worktrees share one cache and two concurrent `setup`
+  runs could otherwise replace each other's install; the script tests require
+  Python 3.12, matching CI and the repository's Python version.
 - Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21): every one of
   the 9 pinned archives downloaded and matched its SHA-256
   (`fetch_deps.py --platform all`); `run.sh setup`, `build`, `test` pass with 12
