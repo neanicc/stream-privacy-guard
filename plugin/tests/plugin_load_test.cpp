@@ -21,8 +21,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -31,7 +34,16 @@ namespace fs = std::filesystem;
 namespace plugin = spg::plugin;
 
 int failures = 0;
-std::string captured_log;
+
+// libobs calls the log handler from whichever thread logs, without a lock
+// (util/base.c, blogva): obs_source_release() hands a source's destruction to
+// libobs's destroy-task thread, which logs ("private source ... destroyed",
+// gs_* errors in this headless run) while the main thread logs the next
+// source's creation. The capture is therefore guarded; appending to it from
+// two threads at once corrupted the heap and aborted the test (SPG-15c).
+std::mutex log_mutex;
+std::string captured_log;                // guarded by log_mutex
+std::set<std::thread::id> log_threads;  // guarded by log_mutex
 
 // Synthetic watch-list entries and fragments of them (raw and as spg-core
 // folds them) that must never appear in a log or in saved settings. The
@@ -59,7 +71,8 @@ bool contains_secret(std::string_view text) {
   return false;
 }
 
-// Captures every libobs log line, the plugin's included, and echoes it.
+// Captures every libobs log line, the plugin's included, and echoes it. Runs
+// on any libobs thread.
 void capture_log(int /*level*/, const char *format, va_list args, void * /*param*/) {
   char line[4096];
   va_list copy;
@@ -67,8 +80,10 @@ void capture_log(int /*level*/, const char *format, va_list args, void * /*param
   const int written = std::vsnprintf(line, sizeof(line), format, copy);
   va_end(copy);
   if (written >= 0) {
+    const std::lock_guard lock{log_mutex};
     captured_log += line;
     captured_log += '\n';
+    log_threads.insert(std::this_thread::get_id());
     std::printf("log: %s\n", line);
   }
 }
@@ -590,12 +605,24 @@ int main(int argc, char **argv) {
     run_filter_checks(module);
   }
 
+  // obs_shutdown joins the destroy-task thread, so every filter's destroy and
+  // its log lines have run by the time it returns.
   obs_shutdown();
   base_set_log_handler(nullptr, nullptr);
 
-  check(!contains_secret(captured_log), "no watch-list text in the libobs log");
-  check(captured_log.find("[obs-spg] watch-list saved") != std::string::npos,
+  std::string log_text;
+  std::size_t logging_threads = 0;
+  {
+    const std::lock_guard lock{log_mutex};
+    log_text = captured_log;
+    logging_threads = log_threads.size();
+  }
+  check(!contains_secret(log_text), "no watch-list text in the libobs log");
+  check(log_text.find("[obs-spg] watch-list saved") != std::string::npos,
         "the log capture saw the plugin's own lines");
+  // Why the capture is locked: sources are destroyed, and log, on libobs's
+  // destroy-task thread while the main thread keeps logging.
+  check(logging_threads > 1, "libobs logs from more than one thread (deferred source destruction)");
   std::printf("%d failure(s)\n", failures);
   return failures == 0 ? 0 : 1;
 }
