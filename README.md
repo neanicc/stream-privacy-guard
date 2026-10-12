@@ -66,7 +66,11 @@ packages for each OS (the `packages-<os>` artifacts of the Check workflow);
    can be scanned before they air. The filter cannot delay audio: in
    **Edit > Advanced Audio Properties**, set **Sync Offset** to the same
    number of milliseconds on every audio source that belongs with this video
-   (the source's own audio, microphone, desktop audio).
+   (the source's own audio, microphone, desktop audio). **Video memory for
+   the lookahead** (default 512 MiB) caps the frames held: when the lookahead
+   does not fit at the source's size and frame rate it is shortened and the
+   properties show a warning with the actual value; set Sync Offset to that
+   value, or raise the budget.
 5. **Mask hold** (default 750 ms) keeps a region blurred after its last
    detection. **When a frame cannot be scanned in time** chooses the
    fallback: blur the whole source (default), repeat the last scanned frame,
@@ -105,7 +109,9 @@ Read these before you rely on the filter.
   watch-list's fuzzy tolerance are missed.
 - **Delay and audio.** Video airs one lookahead late, and you must set the
   audio Sync Offset yourself. Frames are held at full resolution: about 240 MB
-  of video memory at 1080p60 with the default 500 ms.
+  of video memory at 1080p60 with the default 500 ms. The default 512 MiB
+  budget shortens the lookahead at high resolutions (500 ms becomes 216 ms
+  at 2160p60), which leaves less time to scan and so covers more frames whole.
 - **Fail-closed blur.** When a frame cannot be scanned in time (slow machine,
   models missing or damaged, an invalid configuration, a broken watch-list
   file), the whole source is blurred, possibly for long stretches.

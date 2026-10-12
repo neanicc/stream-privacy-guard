@@ -108,6 +108,7 @@ class FakeGpu final : public spg::plugin::FrameGpu {
     freed.push_back(slot);
     slot_serial.erase(slot);
   }
+  [[nodiscard]] std::uint32_t bits_per_pixel() const noexcept override { return 32; }  // BGRA
 
   struct Staged {
     std::size_t slot = 0;
@@ -249,6 +250,7 @@ struct Harness {
     spec.scheduler = std::move(scheduler);
     spec.fallback = config.fallback;
     spec.hold = config.tracker.hold;
+    spec.ring_budget_bytes = budget;
     pipeline.adopt(spec, clock.now());
     schedulers.push_back(&ref);
     return ref;
@@ -257,6 +259,7 @@ struct Harness {
   void adopt_none(FallbackMode fallback = FallbackMode::BlurSource) {
     spg::plugin::PipelineSpec spec;
     spec.fallback = fallback;
+    spec.ring_budget_bytes = budget;
     pipeline.adopt(spec, clock.now());
   }
 
@@ -319,6 +322,7 @@ struct Harness {
   FakeGpu gpu;
   std::vector<std::unique_ptr<spg::plugin::FrameScheduler>> retired;
   std::shared_ptr<int> destroyed = std::make_shared<int>(0);
+  std::uint64_t budget = spg::plugin::kNoRingBudget;  // for the next adopt()
   Pipeline pipeline;
   std::vector<SyncScheduler*> schedulers;
   std::map<std::size_t, Timestamp> slot_time;
@@ -589,6 +593,188 @@ TEST_CASE("a frame without a texture is covered with a solid fill", "[plugin][pi
     CHECK(solid > 0);
     CHECK(h.pipeline.counters().capture_failures > 0);
   }
+}
+
+namespace {
+
+const std::uint64_t k720Bytes = spg::plugin::texture_bytes(k720, 32);
+
+// Faces from 1100 ms on; every third 100 ms window of scans fails, so clean
+// frames, HoldLastScanned re-emits and covered frames all hold ring slots.
+std::shared_ptr<spg_test::ScriptedDetector> flaky_face(Rect box) {
+  return std::make_shared<spg_test::ScriptedDetector>(
+      [box](Timestamp t, Size) {
+        std::vector<Detection> out;
+        if (t >= at_ms(1100)) {
+          out.push_back(spg_test::face_at(box.x, box.y, box.width, box.height));
+        }
+        return out;
+      },
+      [](Timestamp t) {
+        if ((spg::to_ns(t) / 100'000'000) % 3 == 0) {
+          throw std::runtime_error("scan failed");
+        }
+      });
+}
+
+}  // namespace
+
+TEST_CASE("a capture past the VRAM budget gets no texture and the frame is covered", "[plugin][pipeline][budget]") {
+  Harness h;
+  h.budget = 6 * k720Bytes;  // 100 ms at 10 ms ticks needs 14
+  h.adopt(face_config(), face_between({0, 0, 10, 10}, 0, 0));
+  int refused_shown = 0;
+  for (std::int64_t t = 1000; t < 1500; t += 10) {
+    const DrawPlan& plan = h.step(t);  // fail-closed rule checked on every tick
+    REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+    REQUIRE(h.pipeline.ring().held() <= 6);
+    if (plan.cover == Cover::NoTexture) {
+      CHECK(plan.kind == DrawKind::Solid);  // never the frame, never sharp
+      ++refused_shown;
+    }
+  }
+  CHECK(refused_shown > 0);
+  const spg::plugin::PipelineCounters& counters = h.pipeline.counters();
+  CHECK(counters.over_budget > 0);
+  CHECK(counters.capture_failures >= counters.over_budget);
+}
+
+TEST_CASE("at the VRAM budget an idle texture is reused, not freed and recreated", "[plugin][pipeline][budget]") {
+  Harness h;
+  h.budget = 6 * k720Bytes;  // 100 ms at 10 ms ticks needs 14: the ring runs at the cap
+  h.adopt(face_config(), face_between({0, 0, 10, 10}, 0, 0));
+  for (std::int64_t t = 1000; t < 1300; t += 10) {
+    h.step(t);
+  }
+  REQUIRE(h.pipeline.ring_bytes() == h.budget);
+  const std::size_t freed_before = h.gpu.freed.size();
+  const int captures_before = h.gpu.captures;
+  for (std::int64_t t = 1300; t < 1800; t += 10) {
+    h.step(t);
+    REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  }
+  CHECK(h.gpu.captures > captures_before);    // frames still get textures
+  CHECK(h.gpu.freed.size() == freed_before);  // each into an idle slot's texture
+}
+
+TEST_CASE("at the VRAM budget a larger capture frees other idle textures before its own", "[plugin][pipeline][budget]") {
+  constexpr Size kSmall{640, 360};  // a quarter of a 720p texture
+  const std::uint64_t small_bytes = spg::plugin::texture_bytes(kSmall, 32);
+  Harness h(16);
+  h.budget = 8 * small_bytes;  // two 720p frames: the one on screen and the capture
+  h.adopt(face_config(), face_between({0, 0, 10, 10}, 0, 0));
+  for (std::int64_t t = 1000; t < 1300; t += 10) {
+    h.step(t, kSmall);  // the lookahead fills the ring
+  }
+  h.adopt_none();  // the buffered frames drain and their textures go idle
+  for (std::int64_t t = 1300; t < 1500; t += 10) {
+    h.step(t, kSmall);
+  }
+  REQUIRE(h.pipeline.ring().held() <= 2);  // the frame on screen (and the one before it)
+  REQUIRE(h.pipeline.ring_bytes() > 4 * small_bytes);  // with idle textures
+  REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  // A 720p frame does not fit beside every idle small texture: the other idle
+  // ones are freed, and the warm one is grown in place, not freed and recreated.
+  const std::uint64_t refused = h.pipeline.counters().over_budget;  // while the lookahead filled the ring
+  const std::size_t freed_before = h.gpu.freed.size();
+  const DrawPlan& first = h.step(1500);
+  REQUIRE(first.kind == DrawKind::BlurWhole);  // the live frame, in the slot it was captured to
+  const std::vector<std::size_t> freed(h.gpu.freed.begin() + static_cast<std::ptrdiff_t>(freed_before),
+                                       h.gpu.freed.end());
+  CHECK_FALSE(freed.empty());
+  CHECK(std::find(freed.begin(), freed.end(), first.slot) == freed.end());
+  REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  CHECK(h.pipeline.counters().over_budget == refused);
+  for (std::int64_t t = 1510; t < 1700; t += 10) {
+    h.step(t);
+    REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  }
+}
+
+TEST_CASE("a budget that fits the lookahead never refuses a frame", "[plugin][pipeline][budget]") {
+  // ring_frames_needed() against the real pipeline: buffered frames, the
+  // capture, the frame on screen and the last clean frame (re-emitted by
+  // HoldLastScanned while scans fail) all fit.
+  for (const FallbackMode fallback : {FallbackMode::BlurSource, FallbackMode::HoldLastScanned}) {
+    INFO("fallback " << static_cast<int>(fallback));
+    Harness h;
+    h.budget = spg::plugin::ring_frames_needed(100ms, 10ms) * k720Bytes;
+    h.adopt(face_config(fallback), flaky_face({400, 200, 120, 160}));
+    int reemits = 0;
+    for (std::int64_t t = 1000; t < 3000; t += 10) {
+      const DrawPlan& plan = h.step(t);
+      REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+      reemits += plan.reemit ? 1 : 0;
+    }
+    CHECK(h.pipeline.counters().over_budget == 0);
+    CHECK(h.pipeline.counters().capture_failures == 0);
+    CHECK((fallback != FallbackMode::HoldLastScanned || reemits > 0));
+  }
+}
+
+TEST_CASE("a lower budget in a new generation keeps the frames already buffered", "[plugin][pipeline][budget]") {
+  Harness h;
+  const Rect face{400, 200, 120, 160};
+  h.adopt(face_config(), face_between(face, 1000, 10'000));
+  for (std::int64_t t = 1000; t < 1200; t += 10) {
+    h.step(t);
+  }
+  REQUIRE(h.pipeline.ring().held() > 4);
+  // Settings change: a budget below what is held now and a shorter lookahead.
+  h.budget = 4 * k720Bytes;
+  spg::SchedulerConfig shorter = face_config();
+  shorter.lookahead = 50ms;
+  shorter.retro = 50ms;
+  h.adopt(shorter, face_between(face, 1000, 10'000));
+  int old_frames_aired = 0;
+  for (std::int64_t t = 1200; t < 1600; t += 10) {
+    const DrawPlan& plan = h.step(t);
+    if (plan.kind == DrawKind::Masked && *h.shown_time(plan) < at_ms(1200)) {
+      CHECK(masks(plan, face));  // the old generation's frame, with its own masks
+      ++old_frames_aired;
+    }
+  }
+  CHECK(old_frames_aired > 0);  // buffered frames were not dropped by the budget
+  CHECK(h.pipeline.counters().over_budget > 0);
+  CHECK(h.pipeline.ring_bytes() <= h.budget);  // once the old frames are gone
+}
+
+TEST_CASE("after a resize the refitted lookahead fits the budget again", "[plugin][pipeline][budget]") {
+  constexpr Size k1080{1920, 1080};
+  Harness h;
+  h.budget = spg::plugin::ring_frames_needed(100ms, 10ms) * k720Bytes;
+  const Rect face{400, 200, 120, 160};
+  h.adopt(face_config(), face_between(face, 1000, 10'000), 5ms);
+  for (std::int64_t t = 1000; t < 1300; t += 10) {
+    h.step(t);
+  }
+  CHECK(h.pipeline.counters().over_budget == 0);
+  // The source grows: captures past the budget are refused (covered) until
+  // the filter's video tick publishes a generation with the refitted lookahead.
+  for (std::int64_t t = 1300; t < 1400; t += 10) {
+    h.step(t, k1080);
+    REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+  }
+  CHECK(h.pipeline.counters().over_budget > 0);
+  const spg::plugin::LookaheadFit fit = spg::plugin::fit_lookahead(
+      100ms, h.budget, k1080, spg::plugin::texture_bytes(k1080, h.gpu.bits_per_pixel()), 10ms);
+  REQUIRE(fit.shortened);
+  spg::SchedulerConfig refit = face_config();
+  refit.lookahead = fit.lookahead;
+  refit.retro = std::min(refit.retro, fit.lookahead);
+  h.adopt(refit, face_between(face, 1000, 10'000), 5ms);
+  std::uint64_t refused = 0;
+  int masked = 0;
+  for (std::int64_t t = 1400; t < 2400; t += 10) {
+    const DrawPlan& plan = h.step(t, k1080);
+    REQUIRE(h.pipeline.ring_bytes() <= h.budget);
+    if (t == 1700) {
+      refused = h.pipeline.counters().over_budget;  // the old generation has drained
+    }
+    masked += plan.kind == DrawKind::Masked ? 1 : 0;
+  }
+  CHECK(h.pipeline.counters().over_budget == refused);  // steady state: nothing refused
+  CHECK(masked > 50);  // frames scanned within the shorter lookahead air with their masks
 }
 
 TEST_CASE("random stalls and failures never air an unscanned frame", "[plugin][pipeline]") {
@@ -1046,6 +1232,21 @@ TEST_CASE("a generation offered twice before a frame retires the first", "[plugi
   CHECK(rig.frame(1000).kind == DrawKind::Solid);  // the second (solid fill, no policy)
 }
 
+TEST_CASE("the host reports frames refused by the VRAM budget", "[plugin][pipeline][budget]") {
+  HostRig rig;
+  auto spec = rig.spec(face_between({0, 0, 10, 10}, 0, 0));
+  spec->ring_budget_bytes = k720Bytes - 1;  // not even one frame
+  rig.host.offer(std::move(spec));
+  for (std::int64_t t = 1000; t < 1300; t += 10) {
+    const DrawPlan& plan = rig.frame(t);
+    CHECK(plan.kind != DrawKind::Masked);  // nothing fits: every frame is covered
+  }
+  const spg::plugin::RenderStatus status = rig.host.status();
+  CHECK(status.over_budget > 0);
+  CHECK(status.clean == 0);
+  CHECK(rig.host.pipeline().ring_bytes() == 0);
+}
+
 TEST_CASE("settings published while frames render never draw an unscanned frame", "[plugin][pipeline][drift]") {
   HostRig rig;
   const auto failing = std::make_shared<spg_test::ScriptedDetector>(
@@ -1087,6 +1288,7 @@ TEST_CASE("the frame ring counts holders and trims idle textures", "[plugin][pip
   ring.release(*a);  // a double release is ignored
   CHECK(ring.holders(*a) == 0);
   CHECK(ring.held() == 2);
+  CHECK(ring.peek() == a);
   CHECK(ring.acquire() == a);  // the warm slot is reused first
   ring.release(*a);
   ring.release(*b);

@@ -131,6 +131,18 @@ TEST_CASE("lookahead and hold from a scene file are clamped to safe ranges", "[s
   STATIC_REQUIRE(kMinHoldMs <= kDefaultHoldMs && kDefaultHoldMs <= kMaxHoldMs);
 }
 
+TEST_CASE("the VRAM budget from a scene file is clamped", "[settings]") {
+  CHECK(clamp_vram_budget_mb(0) == kMinVramBudgetMb);
+  CHECK(clamp_vram_budget_mb(LLONG_MIN) == kMinVramBudgetMb);
+  CHECK(clamp_vram_budget_mb(kDefaultVramBudgetMb) == kDefaultVramBudgetMb);
+  CHECK(clamp_vram_budget_mb(LLONG_MAX) == kMaxVramBudgetMb);
+  RawFilterSettings raw;
+  raw.vram_budget_mb = -1;
+  CHECK(sanitize(raw).vram_budget_mb == kMinVramBudgetMb);
+  STATIC_REQUIRE(kMinVramBudgetMb > 0);
+  STATIC_REQUIRE(kMinVramBudgetMb <= kDefaultVramBudgetMb && kDefaultVramBudgetMb <= kMaxVramBudgetMb);
+}
+
 TEST_CASE("unknown names fall back to the safe defaults", "[settings]") {
   RawFilterSettings raw;
   raw.lookahead_ms = 0;

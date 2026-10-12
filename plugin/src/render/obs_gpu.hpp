@@ -29,6 +29,7 @@ class ObsFrameGpu final : public FrameGpu {
   bool map(std::size_t surface, MappedReadback& out) override;
   void unmap(std::size_t surface) override;
   void free_slot(std::size_t slot) override;
+  [[nodiscard]] std::uint32_t bits_per_pixel() const noexcept override;
 
   // Draws `plan` as the filter's output at `output` size. With `overlay`,
   // adds mask outlines and, for a covered frame, a corner square whose colour
