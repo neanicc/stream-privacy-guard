@@ -985,3 +985,67 @@ Template:
   Windows loads the plugin and reports dump exclusion `none` instead of
   failing to load the DLL. The Windows branch was syntax-checked locally
   against a stub `windows.h` only; the Windows CI job is the build evidence.
+
+## 2026-10-12 — SPG-15d Recognized text in wiped, dump-excluded memory (#46)
+
+- Decision / change: the recognizer builds text in `ocr::SecureText`
+  (`std::vector<char, SecureAllocator<char>>`) instead of `std::string`:
+  CTC decoding appends straight into the caller's buffer (a decode error
+  zeroes what it appended and cuts it off again), each read job has one, and a
+  region's views are joined in another before `Secret::copy_of()`. A vector
+  rather than `SecureString`, because a string keeps short text in its
+  short-string buffer, inside the object, which for a temporary is on the
+  stack; most OCR lines are short. The model's output probabilities (whose
+  per-step argmax spells the text) are zeroed once a batch is decoded or
+  fails. The cache already stored text only as `Secret` (unchanged; a
+  `static_assert` keeps it so).
+- Crop fingerprints: `Fingerprint` now zeroes its pixels, unused capacity
+  included, when destroyed or assigned over, and a moved-from one is empty;
+  the cache also zeroes each fingerprint it holds when the entry is replaced,
+  erased, expires, is evicted or refused, and when the cache is destroyed,
+  with a test-only observer like `SecureHeap`'s. The pixels stay in ordinary
+  memory on purpose: up to 64 MiB of crops, most over the 16 KiB size
+  classes, would each be a SecureHeap region of their own, using up
+  `RLIMIT_MEMLOCK` and, on Windows, the 512 WER exclusions that keep
+  watch-list regions out of dumps. `RecognitionCache` is no longer copyable
+  or movable (one worker owns it; nothing copied one).
+- Scan path: `run_scan()` gets `std::vector<Secret>`, checks sizes and passes
+  each `Secret` to the policy by reference; `recognize_tracks()` moves them
+  into `TextHit`s; `PolicyEngine::evaluate()` folds into `SecureU32String`s.
+  No plain-string copy there, so `scan.cpp` is unchanged. Copies that remain
+  (ONNX Runtime's output arena, pixel buffers, the policy's short-string
+  buffers for lines of 3 or 4 code points) are in `docs/policy.md`,
+  "Recognized text in memory".
+- Behaviour: identical. A scratch probe (not committed) hashed every text and
+  printed every score for 7 regions x 4 cap heights (10 to 22 px) x BGRA and
+  NV12 with the pinned model, plus the `rec_softmax` fixture: the 58 lines
+  match `main` (7ee5fd8) exactly.
+- Timing (dev Mac, M4, macOS 26.5, ORT 1.30.0 CPU, Release build, scratch
+  probe, median per call, 3 rounds x 2 runs each): one region read as one
+  48x320 crop, `main` 4.54 to 5.10 ms, branch 4.59 to 4.67 ms (SPG-07: about
+  4.5 ms); six regions of a 900x420 panel, `main` 32.5 to 34.3 ms, branch
+  32.3 to 33.9 ms; `ctc_greedy_decode` of 40 steps x 97 classes alone,
+  `main` 8.20 to 8.35 us, branch 8.19 to 8.32 us. No regression beyond
+  noise. Six cache hits (100 KB of crops) take 11.3 to 13.4 us on the
+  branch; `main` was not measured for that path (see open issues).
+- Evidence (automated, dev Mac): new cases `CTC decode builds the text in
+  protected memory and zeroes it`, `RecognitionCache zeroes every fingerprint
+  it lets go of` (all seven ways out), `Fingerprint: moved-from and wiped
+  fingerprints are empty`, and `Recognizer temporaries are protected blocks,
+  zeroed when released` (fixture model: one live block per region after the
+  call, at least two zeroed per region, all zero). The sentinel case
+  (`Recognized text never reaches streams, errors or verdicts`) passes
+  unchanged. Mutation checks: joining a region's text in a `std::string`
+  failed the recognizer case; a cache release that does not zero failed the
+  cache case; dropping an entry without the release failed it too. Not
+  covered by a test: zeroing the probabilities and the bytes a failed decode
+  appended (neither is in the observed heap); both are a single
+  `secure_wipe` call.
+- Eval delta: none expected (memory handling only; texts identical). The eval
+  stage was not run locally (the agent sandbox refuses that command); CI runs
+  it.
+- Open issues or follow-ups: the permission classifier refused restoring
+  `main`'s OCR sources into the worktree to time the cache-hit path on `main`,
+  so that comparison is missing; the change there is one `memset` per
+  fingerprint (about 100 KB per six-region cycle). Pixel copies in the
+  detector, the lookahead's `OwnedFrame` and ONNX Runtime stay unzeroed.

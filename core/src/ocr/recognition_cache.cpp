@@ -6,8 +6,49 @@
 
 #include "detect/frame_image.hpp"
 #include "spg/error.hpp"
+#include "spg/secure_memory.hpp"
 
 namespace spg::ocr {
+
+namespace {
+
+// Zeroes every byte `pixels` owns, its unused capacity included, and leaves
+// them all in it (size() == capacity()).
+void zero_all(std::vector<std::uint8_t>& pixels) noexcept {
+  pixels.resize(pixels.capacity());  // within capacity: never reallocates, never throws
+  secure_wipe(pixels.data(), pixels.size());
+}
+
+}  // namespace
+
+Fingerprint& Fingerprint::operator=(const Fingerprint& other) {
+  if (this != &other) {
+    wipe();
+    crop = other.crop;
+    pixels = other.pixels;  // reuses the zeroed buffer, or frees it for a larger one
+  }
+  return *this;
+}
+
+Fingerprint& Fingerprint::operator=(Fingerprint&& other) noexcept {
+  if (this != &other) {
+    wipe();
+    crop = std::exchange(other.crop, Size{});
+    pixels = std::move(other.pixels);  // frees the zeroed buffer
+    other.pixels.clear();
+  }
+  return *this;
+}
+
+Fingerprint::~Fingerprint() {
+  zero_all(pixels);
+}
+
+void Fingerprint::wipe() noexcept {
+  zero_all(pixels);
+  pixels.clear();
+  crop = {};
+}
 
 void validate(const RecognitionCacheConfig& config) {
   if (config.max_age < Duration::zero()) {
@@ -46,12 +87,28 @@ RecognitionCache::RecognitionCache(const RecognitionCacheConfig& config) : confi
   validate(config_);
 }
 
+RecognitionCache::~RecognitionCache() {
+  for (auto& [track, entry] : entries_) {
+    release(entry.print);
+  }
+}
+
+void RecognitionCache::release(Fingerprint& print) noexcept {
+  zero_all(print.pixels);
+  if (observer_ && !print.pixels.empty()) {
+    observer_(print.pixels.data(), print.pixels.size());
+  }
+  print.pixels.clear();
+  print.crop = {};
+}
+
 bool RecognitionCache::expired(const Entry& entry, Timestamp now) const {
   return now < entry.read_at || now - entry.read_at > config_.max_age;
 }
 
 void RecognitionCache::drop(std::unordered_map<TrackId, Entry>::iterator it) {
   bytes_ -= it->second.print.pixels.size();
+  release(it->second.print);
   lru_.erase(it->second.use);
   entries_.erase(it);
 }
@@ -74,6 +131,7 @@ void RecognitionCache::store(TrackId track, Fingerprint print, Recognition recog
   prune(now);
   const std::size_t size = print.pixels.size();
   if (size == 0 || size > config_.max_entry_bytes || size > config_.max_bytes) {
+    release(print);
     return;
   }
   while (!entries_.empty() && (entries_.size() >= config_.capacity || bytes_ + size > config_.max_bytes)) {
