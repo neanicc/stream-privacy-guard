@@ -7,14 +7,16 @@
 
 #include "spg/category.hpp"
 #include "spg/policy_config.hpp"
+#include "spg/secure_memory.hpp"
 
 namespace spg::detail {
 
 // Folds UTF-8 text for every policy check: compatibility forms, case and
 // diacritics (fold_table.inc), zero-width characters and soft hyphens deleted,
 // control characters and Unicode whitespace turned into one space, leading and
-// trailing space trimmed. A malformed UTF-8 byte becomes U+FFFD.
-[[nodiscard]] std::u32string fold_text(std::string_view utf8);
+// trailing space trimmed. A malformed UTF-8 byte becomes U+FFFD. The text
+// forms below are secret, so they live in SecureHeap (spg/secure_memory.hpp).
+[[nodiscard]] SecureU32String fold_text(std::string_view utf8);
 
 // True for a folded character that separates words in matching_form():
 // anything in ASCII but a-z and 0-9, Unicode whitespace, punctuation and
@@ -24,9 +26,9 @@ namespace spg::detail {
 
 // Watch-list form of folded text: OCR confusions merged (0->o, 1/i/|->l,
 // 5->s, 8->b), then each run of separators turned into one space, trimmed.
-[[nodiscard]] std::u32string matching_form(std::u32string_view folded);
+[[nodiscard]] SecureU32String matching_form(std::u32string_view folded);
 
-[[nodiscard]] std::string to_utf8(std::u32string_view text);
+[[nodiscard]] SecureString to_utf8(std::u32string_view text);
 
 // True when the watch-list entry (in matching form) occurs in the text (in
 // matching form, `reversed` being the same text reversed) under the fuzzy

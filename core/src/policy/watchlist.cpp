@@ -97,7 +97,7 @@ bool watchlist_match(std::u32string_view entry, std::u32string_view text,
   if (prefix_within_edits(entry, text, limits, {partial, true, false})) {
     return true;
   }
-  const std::u32string reversed_entry(entry.rbegin(), entry.rend());
+  const SecureU32String reversed_entry(entry.rbegin(), entry.rend());
   return prefix_within_edits(reversed_entry, reversed, limits, {partial, true, false});
 }
 

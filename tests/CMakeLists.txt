@@ -18,13 +18,28 @@ add_executable(spg-unit-tests
   unit/policy_pii_test.cpp
   unit/policy_sentinel_test.cpp
   unit/policy_test.cpp
+  unit/secure_memory_test.cpp
   unit/version_test.cpp)
 target_link_libraries(spg-unit-tests PRIVATE spg::core Catch2::Catch2WithMain)
 target_compile_definitions(spg-unit-tests PRIVATE
   SPG_EXPECTED_VERSION="${PROJECT_VERSION}"
   SPG_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 spg_target_defaults(spg-unit-tests)
-catch_discover_tests(spg-unit-tests TEST_PREFIX "unit." DISCOVERY_MODE PRE_TEST)
+# Each unit test takes well under a second; the timeout turns a hang (such as
+# a render-facing scheduler call waiting on a stalled stage) into a failure.
+catch_discover_tests(spg-unit-tests TEST_PREFIX "unit." DISCOVERY_MODE PRE_TEST
+  PROPERTIES TIMEOUT 300)
+# Tracker and temporal hold (SPG-09).
+target_sources(spg-unit-tests PRIVATE unit/tracker_test.cpp)
+# Scheduler, lookahead and fail-closed release (SPG-10). The mask helper tests
+# include core/src/mask/ directly. fail_alloc.cpp replaces operator new for
+# this binary so a test can fail one allocation on purpose.
+target_sources(spg-unit-tests PRIVATE
+  unit/fail_alloc.cpp
+  unit/lookahead_test.cpp
+  unit/lookahead_property_test.cpp
+  unit/scheduler_test.cpp)
+target_include_directories(spg-unit-tests PRIVATE "${PROJECT_SOURCE_DIR}/core/src")
 
 # Prebuilt dependencies link, load and run ------------------------------------
 if(SPG_WITH_DEPS)
@@ -62,6 +77,15 @@ add_test(NAME scripts.fetch_deps
 add_test(NAME scripts.fetch_models
   COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_models.py")
 
+# Eval scorer and suite generators (lane:eval) -------------------------------------
+# The scorer test is standard library only. The generator test fetches the
+# Pillow wheel pinned in eval/pydeps.json into the cache on first use.
+add_test(NAME scoring.scorer
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_scorer.py")
+add_test(NAME scoring.generators
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_generators.py")
+set_tests_properties(scoring.generators PROPERTIES ENVIRONMENT "SPG_CACHE_DIR=${SPG_CACHE_DIR}")
+
 # ONNX Runtime session wrapper ------------------------------------------------------
 if(SPG_WITH_DEPS)
   # Tiny ONNX models generated at build time (no weights in Git) plus a listing
@@ -71,6 +95,9 @@ if(SPG_WITH_DEPS)
   add_custom_command(
     OUTPUT "${_spg_runtime_fixtures}/scale_static.onnx" "${_spg_runtime_fixtures}/scale_dynamic.onnx"
            "${_spg_runtime_fixtures}/not_a_model.onnx" "${_spg_runtime_fixtures}/models.txt"
+           "${_spg_runtime_fixtures}/text_wrong_shape.onnx" "${_spg_runtime_fixtures}/text_sqrt.onnx"
+           "${_spg_runtime_fixtures}/rec_softmax.onnx" "${_spg_runtime_fixtures}/rec_sqrt.onnx"
+           "${_spg_runtime_fixtures}/rec_wrong_classes.onnx" "${_spg_runtime_fixtures}/rec_no_dictionary.onnx"
     COMMAND Python3::Interpreter -I "${_spg_runtime_fixture_script}"
             --out "${_spg_runtime_fixtures}"
             --manifest "${PROJECT_SOURCE_DIR}/models/manifest.json"
@@ -92,23 +119,48 @@ endif()
 
 # Detectors (lane:vision) ------------------------------------------------------------
 if(SPG_WITH_DEPS)
-  # The pinned YuNet path, from the manifest; the model tests skip when it is
-  # not cached. The runtime fixtures supply a model that is not YuNet.
+  # The pinned model paths, from the manifest; the model tests skip when a
+  # model is not cached. The runtime fixtures supply a model that is neither.
+  # Text fixtures are drawn at test time with OpenCV (synthetic_text.hpp).
   set(_spg_models_manifest "${PROJECT_SOURCE_DIR}/models/manifest.json")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_spg_models_manifest}")
   file(READ "${_spg_models_manifest}" _spg_models_json)
   string(JSON _spg_yunet_version GET "${_spg_models_json}" models yunet version)
   string(JSON _spg_yunet_file GET "${_spg_models_json}" models yunet file)
+  string(JSON _spg_ppocr_det_version GET "${_spg_models_json}" models ppocr-det-en version)
+  string(JSON _spg_ppocr_det_file GET "${_spg_models_json}" models ppocr-det-en file)
 
   add_executable(spg-detect-tests
     unit/face_detect_test.cpp
-    integration/face_detector_test.cpp)
+    unit/text_detect_test.cpp
+    integration/face_detector_test.cpp
+    integration/text_detector_test.cpp)
   add_dependencies(spg-detect-tests spg-runtime-fixtures)
-  target_link_libraries(spg-detect-tests PRIVATE spg::detect Catch2::Catch2WithMain)
+  target_link_libraries(spg-detect-tests PRIVATE spg::detect spg::opencv Catch2::Catch2WithMain)
   target_compile_definitions(spg-detect-tests PRIVATE
     SPG_YUNET_MODEL="${SPG_CACHE_DIR}/models/yunet/${_spg_yunet_version}/${_spg_yunet_file}"
+    SPG_PPOCR_DET_MODEL="${SPG_CACHE_DIR}/models/ppocr-det-en/${_spg_ppocr_det_version}/${_spg_ppocr_det_file}"
     SPG_RUNTIME_FIXTURES="${_spg_runtime_fixtures}")
   spg_target_defaults(spg-detect-tests)
   spg_copy_runtime_dlls(spg-detect-tests)
   catch_discover_tests(spg-detect-tests TEST_PREFIX "detect." DISCOVERY_MODE PRE_TEST)
+endif()
+
+# Text recognizer (SPG-07, lane:vision) ----------------------------------------------
+if(SPG_WITH_DEPS)
+  string(JSON _spg_ppocr_rec_version GET "${_spg_models_json}" models ppocr-rec-en version)
+  string(JSON _spg_ppocr_rec_file GET "${_spg_models_json}" models ppocr-rec-en file)
+  # Crops are made-up strings drawn at test time (synthetic_text.hpp).
+  add_executable(spg-ocr-tests
+    unit/ocr_test.cpp
+    integration/text_recognizer_test.cpp)
+  add_dependencies(spg-ocr-tests spg-runtime-fixtures)
+  target_link_libraries(spg-ocr-tests PRIVATE spg::ocr spg::opencv Catch2::Catch2WithMain)
+  target_compile_definitions(spg-ocr-tests PRIVATE
+    SPG_PPOCR_REC_MODEL="${SPG_CACHE_DIR}/models/ppocr-rec-en/${_spg_ppocr_rec_version}/${_spg_ppocr_rec_file}"
+    SPG_PPOCR_DET_MODEL="${SPG_CACHE_DIR}/models/ppocr-det-en/${_spg_ppocr_det_version}/${_spg_ppocr_det_file}"
+    SPG_RUNTIME_FIXTURES="${_spg_runtime_fixtures}")
+  spg_target_defaults(spg-ocr-tests)
+  spg_copy_runtime_dlls(spg-ocr-tests)
+  catch_discover_tests(spg-ocr-tests TEST_PREFIX "ocr." DISCOVERY_MODE PRE_TEST)
 endif()

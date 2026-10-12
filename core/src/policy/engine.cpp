@@ -31,7 +31,7 @@ PolicyEngine::PolicyEngine(const PolicyConfig& config, const LogSink& log)
   std::size_t whole_word_only = 0;
   watchlist_.reserve(config.watchlist.size());
   for (std::size_t i = 0; i < config.watchlist.size(); ++i) {
-    std::u32string form = detail::matching_form(detail::fold_text(config.watchlist[i].reveal()));
+    SecureU32String form = detail::matching_form(detail::fold_text(config.watchlist[i].reveal()));
     if (form.empty()) {
       throw ContractError("policy config: watchlist entry " + std::to_string(i) +
                           " has no letters or digits once normalized");
@@ -53,12 +53,12 @@ PolicyEngine::PolicyEngine(const PolicyConfig& config, const LogSink& log)
 }
 
 Verdict PolicyEngine::evaluate(const Secret& text) const {
-  const std::u32string folded = detail::fold_text(text.reveal());
+  const SecureU32String folded = detail::fold_text(text.reveal());
   Verdict verdict{detail::find_pii_folded(folded, categories_)};
   if (categories_.contains(Category::Watchlist) && !watchlist_.empty()) {
-    const std::u32string form = detail::matching_form(folded);
-    const std::u32string reversed(form.rbegin(), form.rend());
-    for (const std::u32string& entry : watchlist_) {
+    const SecureU32String form = detail::matching_form(folded);
+    const SecureU32String reversed(form.rbegin(), form.rend());
+    for (const SecureU32String& entry : watchlist_) {
       if (detail::watchlist_match(entry, form, reversed, fuzzy_)) {
         verdict.reasons.insert(Category::Watchlist);
         break;

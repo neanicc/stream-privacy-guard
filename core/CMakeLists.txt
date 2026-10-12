@@ -32,9 +32,28 @@ target_link_libraries(spg-core PRIVATE nlohmann_json::nlohmann_json)
 target_compile_definitions(spg-core PRIVATE SPG_VERSION_STRING="${PROJECT_VERSION}")
 spg_target_defaults(spg-core)
 
+# Protected memory for watch-list text (SPG-15b): Secret and SecureHeap.
+# Windows Error Reporting's dump exclusion is looked up in kernel32 at run
+# time (Windows 10 1703 and later), so nothing extra is linked.
+target_sources(spg-core PRIVATE src/secure/secret.cpp src/secure/secure_memory.cpp)
+
+# Tracker and temporal hold (SPG-09).
+target_sources(spg-core PRIVATE src/track/tracker.cpp)
+
+# Scheduler, lookahead and fail-closed release (SPG-10). Worker threads.
+find_package(Threads REQUIRED)
+target_sources(spg-core PRIVATE
+  src/mask/mask_rects.cpp
+  src/schedule/lookahead.cpp
+  src/schedule/scan.cpp
+  src/schedule/scheduler.cpp)
+target_link_libraries(spg-core PUBLIC Threads::Threads)
+
 # ONNX Runtime session wrapper; needs the prebuilt ONNX Runtime.
 if(SPG_WITH_DEPS)
   add_subdirectory(src/runtime)
   # Detectors on top of the runtime and OpenCV.
   add_subdirectory(src/detect)
+  # Text recognition on the detector's regions (SPG-07).
+  add_subdirectory(src/ocr)
 endif()

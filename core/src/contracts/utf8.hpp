@@ -59,8 +59,10 @@ namespace spg::detail {
   return cp;
 }
 
-// Appends the UTF-8 encoding of a valid code point.
-inline void append_utf8(std::string& out, char32_t cp) {
+// Appends the UTF-8 encoding of a valid code point to a std::string or any
+// other basic_string of char (the policy engine's SecureString).
+template <class String>
+void append_utf8(String& out, char32_t cp) {
   if (cp < 0x80) {
     out.push_back(static_cast<char>(cp));
   } else if (cp < 0x800) {
