@@ -47,4 +47,6 @@ if(SPG_WITH_DEPS)
   add_subdirectory(src/runtime)
   # Detectors on top of the runtime and OpenCV.
   add_subdirectory(src/detect)
+  # Text recognition on the detector's regions (SPG-07).
+  add_subdirectory(src/ocr)
 endif()

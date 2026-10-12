@@ -84,6 +84,8 @@ if(SPG_WITH_DEPS)
     OUTPUT "${_spg_runtime_fixtures}/scale_static.onnx" "${_spg_runtime_fixtures}/scale_dynamic.onnx"
            "${_spg_runtime_fixtures}/not_a_model.onnx" "${_spg_runtime_fixtures}/models.txt"
            "${_spg_runtime_fixtures}/text_wrong_shape.onnx" "${_spg_runtime_fixtures}/text_sqrt.onnx"
+           "${_spg_runtime_fixtures}/rec_softmax.onnx" "${_spg_runtime_fixtures}/rec_sqrt.onnx"
+           "${_spg_runtime_fixtures}/rec_wrong_classes.onnx" "${_spg_runtime_fixtures}/rec_no_dictionary.onnx"
     COMMAND Python3::Interpreter -I "${_spg_runtime_fixture_script}"
             --out "${_spg_runtime_fixtures}"
             --manifest "${PROJECT_SOURCE_DIR}/models/manifest.json"
@@ -130,4 +132,23 @@ if(SPG_WITH_DEPS)
   spg_target_defaults(spg-detect-tests)
   spg_copy_runtime_dlls(spg-detect-tests)
   catch_discover_tests(spg-detect-tests TEST_PREFIX "detect." DISCOVERY_MODE PRE_TEST)
+endif()
+
+# Text recognizer (SPG-07, lane:vision) ----------------------------------------------
+if(SPG_WITH_DEPS)
+  string(JSON _spg_ppocr_rec_version GET "${_spg_models_json}" models ppocr-rec-en version)
+  string(JSON _spg_ppocr_rec_file GET "${_spg_models_json}" models ppocr-rec-en file)
+  # Crops are made-up strings drawn at test time (synthetic_text.hpp).
+  add_executable(spg-ocr-tests
+    unit/ocr_test.cpp
+    integration/text_recognizer_test.cpp)
+  add_dependencies(spg-ocr-tests spg-runtime-fixtures)
+  target_link_libraries(spg-ocr-tests PRIVATE spg::ocr spg::opencv Catch2::Catch2WithMain)
+  target_compile_definitions(spg-ocr-tests PRIVATE
+    SPG_PPOCR_REC_MODEL="${SPG_CACHE_DIR}/models/ppocr-rec-en/${_spg_ppocr_rec_version}/${_spg_ppocr_rec_file}"
+    SPG_PPOCR_DET_MODEL="${SPG_CACHE_DIR}/models/ppocr-det-en/${_spg_ppocr_det_version}/${_spg_ppocr_det_file}"
+    SPG_RUNTIME_FIXTURES="${_spg_runtime_fixtures}")
+  spg_target_defaults(spg-ocr-tests)
+  spg_copy_runtime_dlls(spg-ocr-tests)
+  catch_discover_tests(spg-ocr-tests TEST_PREFIX "ocr." DISCOVERY_MODE PRE_TEST)
 endif()
