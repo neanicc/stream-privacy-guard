@@ -1401,3 +1401,71 @@ Template:
   first `Secret` of a process terminates instead of throwing. Pre-existing,
   outside this ticket. The coverage-assumption risk in scheduler.md (content
   that appears and disappears between cycles) is unchanged.
+
+## 2026-10-12 — SPG-17 Packaging and docs (#PR)
+
+- Decision / change: `scripts/package.sh` (called by `scripts/ci/run.sh
+  package`) installs a new CMake component, `obs-spg`
+  (`cmake/SpgInstall.cmake`, included by the root `CMakeLists.txt` after
+  `plugin/`, so `plugin/CMakeLists.txt` is unchanged), into
+  `build/package-stage/`, adds `INSTALL.txt` for the OS, the GPL license,
+  `scripts/fetch_models.py` with `fetch_deps.py` and `models/manifest.json`
+  (so the fetch step works from the unpacked folder), runs
+  `build-aux/package_tool.py check` and writes
+  `dist/obs-spg-<version>-<os>.zip` (macOS, Windows) or `.tar.gz` (Linux) and
+  `SHA256SUMS.txt`. README gains Install, Usage, Limitations, Privacy and
+  Packaging sections; draft notes in `docs/release-notes/0.1.0.md` (no
+  release, tag or upload).
+- Decisions (no one to ask; smallest change, safety first):
+  (1) Layout is what OBS 32 loads per user: the macOS bundle for
+  `~/Library/Application Support/obs-studio/plugins/`, and
+  `obs-spg/bin/64bit` + `obs-spg/data` for `C:\ProgramData\obs-studio\plugins\`
+  and `~/.config/obs-studio/plugins/`. Archives, not a `.pkg` or an installer:
+  nothing to sign, and the same tree on every OS. (2) The macOS bundle
+  installs whole, so whatever the module build puts in it (ONNX Runtime in
+  `Contents/Frameworks` once SPG-14b lands) is packaged. On Windows and
+  Linux ONNX Runtime is installed beside the module under the name it is
+  loaded by (`onnxruntime.dll`, its SONAME) only when the module links it:
+  a configure-time walk of the module's link graph (static libraries'
+  `$<LINK_ONLY:>` included) decides, and prints `obs-spg package ships ONNX
+  Runtime: TRUE/FALSE`. On `main` today it is FALSE. (3) The check is the
+  package's test: every library the module imports must be shipped beside it
+  or be libobs or an allow-listed OS library, nothing shipped may be unused,
+  macOS rpaths must stay inside the bundle, the licenses and data must be
+  present, and no `.onnx` may be present without `--with-models`. Windows
+  imports are read from the PE file itself (no dumpbin needed). (4) macOS:
+  the installed bundle has a linker signature but no resource seal, so
+  `codesign --verify` rejects it; the script seals it with an ad-hoc
+  signature (as obs-plugintemplate does without an identity) after all files
+  are in place, and the check verifies it with `--strict --deep`. No
+  Developer ID signing or notarization exists; packages are documented as
+  unsigned. (5) No model weights by default (AGENTS.md); `--with-models`
+  (never in CI) copies the pinned models from `$SPG_CACHE_DIR` into
+  `data/models/<name>/<version>/<file>` after a size and SHA-256 check, with
+  their license texts. (6) License texts the prebuilt packages lack are
+  committed in `build-aux/package/licenses/` (OpenCV 4.9.0, YuNet, RapidOCR
+  3.9.2, fetched from their pinned tags); ONNX Runtime's LICENSE and
+  ThirdPartyNotices, OpenCV's bundled third-party licenses and nlohmann/json's
+  LICENSE.MIT are installed from the pinned inputs. A test keeps the notices'
+  versions in step with `deps/manifest.json` and `core/CMakeLists.txt`.
+- Evidence (automated, dev Mac, macOS 26.5.2 arm64): `scripts/ci/run.sh
+  setup`, `build`, `package`: `obs-spg-0.1.0-macos-arm64.zip` (20 files), the
+  check passes, the unzipped bundle passes `codesign --verify --strict
+  --deep`, and `python3 -I scripts/fetch_models.py --verify` run from the
+  unzipped folder finds the three cached models. `--with-models` writes a
+  9.7 MB package whose check passes. Against a local merge of PR #61 (not
+  pushed): configure prints `ships ONNX Runtime: TRUE`, the bundle has
+  `Contents/Frameworks/libonnxruntime.1.dylib`, the only rpath is
+  `@loader_path/../Frameworks` and the check passes; deleting the dylib from
+  the staged bundle fails it (missing import, broken seal). New ctest
+  `scripts.package_tool` (16 cases: PE import and delay-import parsing,
+  dependency rules per OS, layout and model checks, archive folder, modes
+  and owner scrubbing, checksums, notices in step with the pins). Windows and
+  Linux packages are built only by CI; see the PR's Validation section.
+- Eval delta: not affected (packaging and docs only).
+- Open issues or follow-ups: when SPG-14b (#61) merges, the README status,
+  the "does not run detection" limitation and the release notes must say the
+  plugin loads the models, and the Windows and Linux packages must show
+  ONNX Runtime beside the module (the check fails otherwise). No live OBS
+  install from a package has been done; the live check should install from
+  the CI artifact rather than the build tree.

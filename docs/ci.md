@@ -25,7 +25,14 @@ Visual Studio with C++ tools on Windows) and prints ccache statistics, and
 `test` runs `ctest`, which fails if no tests are registered. One pin lives
 outside the manifest: Catch2 is fetched by CMake `FetchContent` at configure
 time, pinned by URL and SHA-256 in `tests/CMakeLists.txt`, so the first
-configure needs network access.
+configure needs network access. Since SPG-17 `package` runs
+`scripts/package.sh`: it installs the plugin's `obs-spg` CMake component,
+checks the staged tree (`build-aux/package_tool.py check`: module, data,
+licenses, the module's imported libraries against what is shipped, macOS
+rpaths and signature, no model weights) and writes
+`obs-spg-<version>-<os>.zip` (macOS, Windows) or `.tar.gz` (Linux) plus
+`SHA256SUMS.txt` to `dist/`, which the job uploads as `packages-<os>`. A failed
+check fails the job. Packages are unsigned and never published from CI.
 
 Plugin coverage differs by OS. `plugin.loads` (headless libobs: module load,
 filter registration, locale, defaults, property types) runs on macOS and

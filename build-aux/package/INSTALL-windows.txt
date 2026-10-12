@@ -23,17 +23,17 @@ Install
   4. Start OBS. Right-click a source > Filters > Effect Filters > + >
      Privacy Guard.
 
-  This build is not code-signed. onnxruntime.dll beside obs-spg.dll is the
-  ONNX Runtime version the plugin was built with; keep the two together.
+  This build is not code-signed. Keep the files in obs-spg\bin\64bit
+  together and do not replace any of them with another copy.
 
 Models
   The package carries no model weights. From this folder, run once:
        python scripts\fetch_models.py
   It downloads YuNet and PP-OCR from the pinned URLs in models\manifest.json,
   checks each file's size and SHA-256, and installs them in
-  %USERPROFILE%\.cache\spg\models (or %SPG_CACHE_DIR%\models). The plugin
-  checks them again before loading and never downloads anything itself.
-  Without the models the filter fails closed: it blurs the whole source.
+  %USERPROFILE%\.cache\spg\models (or %SPG_CACHE_DIR%\models). Nothing in
+  the plugin downloads anything. Without the models the filter cannot detect
+  anything and fails closed: it blurs the whole source.
 
 Audio
   The filter delays the video by its Lookahead (500 ms by default). Set the

@@ -17,8 +17,9 @@ Install
   2. Copy obs-spg.plugin into
        ~/Library/Application Support/obs-studio/plugins/
      (create the plugins folder if it does not exist).
-  3. This build is not signed or notarized. If the archive was downloaded
-     with a browser, macOS quarantines it; remove the mark so OBS can load it:
+  3. This build has only an ad-hoc signature: it is not signed with a
+     developer certificate or notarized. If the archive was downloaded with
+     a browser, macOS quarantines it; remove the mark so OBS can load it:
        xattr -dr com.apple.quarantine ~/Library/Application\ Support/obs-studio/plugins/obs-spg.plugin
   4. Fetch the models (next section).
   5. Start OBS. Right-click a source > Filters > Effect Filters > + >
@@ -29,9 +30,9 @@ Models
        python3 scripts/fetch_models.py
   It downloads YuNet and PP-OCR from the pinned URLs in models/manifest.json,
   checks each file's size and SHA-256, and installs them in
-  ~/.cache/spg/models (or $SPG_CACHE_DIR/models). The plugin checks them
-  again before loading and never downloads anything itself. Without the
-  models the filter fails closed: it blurs the whole source.
+  ~/.cache/spg/models (or $SPG_CACHE_DIR/models). Nothing in the plugin
+  downloads anything. Without the models the filter cannot detect anything
+  and fails closed: it blurs the whole source.
 
 Audio
   The filter delays the video by its Lookahead (500 ms by default). Set the
