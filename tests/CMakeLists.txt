@@ -37,6 +37,8 @@ target_sources(spg-unit-tests PRIVATE
   unit/lookahead_property_test.cpp
   unit/scheduler_test.cpp)
 target_include_directories(spg-unit-tests PRIVATE "${PROJECT_SOURCE_DIR}/core/src")
+# CPU reference compositor (SPG-11).
+target_sources(spg-unit-tests PRIVATE unit/compose_test.cpp)
 
 # Prebuilt dependencies link, load and run ------------------------------------
 if(SPG_WITH_DEPS)
@@ -57,13 +59,30 @@ set_tests_properties(cli.version PROPERTIES
   PASS_REGULAR_EXPRESSION "^spg-cli ${PROJECT_VERSION}\r?\n$")
 add_test(NAME cli.help COMMAND spg-cli --help)
 set_tests_properties(cli.help PROPERTIES PASS_REGULAR_EXPRESSION "usage: spg-cli")
-# Unimplemented and unknown commands must exit non-zero.
+# Commands without their required options, the unimplemented scrub and
+# unknown commands must exit non-zero.
 foreach(command run bench eval scrub frobnicate)
   add_test(NAME cli.rejects-${command} COMMAND spg-cli ${command})
   set_tests_properties(cli.rejects-${command} PROPERTIES WILL_FAIL TRUE)
 endforeach()
 add_test(NAME cli.rejects-no-arguments COMMAND spg-cli)
 set_tests_properties(cli.rejects-no-arguments PROPERTIES WILL_FAIL TRUE)
+
+# spg-cli commands and drivers (SPG-11), in process. The unit cases use fake
+# stages; the model case runs the pinned models and skips when they are not
+# cached. Frames are written under the build tree.
+add_executable(spg-cli-tests unit/cli_test.cpp)
+target_link_libraries(spg-cli-tests PRIVATE spg-cli-lib nlohmann_json::nlohmann_json Catch2::Catch2WithMain)
+target_include_directories(spg-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/unit")
+target_compile_definitions(spg-cli-tests PRIVATE SPG_CLI_TEST_DIR="${CMAKE_CURRENT_BINARY_DIR}/cli-tmp")
+if(SPG_WITH_DEPS)
+  target_sources(spg-cli-tests PRIVATE integration/cli_pipeline_test.cpp)
+  target_link_libraries(spg-cli-tests PRIVATE spg::opencv)
+  target_compile_definitions(spg-cli-tests PRIVATE SPG_CACHE_DIR="${SPG_CACHE_DIR}")
+  spg_copy_runtime_dlls(spg-cli-tests)
+endif()
+spg_target_defaults(spg-cli-tests)
+catch_discover_tests(spg-cli-tests TEST_PREFIX "cli." DISCOVERY_MODE PRE_TEST PROPERTIES TIMEOUT 300)
 
 # Dependency fetch script --------------------------------------------------------
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter)
@@ -82,6 +101,9 @@ add_test(NAME scoring.scorer
 add_test(NAME scoring.generators
   COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_generators.py")
 set_tests_properties(scoring.generators PROPERTIES ENVIRONMENT "SPG_CACHE_DIR=${SPG_CACHE_DIR}")
+# The eval driver's pipeline wiring (SPG-11), with fake suites and a fake spg-cli.
+add_test(NAME scoring.driver
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_run_pipeline.py")
 
 # ONNX Runtime session wrapper ------------------------------------------------------
 if(SPG_WITH_DEPS)

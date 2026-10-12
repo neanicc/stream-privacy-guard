@@ -158,8 +158,9 @@ left null only when `scan.categories` disables its categories; otherwise
 every cycle fails and every frame gets the fallback. Without a recognizer or
 policy every text region is masked. Recognized text longer than
 `scan.max_text_bytes` (512) is not passed to the policy; its region is masked.
-Offline, `spg-cli` (SPG-11) can drive `Lookahead` directly: push, take a job,
-`run_scan()`, `complete()`, `release_due()`.
+Offline, `spg-cli` (SPG-11) drives `Lookahead` directly: push, take a job,
+`run_scan()`, `complete()`, `release_due()`, in simulated time
+([cli.md](cli.md)); `spg-cli bench --realtime` drives `Scheduler`.
 
 ## Defaults
 

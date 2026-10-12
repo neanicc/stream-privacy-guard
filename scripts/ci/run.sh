@@ -155,12 +155,7 @@ case "$stage" in
       bash "$root/scripts/ci/run.sh" setup
       bash "$root/scripts/ci/run.sh" build
     fi
-    if [[ ! -f eval/run_eval.py ]]; then
-      echo "THRESHOLDS: NOT RUN (eval driver not implemented yet; SPG-03 and SPG-11)"
-      # CI stays green before the eval exists; local acceptance must not pass.
-      [[ "$mode" == ci ]] && exit 0
-      exit 1
-    fi
+    # run_eval.py runs spg-cli from $build_dir; without it the verdict is FAIL.
     "$py" eval/run_eval.py --mode "$mode" --build-dir "$build_dir" \
       --thresholds eval/thresholds.toml --out eval-out
     ;;

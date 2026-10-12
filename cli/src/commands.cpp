@@ -1,0 +1,496 @@
+#include "commands.hpp"
+
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <system_error>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "driver.hpp"
+#include "image_io.hpp"
+#include "inputs.hpp"
+#include "spg/error.hpp"
+#include "spg/json.hpp"
+#include "spg/version.hpp"
+#include "timing.hpp"
+
+namespace spg::cli {
+
+namespace {
+
+namespace fs = std::filesystem;
+using nlohmann::json;
+
+class UsageError : public std::runtime_error {
+ public:
+  explicit UsageError(const std::string& what) : std::runtime_error(what) {}
+};
+
+constexpr std::string_view kUsage =
+    "usage: spg-cli <command> [options]\n"
+    "\n"
+    "commands:\n"
+    "  run     run the pipeline on one PNG sequence and write its mask plans\n"
+    "            --frames DIR --policy FILE --out FILE [--fps N] [--timing FILE]\n"
+    "            [--write-frames DIR]  debug: write every composed frame (off by default)\n"
+    "  eval    run the pipeline on every sequence of a generated eval suite\n"
+    "            --suite DIR --plans DIR [--timing FILE]\n"
+    "            writes DIR/<sequence>/mask_plans.jsonl; eval/score.py scores them\n"
+    "  bench   measure stage latency, detection latency and the fail-closed rate\n"
+    "            (--frames DIR --policy FILE [--fps N] | --suite DIR [--resolution WxH])\n"
+    "            [--realtime] [--out FILE | --plans DIR] [--report FILE]\n"
+    "            simulated feed (default): cycles take their measured time, the\n"
+    "            CPU compositor runs on every frame; --realtime: worker threads\n"
+    "            on the wall clock, fed at fps\n"
+    "  scrub   find planted strings still readable in a recording (SPG-18, not implemented)\n"
+    "\n"
+    "pipeline options:\n"
+    "  --cache DIR            models cache (default: $SPG_CACHE_DIR or ~/.cache/spg)\n"
+    "  --cpu                  run the models on CPU only\n"
+    "  --readback-scale S     scan a copy scaled by S in (0, 1] (default 1)\n"
+    "  --workers N            detection workers (default 2)\n"
+    "  --cycle-ms MS          run/eval: simulated time per detection cycle (default 200)\n"
+    "\n"
+    "  --version  print the version and exit\n"
+    "  --help     print this help and exit\n";
+
+// --name value pairs and --flag switches; anything else is a usage error.
+class Options {
+ public:
+  Options(std::span<const std::string_view> args, const std::set<std::string_view>& valued,
+          const std::set<std::string_view>& flags) {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+      const std::string_view a = args[i];
+      if (flags.contains(a)) {
+        flags_.insert(std::string(a));
+      } else if (valued.contains(a)) {
+        if (i + 1 >= args.size()) {
+          throw UsageError(std::string(a) + " needs a value");
+        }
+        if (!values_.emplace(std::string(a), std::string(args[i + 1])).second) {
+          throw UsageError(std::string(a) + " given twice");
+        }
+        ++i;
+      } else {
+        throw UsageError("unknown option '" + std::string(a) + "'");
+      }
+    }
+  }
+  [[nodiscard]] bool flag(std::string_view name) const { return flags_.contains(std::string(name)); }
+  [[nodiscard]] std::optional<std::string> get(std::string_view name) const {
+    const auto it = values_.find(std::string(name));
+    return it == values_.end() ? std::nullopt : std::optional<std::string>(it->second);
+  }
+  [[nodiscard]] std::string need(std::string_view name) const {
+    std::optional<std::string> v = get(name);
+    if (!v) {
+      throw UsageError(std::string(name) + " is required");
+    }
+    return *v;
+  }
+
+ private:
+  std::map<std::string, std::string> values_;
+  std::set<std::string> flags_;
+};
+
+double parse_number(const std::string& text, std::string_view name) {
+  try {
+    std::size_t used = 0;
+    const double v = std::stod(text, &used);
+    if (used != text.size() || !std::isfinite(v)) {
+      throw UsageError(std::string(name) + " must be a number");
+    }
+    return v;
+  } catch (const std::logic_error&) {
+    throw UsageError(std::string(name) + " must be a number");
+  }
+}
+
+std::uint32_t parse_count(const std::string& text, std::string_view name) {
+  std::uint32_t v = 0;
+  const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+  if (ec != std::errc{} || end != text.data() + text.size() || v == 0) {
+    throw UsageError(std::string(name) + " must be a positive integer");
+  }
+  return v;
+}
+
+Size parse_resolution(const std::string& text) {
+  const std::size_t x = text.find('x');
+  if (x == std::string::npos) {
+    throw UsageError("--resolution must look like 1920x1080");
+  }
+  return Size{parse_count(text.substr(0, x), "--resolution width"), parse_count(text.substr(x + 1), "--resolution height")};
+}
+
+const std::set<std::string_view> kPipelineValued = {"--cache", "--readback-scale", "--workers", "--cycle-ms"};
+
+struct PipelineSetup {
+  DriverOptions driver;
+  StageOptions stages;
+  fs::path cache;
+};
+
+PipelineSetup pipeline_setup(const Options& o, bool simulated_fixed) {
+  PipelineSetup s;
+  s.cache = o.get("--cache") ? fs::path(*o.get("--cache")) : default_cache_dir();
+  s.stages.cpu_only = o.flag("--cpu");
+  if (const auto v = o.get("--readback-scale")) {
+    s.driver.readback_scale = parse_number(*v, "--readback-scale");
+    if (!(s.driver.readback_scale > 0.0 && s.driver.readback_scale <= 1.0)) {
+      throw UsageError("--readback-scale must be in (0, 1]");
+    }
+  }
+  if (const auto v = o.get("--workers")) {
+    s.driver.workers = parse_count(*v, "--workers");
+  }
+  if (const auto v = o.get("--cycle-ms")) {
+    if (!simulated_fixed) {
+      throw UsageError("--cycle-ms applies to run and eval only; bench measures each cycle");
+    }
+    const double ms = parse_number(*v, "--cycle-ms");
+    if (ms < 0.0 || ms > 60000.0) {
+      throw UsageError("--cycle-ms must be in [0, 60000]");
+    }
+    s.driver.cycle = std::chrono::duration_cast<Duration>(std::chrono::duration<double, std::milli>(ms));
+  }
+  if (!simulated_fixed) {
+    s.driver.cycle.reset();
+  }
+  return s;
+}
+
+OpenedStages open_for(const CliHooks& hooks, const PolicyConfig& policy, const PipelineSetup& setup) {
+  if (hooks.open) {
+    return hooks.open(policy, setup.stages, setup.cache);
+  }
+  return open_stages(model_paths(setup.cache), policy, setup.stages);
+}
+
+FrameSource png_source(const FrameSequence& seq, StageTimes& times) {
+  FrameSource source;
+  source.count = seq.frames.size();
+  source.fps = seq.fps;
+  source.load = [frames = seq.frames, expected = seq.size, &times](std::size_t i) {
+    const auto start = std::chrono::steady_clock::now();
+    BgraImage image = read_png(frames.at(i));
+    times.add(kStageDecode, elapsed_ms(start, std::chrono::steady_clock::now()));
+    if (expected.width != 0 && image.size() != expected) {
+      throw CliError(frames.at(i).string() + " is " + std::to_string(image.width) + "x" +
+                     std::to_string(image.height) + ", the suite declares " + std::to_string(expected.width) + "x" +
+                     std::to_string(expected.height));
+    }
+    return image;
+  };
+  return source;
+}
+
+void write_plans(const fs::path& path, const std::vector<MaskPlan>& plans) {
+  if (path.has_parent_path()) {
+    fs::create_directories(path.parent_path());
+  }
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  for (const MaskPlan& plan : plans) {
+    out << serialize_mask_plan(plan) << '\n';
+  }
+  if (!out) {
+    throw CliError("cannot write " + path.string());
+  }
+}
+
+void write_json(const fs::path& path, const json& doc) {
+  if (path.has_parent_path()) {
+    fs::create_directories(path.parent_path());
+  }
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out << doc.dump(2) << '\n';
+  if (!out) {
+    throw CliError("cannot write " + path.string());
+  }
+}
+
+json summary_json(const StageSummary& s) {
+  return json{{"count", s.count}, {"total_ms", s.total_ms}, {"mean_ms", s.mean_ms},
+              {"p50_ms", s.p50_ms}, {"p95_ms", s.p95_ms}, {"max_ms", s.max_ms}};
+}
+
+// Totals over the sequences of one command.
+struct Totals {
+  std::size_t frames = 0;
+  std::size_t fail_closed = 0;
+  std::size_t padding = 0;
+  std::size_t late = 0;
+  std::vector<double> latencies_ms;
+  json sequences = json::array();
+  json scheduler = json::object();
+
+  void add(const std::string& name, const SequenceResult& r) {
+    frames += r.plans.size();
+    fail_closed += r.fail_closed;
+    padding += r.padding_frames;
+    late += r.late_frames;
+    latencies_ms.insert(latencies_ms.end(), r.latencies_ms.begin(), r.latencies_ms.end());
+    sequences.push_back(json{{"name", name},
+                             {"frames", r.plans.size()},
+                             {"fail_closed_frames", r.fail_closed},
+                             {"padding_frames", r.padding_frames},
+                             {"late_frames", r.late_frames}});
+    const auto bump = [this](const char* key, std::uint64_t v) {
+      scheduler[key] = scheduler.value(key, std::uint64_t{0}) + v;
+    };
+    bump("frames_pushed", r.stats.frames_pushed);
+    bump("frames_released", r.stats.frames_released);
+    bump("frames_failed_closed", r.stats.frames_failed_closed);
+    bump("early_releases", r.stats.early_releases);
+    bump("bad_timestamps", r.stats.bad_timestamps);
+    bump("scans_queued", r.stats.scans_queued);
+    bump("scans_dropped", r.stats.scans_dropped);
+    bump("scans_started", r.stats.scans_started);
+    bump("scans_completed", r.stats.scans_completed);
+    bump("scans_failed", r.stats.scans_failed);
+  }
+};
+
+json report_json(std::string_view command, std::string_view mode, std::uint32_t fps, const PipelineSetup& setup,
+                 const std::string& providers, const Totals& totals, const StageTimes& times) {
+  json stages = json::object();
+  for (const auto& [name, s] : times.summary()) {
+    stages[name] = summary_json(s);
+  }
+  const double rate =
+      totals.frames == 0 ? 0.0 : static_cast<double>(totals.fail_closed) / static_cast<double>(totals.frames);
+  json doc{{"schema", 1},
+           {"command", command},
+           {"mode", mode},
+           {"version", version()},
+           {"fps", fps},
+           {"workers", setup.driver.workers},
+           {"readback_scale", setup.driver.readback_scale},
+           {"providers", providers},
+           {"frames", totals.frames},
+           {"padding_frames", totals.padding},
+           {"late_frames", totals.late},
+           {"fail_closed_frames", totals.fail_closed},
+           {"fail_closed_frame_rate", rate},
+           {"detection_latency_ms", summary_json(summarize(totals.latencies_ms))},
+           {"latencies_ms", totals.latencies_ms},
+           {"stages", stages},
+           {"scheduler", totals.scheduler},
+           {"sequences", totals.sequences}};
+  doc["cycle_ms"] = setup.driver.cycle ? json(to_ms(*setup.driver.cycle)) : json(nullptr);
+  return doc;
+}
+
+void print_summary(std::ostream& out, std::string_view command, std::string_view mode, const std::string& providers,
+                   const Totals& totals, const StageTimes& times) {
+  out << "spg-cli " << command << " (" << mode << "): " << totals.frames << " frames, " << totals.fail_closed
+      << " fail-closed, " << totals.padding << " padding";
+  if (totals.late > 0) {
+    out << ", " << totals.late << " fed late";
+  }
+  out << '\n';
+  if (!providers.empty()) {
+    out << "providers: " << providers << '\n';
+  }
+  const StageSummary lat = summarize(totals.latencies_ms);
+  out << std::fixed << std::setprecision(1);
+  out << "detection latency: " << lat.count << " cycles, p50 " << lat.p50_ms << " ms, p95 " << lat.p95_ms
+      << " ms, max " << lat.max_ms << " ms\n";
+  out << std::left << std::setw(14) << "stage" << std::right << std::setw(8) << "calls" << std::setw(10) << "mean ms"
+      << std::setw(10) << "p50 ms" << std::setw(10) << "p95 ms" << std::setw(10) << "max ms" << '\n';
+  for (const auto& [name, s] : times.summary()) {
+    out << std::left << std::setw(14) << name << std::right << std::setw(8) << s.count << std::setw(10) << s.mean_ms
+        << std::setw(10) << s.p50_ms << std::setw(10) << s.p95_ms << std::setw(10) << s.max_ms << '\n';
+  }
+  out.unsetf(std::ios::floatfield);
+}
+
+int cmd_run(std::span<const std::string_view> args, std::ostream& out, std::ostream& err, const CliHooks& hooks) {
+  std::set<std::string_view> valued = kPipelineValued;
+  valued.insert({"--frames", "--policy", "--out", "--fps", "--timing", "--write-frames"});
+  const Options o(args, valued, {"--cpu"});
+  PipelineSetup setup = pipeline_setup(o, true);
+  FrameSequence seq;
+  seq.name = "run";
+  seq.frames = list_frames(o.need("--frames"));
+  seq.fps = o.get("--fps") ? parse_count(*o.get("--fps"), "--fps") : 60;
+  const fs::path out_file = o.need("--out");
+  const PolicyConfig policy = read_policy(o.need("--policy"));
+  if (const auto dir = o.get("--write-frames")) {
+    // Debug only, never on by default: composed frames hold whatever the
+    // source showed outside the masks.
+    err << "spg-cli: debug: writing composed frames to " << *dir << '\n';
+    fs::create_directories(*dir);
+    setup.driver.compose = true;
+    setup.driver.on_composed = [target = fs::path(*dir)](std::size_t index, const BgraImage& image) {
+      std::ostringstream name;
+      name << std::setw(6) << std::setfill('0') << index << ".png";
+      write_png(target / name.str(), image);
+    };
+  }
+  const OpenedStages opened = open_for(hooks, policy, setup);
+  auto times = std::make_shared<StageTimes>();
+  const ScanStages stages = timed(opened.stages, times);
+  const SequenceResult result = run_simulated(png_source(seq, *times), policy, stages, setup.driver, *times);
+  write_plans(out_file, result.plans);
+  Totals totals;
+  totals.add(seq.name, result);
+  print_summary(out, "run", "simulated", opened.providers, totals, *times);
+  if (const auto timing = o.get("--timing")) {
+    write_json(*timing, report_json("run", "simulated", seq.fps, setup, opened.providers, totals, *times));
+  }
+  return kExitOk;
+}
+
+int cmd_suite(std::span<const std::string_view> args, std::ostream& out, const CliHooks& hooks) {
+  std::set<std::string_view> valued = kPipelineValued;
+  valued.insert({"--suite", "--plans", "--timing"});
+  const Options o(args, valued, {"--cpu"});
+  const PipelineSetup setup = pipeline_setup(o, true);
+  const Suite suite = read_suite(o.need("--suite"));
+  const fs::path plans = o.need("--plans");
+  const OpenedStages opened = open_for(hooks, suite.policy, setup);
+  auto times = std::make_shared<StageTimes>();
+  const ScanStages stages = timed(opened.stages, times);
+  Totals totals;
+  for (const FrameSequence& seq : suite.sequences) {
+    const SequenceResult result = run_simulated(png_source(seq, *times), suite.policy, stages, setup.driver, *times);
+    write_plans(plans / seq.name / "mask_plans.jsonl", result.plans);
+    totals.add(seq.name, result);
+    out << seq.name << ": " << result.plans.size() << " frames, " << result.fail_closed << " fail-closed\n";
+  }
+  print_summary(out, "eval", "simulated", opened.providers, totals, *times);
+  if (const auto timing = o.get("--timing")) {
+    write_json(*timing, report_json("eval", "simulated", suite.fps, setup, opened.providers, totals, *times));
+  }
+  return kExitOk;
+}
+
+int cmd_bench(std::span<const std::string_view> args, std::ostream& out, const CliHooks& hooks) {
+  std::set<std::string_view> valued = kPipelineValued;
+  valued.insert({"--frames", "--policy", "--fps", "--suite", "--resolution", "--out", "--plans", "--report"});
+  const Options o(args, valued, {"--cpu", "--realtime"});
+  const bool realtime = o.flag("--realtime");
+  PipelineSetup setup = pipeline_setup(o, false);
+  setup.driver.compose = !realtime;
+
+  std::vector<FrameSequence> sequences;
+  PolicyConfig policy;
+  std::uint32_t fps = 60;
+  if (o.get("--suite")) {
+    if (o.get("--frames") || o.get("--policy") || o.get("--fps") || o.get("--out")) {
+      throw UsageError("--suite takes the frames, policy and fps from suite.json (use --plans for output)");
+    }
+    Suite suite = read_suite(*o.get("--suite"));
+    policy = suite.policy;
+    fps = suite.fps;
+    const std::optional<Size> only = o.get("--resolution") ? std::optional<Size>(parse_resolution(*o.get("--resolution")))
+                                                           : std::nullopt;
+    for (FrameSequence& seq : suite.sequences) {
+      if (!only || seq.size == *only) {
+        sequences.push_back(std::move(seq));
+      }
+    }
+    if (sequences.empty()) {
+      throw CliError("no sequence of the suite has the requested resolution");
+    }
+  } else {
+    if (o.get("--plans") || o.get("--resolution")) {
+      throw UsageError("--plans and --resolution need --suite");
+    }
+    FrameSequence seq;
+    seq.name = "bench";
+    seq.frames = list_frames(o.need("--frames"));
+    seq.fps = o.get("--fps") ? parse_count(*o.get("--fps"), "--fps") : 60;
+    fps = seq.fps;
+    policy = read_policy(o.need("--policy"));
+    sequences.push_back(std::move(seq));
+  }
+
+  const OpenedStages opened = open_for(hooks, policy, setup);
+  auto times = std::make_shared<StageTimes>();
+  Totals totals;
+  for (const FrameSequence& seq : sequences) {
+    SequenceResult result;
+    if (realtime) {
+      auto cycles = std::make_shared<CycleLog>();
+      result = run_realtime(png_source(seq, *times), policy, timed(opened.stages, times, cycles), setup.driver,
+                            *times, *cycles);
+    } else {
+      result = run_simulated(png_source(seq, *times), policy, timed(opened.stages, times), setup.driver, *times);
+    }
+    if (const auto file = o.get("--out")) {
+      write_plans(*file, result.plans);
+    }
+    if (const auto dir = o.get("--plans")) {
+      write_plans(fs::path(*dir) / seq.name / "mask_plans.jsonl", result.plans);
+    }
+    totals.add(seq.name, result);
+  }
+  const std::string_view mode = realtime ? "realtime" : "simulated";
+  print_summary(out, "bench", mode, opened.providers, totals, *times);
+  if (const auto report = o.get("--report")) {
+    write_json(*report, report_json("bench", mode, fps, setup, opened.providers, totals, *times));
+  }
+  return kExitOk;
+}
+
+}  // namespace
+
+int run_cli(std::span<const std::string_view> args, std::ostream& out, std::ostream& err, const CliHooks& hooks) {
+  if (args.empty()) {
+    err << kUsage;
+    return kExitUsage;
+  }
+  const std::string_view command = args[0];
+  const std::span<const std::string_view> rest = args.subspan(1);
+  if (command == "--version") {
+    out << "spg-cli " << version() << '\n';
+    return kExitOk;
+  }
+  if (command == "--help" || command == "-h") {
+    out << kUsage;
+    return kExitOk;
+  }
+  try {
+    if (command == "run") {
+      return cmd_run(rest, out, err, hooks);
+    }
+    if (command == "eval") {
+      return cmd_suite(rest, out, hooks);
+    }
+    if (command == "bench") {
+      return cmd_bench(rest, out, hooks);
+    }
+    if (command == "scrub") {
+      err << "spg-cli: 'scrub' is not implemented yet (SPG-18)\n";
+      return kExitUsage;
+    }
+    err << "spg-cli: unknown command '" << command << "'\n" << kUsage;
+    return kExitUsage;
+  } catch (const UsageError& e) {
+    err << "spg-cli " << command << ": " << e.what() << "\n" << kUsage;
+    return kExitUsage;
+  } catch (const std::exception& e) {
+    // CliError, ContractError (field names and offsets only), filesystem and
+    // runtime errors: none carries recognized text or a watch-list entry.
+    err << "spg-cli " << command << ": error: " << e.what() << '\n';
+    return kExitFailure;
+  }
+}
+
+}  // namespace spg::cli
