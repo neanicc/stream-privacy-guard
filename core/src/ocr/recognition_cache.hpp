@@ -135,7 +135,8 @@ class RecognitionCache {
   [[nodiscard]] const RecognitionCacheConfig& config() const noexcept { return config_; }
 
   // Test hook: called with a fingerprint's pixel bytes right after the cache
-  // wiped them and before they are freed. Must not touch this cache.
+  // wiped them and before they are freed. Must not touch this cache. An
+  // exception it throws is swallowed, so cleanup always finishes.
   using WipeObserver = std::function<void(const std::uint8_t* pixels, std::size_t bytes)>;
   void set_wipe_observer(WipeObserver observer) { observer_ = std::move(observer); }
 

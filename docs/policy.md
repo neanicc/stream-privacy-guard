@@ -157,6 +157,14 @@ What is not covered:
   Linux), so later watch-list regions could not be locked, and on Windows the
   512 Windows Error Reporting exclusions per process, so later watch-list
   regions could not be kept out of dumps.
+  Residual risk: a fingerprint is a picture of on-screen text, possibly a
+  watch-listed string, and while it is cached (up to `max_age`, default
+  1 s) it can appear in a crash dump or swap. The transient crops
+  `fingerprint()` and the recognizer's read jobs render (including buffers
+  a growing vector frees) are not zeroed at all. "Wiped, dump-excluded
+  memory" in SPG-15d holds for recognized text, not for the pixels that
+  show it. A bounded pixel arena in `SecureHeap` or a shorter default
+  `max_age` would narrow this; neither is part of SPG-15d.
 - **Very short text in the policy.** `evaluate()`'s `SecureU32String`
   temporaries keep up to 3 or 4 code points (by standard library) inside the
   string object, which is on the stack (see

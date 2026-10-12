@@ -215,6 +215,19 @@ TEST_CASE("CTC decode builds the text in protected memory and zeroes it", "[ocr]
     CHECK(wipes.all_zero());
     CHECK(heap.stats().live_blocks == live_before);
   }
+  SECTION("a decode error zeroes the bytes it appended") {
+    // The block is large enough that decoding never reallocates, so the bytes
+    // past size() after the error are the ones the decode wrote.
+    ocr::SecureText text{'x'};
+    text.reserve(64);
+    const char* data = text.data();
+    std::vector<float> probs = steps_of({1, 2, 3, 1}, c);
+    probs.back() = std::numeric_limits<float>::quiet_NaN();
+    CHECK_THROWS_AS(ocr::ctc_greedy_decode(probs, 4, alphabet, text), ocr::DecodeError);
+    REQUIRE(text.data() == data);
+    CHECK(ocr::view(text) == "x");
+    CHECK(std::all_of(data + 1, data + 4, [](char b) { return b == 0; }));
+  }
 }
 
 // --- Line splitting ----------------------------------------------------------
@@ -772,6 +785,43 @@ TEST_CASE("Fingerprint: moved-from and wiped fingerprints are empty", "[ocr][cac
   CHECK(assigned.pixels.empty());
   CHECK(assigned.crop == Size{});
   CHECK_FALSE(ocr::same_content(assigned, copy));
+}
+
+TEST_CASE("Fingerprint::wipe zeroes its pixels and spare capacity", "[ocr][cache][secure]") {
+  // Nonzero bytes in both the used part and the spare capacity; wipe() keeps
+  // the allocation, so every byte of it can be read back afterwards.
+  std::vector<std::uint8_t> bytes(96, 0xAB);
+  bytes.resize(48);
+  ocr::Fingerprint print({4, 4}, std::move(bytes));
+  const std::uint8_t* data = print.pixels.data();
+  const std::size_t capacity = print.pixels.capacity();
+  REQUIRE(capacity >= 96);
+  REQUIRE(std::all_of(data, data + capacity, [](std::uint8_t b) { return b == 0xAB; }));
+  print.wipe();
+  REQUIRE(print.pixels.data() == data);
+  REQUIRE(print.pixels.capacity() == capacity);
+  CHECK(print.pixels.empty());
+  CHECK(std::all_of(data, data + capacity, [](std::uint8_t b) { return b == 0; }));
+}
+
+TEST_CASE("RecognitionCache: a throwing wipe observer does not stop cleanup", "[ocr][cache][secure]") {
+  const ocr::Fingerprint print = print_of(strokes({30, 40, 50, 60}));
+  std::size_t calls = 0;
+  ocr::RecognitionCache cache;
+  cache.set_wipe_observer([&calls](const std::uint8_t*, std::size_t) {
+    ++calls;
+    throw std::runtime_error("observer failed");
+  });
+  cache.store(1, print, reading("1"), at_ms(0));
+  cache.store(2, print, reading("2"), at_ms(0));
+  cache.erase(1);
+  CHECK(calls == 1);
+  CHECK(cache.size() == 1);
+  CHECK(cache.bytes() == print.pixels.size());
+  cache.prune(at_ms(5000));
+  CHECK(calls == 2);
+  CHECK(cache.size() == 0);
+  CHECK(cache.bytes() == 0);
 }
 
 TEST_CASE("RecognitionCache stays within its bounds under churn", "[ocr][cache]") {

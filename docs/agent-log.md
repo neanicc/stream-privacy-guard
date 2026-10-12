@@ -1037,10 +1037,14 @@ Template:
   (`Recognized text never reaches streams, errors or verdicts`) passes
   unchanged. Mutation checks: joining a region's text in a `std::string`
   failed the recognizer case; a cache release that does not zero failed the
-  cache case; dropping an entry without the release failed it too. Not
-  covered by a test: zeroing the probabilities and the bytes a failed decode
-  appended (neither is in the observed heap); both are a single
-  `secure_wipe` call.
+  cache case; dropping an entry without the release failed it too. Review
+  follow-up: `RecognitionCache::release()` (noexcept) now swallows an
+  exception from its test observer, as `SecureHeap` does, and new cases check
+  the bytes a failed decode appended, `Fingerprint::wipe()` on its own
+  (used part and spare capacity), and a throwing observer; dropping each of
+  those three lines failed its case. Not covered by a test: zeroing the
+  model's output probabilities (one `secure_wipe` call; needs a model run).
+  The residual risk of cached crop pixels is stated in `docs/policy.md`.
 - Eval delta: none expected (memory handling only; texts identical). The eval
   stage was not run locally (the agent sandbox refuses that command); CI runs
   it.

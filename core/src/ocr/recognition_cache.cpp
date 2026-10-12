@@ -96,7 +96,11 @@ RecognitionCache::~RecognitionCache() {
 void RecognitionCache::release(Fingerprint& print) noexcept {
   zero_all(print.pixels);
   if (observer_ && !print.pixels.empty()) {
-    observer_(print.pixels.data(), print.pixels.size());
+    try {
+      observer_(print.pixels.data(), print.pixels.size());
+    } catch (...) {
+      // A test hook must not break cleanup (release() is noexcept).
+    }
   }
   print.pixels.clear();
   print.crop = {};
