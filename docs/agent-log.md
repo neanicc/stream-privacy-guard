@@ -1053,3 +1053,55 @@ Template:
   so that comparison is missing; the change there is one `memset` per
   fingerprint (about 100 KB per six-region cycle). Pixel copies in the
   detector, the lookahead's `OwnedFrame` and ONNX Runtime stay unzeroed.
+
+## 2026-10-12 — SPG-15c Intermittent plugin.loads abort on macOS CI (#44)
+
+- Root cause: a data race in the test, not in the plugin. The test's libobs
+  log handler appended every line to one global `std::string` with no lock.
+  libobs calls the log handler from whichever thread logs, also without a lock
+  (`util/base.c`, `blogva`). Since OBS 30, `obs_source_release()` hands
+  destruction to libobs's destroy-task thread (`obs_source_destroy_defer`),
+  which logs "private source ... destroyed" and, in this headless run,
+  `gs_*` "not in a graphics context" errors. Meanwhile the main thread logs
+  the next filter's creation. Two appends at once corrupted the string's heap
+  buffer, and libmalloc aborted.
+- Evidence: macOS crash reports (`~/Library/Logs/DiagnosticReports`) from a
+  local repro on `main` (cc5da96) all show the same stack:
+  `capture_log` -> `std::string::append` -> `__grow_by_and_replace` ->
+  `free`, ending in "BUG IN CLIENT OF LIBMALLOC: pointer being freed was not
+  allocated" (SIGABRT) or "not an allocated block" (SIGTRAP via `mfm_free`).
+  The thread was either `obs_source_destroy_defer` on libobs's task thread or
+  `filter_update` / `obs_shutdown` on the main thread. In every case the other
+  thread was logging at the same moment. The output "last seen" before CI's
+  abort was not where it happened: stdout to a pipe is fully buffered, and an
+  abort drops the unflushed tail. The CI log for run 38251187913 already shows
+  `spg-clamp-2` created and destroyed, with destroy-thread lines interleaved
+  among main-thread lines.
+- Reproduction (dev Mac, M4, Release build, 8 parallel workers, each with its
+  own config directory, so the two threads overlap more often): `main`
+  failed 73 of 2000 runs (13 SIGABRT, 60 SIGTRAP). With the fix, 0 of 2000
+  failed, then 0 of 5000 with 10 workers, and
+  `ctest -R plugin.loads --repeat until-fail:500` passed. Run serially, `main`
+  passed 300 of 300, which is why 30 local repeats never caught it.
+- Sanitizers (separate build directories with `-fsanitize=thread` and
+  `-fsanitize=address,undefined` on our code; CI flags unchanged): no reports
+  on `main` (TSan 3 runs, ASan+UBSan 50) or with the fix (TSan 20,
+  ASan+UBSan 100). TSan could not see this race. `std::string::append` is
+  compiled into the system libc++ dylib, so TSan does not instrument it, and
+  ASan only notices if the corruption happens during the run. TSan did check
+  the plugin's code running on the destroy thread (`filter_destroy`: registry
+  release and `FilterState` teardown, including `Secret`s freed to
+  `SecureHeap`) against the main thread and reported nothing.
+- Change: `plugin/tests/plugin_load_test.cpp` guards the capture with a
+  mutex, reads it under the lock after `obs_shutdown()` (which joins the
+  destroy-task thread), and adds a check that libobs logged from more than
+  one thread. That check fails if libobs stops deferring destruction, so
+  the reason for the lock stays visible. No plugin code changed. No check was
+  removed, skipped, retried or loosened.
+- Open issues or follow-ups: because destruction is deferred, a filter
+  released and then reloaded straight away with the same watch-list reference
+  (as `check_watchlist` and `check_broken_copy` do) can find the reference
+  still held and fork the file. The checks pass either way: the fork carries
+  the entries or the error. Not checked: whether OBS waits for the destroy
+  queue before it loads a scene collection, which would rule this out in
+  live use.
