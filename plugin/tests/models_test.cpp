@@ -19,6 +19,9 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -331,16 +334,33 @@ TEST_CASE("ModelHub loads on its own thread and tells every listener once", "[mo
 }
 
 TEST_CASE("ModelHub never reports Ready without models, and survives a throwing loader", "[models][hub]") {
-  const bool throws = GENERATE(false, true);
-  CAPTURE(throws);
-  ModelHub hub([throws]() -> LoadResult {
-    if (throws) {
-      throw std::runtime_error("loader failed");
-    }
-    LoadResult result;
-    result.report.status = ModelStatus::Ready;  // but no models
-    return result;
-  });
+  enum class Fault { ReadyWithoutModels, Throws, OutOfMemory };
+  const Fault fault = GENERATE(Fault::ReadyWithoutModels, Fault::Throws, Fault::OutOfMemory);
+  CAPTURE(static_cast<int>(fault));
+  struct Reported {
+    int calls = 0;
+    ModelReport report;
+    std::chrono::milliseconds elapsed{-1};
+  };
+  auto reported = std::make_shared<Reported>();  // written on the loader thread, read after it is joined
+  ModelHub hub(
+      [fault]() -> LoadResult {
+        if (fault == Fault::Throws) {
+          // A message the hub must not pass on: only fixed reasons reach the log.
+          throw std::runtime_error("loader failed: Zorbly Quanticor");
+        }
+        if (fault == Fault::OutOfMemory) {
+          throw std::bad_alloc();
+        }
+        LoadResult result;
+        result.report.status = ModelStatus::Ready;  // but no models
+        return result;
+      },
+      [reported](const ModelReport& report, std::chrono::milliseconds elapsed) {
+        ++reported->calls;
+        reported->report = report;
+        reported->elapsed = elapsed;
+      });
   std::mutex mutex;
   std::condition_variable cv;
   bool done = false;
@@ -354,6 +374,59 @@ TEST_CASE("ModelHub never reports Ready without models, and survives a throwing 
   CHECK(hub.status() == ModelStatus::Failed);
   CHECK(hub.snapshot().models == nullptr);
   hub.unsubscribe(id);
+  hub.shutdown();  // joins the loader: `reported` is complete
+  hub.start();
+  // Told once, with a fixed reason the properties' "see the OBS log" can rely on.
+  CHECK(reported->calls == 1);
+  CHECK(reported->elapsed.count() >= 0);
+  CHECK(reported->report.status == ModelStatus::Failed);
+  CHECK(hub.snapshot().report.detail == reported->report.detail);
+  CHECK(reported->report.detail.find("Zorbly") == std::string::npos);
+  switch (fault) {
+    case Fault::ReadyWithoutModels:
+      CHECK(reported->report.detail == "the model loader reported ready without models");
+      break;
+    case Fault::Throws:
+      CHECK(reported->report.detail == "the model loader failed with an unexpected error");
+      break;
+    case Fault::OutOfMemory:
+      CHECK(reported->report.detail == "out of memory while loading the models");
+      break;
+  }
+}
+
+TEST_CASE("ModelHub reports the loader's own outcome once, before listeners run", "[models][hub]") {
+  std::atomic<int> reports{0};
+  std::atomic<bool> reported_first{false};
+  ModelReport seen;  // written on the loader thread, read after it is joined
+  ModelHub hub(
+      [] {
+        LoadResult result;
+        result.report = {ModelStatus::Corrupt, "ppocr-det-en", "x does not match its pinned SHA-256"};
+        return result;
+      },
+      [&](const ModelReport& report, std::chrono::milliseconds) {
+        ++reports;
+        seen = report;
+      });
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool done = false;
+  const std::uint64_t id = hub.subscribe([&] {
+    reported_first = reports.load() == 1;
+    const std::lock_guard lock(mutex);
+    done = true;
+    cv.notify_all();
+  });
+  hub.start();
+  REQUIRE(wait_for(mutex, cv, done, seconds{30}));
+  hub.unsubscribe(id);
+  hub.shutdown();
+  CHECK(reports == 1);
+  CHECK(reported_first);
+  CHECK(seen.status == ModelStatus::Corrupt);
+  CHECK(seen.model == "ppocr-det-en");
+  CHECK(seen.detail == "x does not match its pinned SHA-256");
 }
 
 TEST_CASE("ModelHub shutdown waits for a load in progress", "[models][hub]") {
@@ -393,11 +466,14 @@ TEST_CASE("The pinned models load off the caller's thread and the stages mask a 
   REQUIRE(wait_for(mutex, cv, done, seconds{240}));
   hub.unsubscribe(id);
   CHECK(listener_thread != std::this_thread::get_id());
-  const ModelHub::Snapshot loaded = hub.snapshot();
-  INFO(loaded.report.detail);
-  REQUIRE(loaded.report.status == ModelStatus::Ready);
-  REQUIRE(loaded.models != nullptr);
-  CHECK(loaded.report.detail == "faces=cpu, text=cpu, recognizer=cpu");
+  // Outside the hub, the only owners of the models are the stages built
+  // below: this snapshot is dropped before the hub lets go.
+  std::optional<ModelHub::Snapshot> loaded = hub.snapshot();
+  INFO(loaded->report.detail);
+  REQUIRE(loaded->report.status == ModelStatus::Ready);
+  REQUIRE(loaded->models != nullptr);
+  CHECK(loaded->report.detail == "faces=cpu, text=cpu, recognizer=cpu");
+  const std::weak_ptr<const spg::plugin::LoadedModels> models = loaded->models;
 
   const Scene scene = make_scene();
   REQUIRE(scene.lines.size() == 2);
@@ -406,12 +482,12 @@ TEST_CASE("The pinned models load off the caller's thread and the stages mask a 
 
   spg::PolicyConfig policy;
   policy.watchlist.emplace_back(kWatchlistEntry);
-  const spg::ScanStages stages = spg::plugin::make_stages(loaded.models, policy);
-  REQUIRE(stages.faces != nullptr);
-  REQUIRE(stages.text != nullptr);
-  REQUIRE(stages.recognizer != nullptr);
-  REQUIRE(stages.policy != nullptr);
-  const spg::ScanResult result = spg::run_scan(stages, job, spg::ScanLimits{});
+  std::optional<spg::ScanStages> stages = spg::plugin::make_stages(loaded->models, policy);
+  REQUIRE(stages->faces != nullptr);
+  REQUIRE(stages->text != nullptr);
+  REQUIRE(stages->recognizer != nullptr);
+  REQUIRE(stages->policy != nullptr);
+  const spg::ScanResult result = spg::run_scan(*stages, job, spg::ScanLimits{});
   REQUIRE(result.complete);
   CHECK(result.failure == spg::ScanFailure::None);
   CHECK(masked(result, scene.face, spg::DetectionKind::Face));
@@ -420,17 +496,23 @@ TEST_CASE("The pinned models load off the caller's thread and the stages mask a 
 
   // The policy comes from the filter's PolicyConfig: without the entry the
   // same line is read and left alone.
-  const spg::ScanStages no_entry = spg::plugin::make_stages(loaded.models, spg::PolicyConfig{});
-  const spg::ScanResult plain = spg::run_scan(no_entry, job, spg::ScanLimits{});
-  REQUIRE(plain.complete);
-  CHECK(masked(plain, scene.face, spg::DetectionKind::Face));
-  CHECK_FALSE(masked(plain, scene.lines[0], spg::DetectionKind::TextRegion));
+  {
+    const spg::ScanStages no_entry = spg::plugin::make_stages(loaded->models, spg::PolicyConfig{});
+    const spg::ScanResult plain = spg::run_scan(no_entry, job, spg::ScanLimits{});
+    REQUIRE(plain.complete);
+    CHECK(masked(plain, scene.face, spg::DetectionKind::Face));
+    CHECK_FALSE(masked(plain, scene.lines[0], spg::DetectionKind::TextRegion));
+  }
 
   // Stages keep the models alive after the hub lets go (module unload while
-  // a scheduler still holds them).
+  // a scheduler still holds them), as their only owners by then.
+  loaded.reset();
   hub.shutdown();
   CHECK(hub.snapshot().models == nullptr);
-  const spg::ScanResult after = spg::run_scan(stages, job, spg::ScanLimits{});
+  REQUIRE_FALSE(models.expired());
+  const spg::ScanResult after = spg::run_scan(*stages, job, spg::ScanLimits{});
   CHECK(after.complete);
   CHECK(masked(after, scene.lines[0], spg::DetectionKind::TextRegion));
+  stages.reset();
+  CHECK(models.expired());
 }

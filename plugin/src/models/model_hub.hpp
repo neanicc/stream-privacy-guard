@@ -6,11 +6,14 @@
 // or UI thread: start() only starts the thread, and a filter keeps covering
 // every frame whole until the models are ready. When loading ends (ready or
 // not) every subscribed listener is called on the loader thread, so each
-// filter can rebuild its scheduler with the models.
+// filter can rebuild its scheduler with the models. The reporter is told the
+// outcome exactly once, with a reason even when the loader threw or its
+// thread could not be started, so the log always says why detection is off.
 //
 // One attempt per module load: after a failure the status stays until OBS
 // restarts (the properties say so).
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -27,8 +30,14 @@ class ModelHub {
  public:
   using Loader = std::function<LoadResult()>;
   using Listener = std::function<void()>;
+  // Called once per start() with the final report and how long loading took:
+  // on the loader thread before the state changes, or on start()'s caller
+  // when the thread cannot be started. Failures the hub detects itself carry
+  // a fixed reason in report.detail.
+  using Reporter = std::function<void(const ModelReport& report, std::chrono::milliseconds elapsed)>;
 
-  explicit ModelHub(Loader loader) : loader_(std::move(loader)) {}
+  explicit ModelHub(Loader loader, Reporter reporter = {})
+      : loader_(std::move(loader)), reporter_(std::move(reporter)) {}
   ~ModelHub();  // shutdown()
   ModelHub(const ModelHub&) = delete;
   ModelHub& operator=(const ModelHub&) = delete;
@@ -61,9 +70,11 @@ class ModelHub {
 
  private:
   void run() noexcept;
-  void finish(LoadResult result) noexcept;
+  void finish(LoadResult result, std::chrono::milliseconds elapsed) noexcept;
+  void report(const ModelReport& report, std::chrono::milliseconds elapsed) const noexcept;
 
   Loader loader_;
+  Reporter reporter_;
 
   mutable std::mutex state_mutex_;  // guards the fields below
   std::shared_ptr<const LoadedModels> models_;

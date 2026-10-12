@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <new>
 
 namespace spg::plugin {
 
@@ -9,44 +10,92 @@ ModelHub::~ModelHub() {
   shutdown();
 }
 
+namespace {
+
+// Fixed reasons for failures the hub detects itself.
+constexpr const char* kThreadFailed = "the model loader thread could not be started";
+constexpr const char* kOutOfMemory = "out of memory while loading the models";
+constexpr const char* kLoaderThrew = "the model loader failed with an unexpected error";
+constexpr const char* kReadyWithoutModels = "the model loader reported ready without models";
+
+}  // namespace
+
 void ModelHub::start() noexcept {
-  const std::lock_guard lock(state_mutex_);
-  if (started_ || shut_down_) {
-    return;
-  }
-  started_ = true;
-  report_.status = ModelStatus::Loading;
-  ++generation_;
-  try {
-    thread_ = std::thread([this] { run(); });
-  } catch (...) {
-    report_.status = ModelStatus::Failed;
-    report_.model.clear();
-    report_.detail.clear();
+  ModelReport failed;
+  {
+    const std::lock_guard lock(state_mutex_);
+    if (started_ || shut_down_) {
+      return;
+    }
+    started_ = true;
+    report_.status = ModelStatus::Loading;
     ++generation_;
+    try {
+      thread_ = std::thread([this] { run(); });
+      return;
+    } catch (...) {
+      report_.status = ModelStatus::Failed;
+      report_.model.clear();
+      report_.detail.clear();
+      ++generation_;
+    }
   }
+  failed.status = ModelStatus::Failed;
+  try {
+    failed.detail = kThreadFailed;
+  } catch (...) {
+    // No memory for the reason: the status still says Failed.
+  }
+  report(failed, std::chrono::milliseconds{0});
 }
 
 void ModelHub::run() noexcept {
+  const auto started = std::chrono::steady_clock::now();
   LoadResult result;
+  const char* reason = nullptr;
   try {
     result = loader_();
     if (result.report.status == ModelStatus::Ready && result.models == nullptr) {
-      result.report.status = ModelStatus::Failed;  // never claim Ready without models
+      reason = kReadyWithoutModels;  // never claim Ready without models
     }
+  } catch (const std::bad_alloc&) {
+    reason = kOutOfMemory;
   } catch (...) {
+    reason = kLoaderThrew;
+  }
+  if (reason != nullptr) {
     result.models.reset();
     result.report.status = ModelStatus::Failed;
+    result.report.model.clear();
+    result.report.detail.clear();
+    try {
+      result.report.detail = reason;
+    } catch (...) {
+      // No memory for the reason: the status still says Failed.
+    }
   }
-  finish(std::move(result));
+  finish(std::move(result),
+         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started));
 }
 
-void ModelHub::finish(LoadResult result) noexcept {
+void ModelHub::report(const ModelReport& report, std::chrono::milliseconds elapsed) const noexcept {
+  if (!reporter_) {
+    return;
+  }
+  try {
+    reporter_(report, elapsed);
+  } catch (...) {
+    // A reporter that fails costs the log line, nothing else.
+  }
+}
+
+void ModelHub::finish(LoadResult result, std::chrono::milliseconds elapsed) noexcept {
+  if (result.report.status != ModelStatus::Ready) {
+    result.models.reset();
+  }
+  report(result.report, elapsed);
   {
     const std::lock_guard lock(state_mutex_);
-    if (result.report.status != ModelStatus::Ready) {
-      result.models.reset();
-    }
     models_ = std::move(result.models);
     report_ = std::move(result.report);
     ++generation_;
