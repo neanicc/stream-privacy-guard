@@ -362,11 +362,11 @@ Session Session::open(Environment& env, const std::filesystem::path& model, cons
                          (options.cpu_fallback ? "on" : "off") + ")" + detail);
 }
 
-Provider Session::provider() const noexcept { return impl_->provider; }
-const std::vector<ProviderAttempt>& Session::attempts() const noexcept { return impl_->attempts; }
-const std::filesystem::path& Session::model_path() const noexcept { return impl_->path; }
-const std::vector<TensorInfo>& Session::inputs() const noexcept { return impl_->inputs; }
-const std::vector<TensorInfo>& Session::outputs() const noexcept { return impl_->outputs; }
+Provider Session::provider() const { return live(impl_).provider; }
+const std::vector<ProviderAttempt>& Session::attempts() const { return live(impl_).attempts; }
+const std::filesystem::path& Session::model_path() const { return live(impl_).path; }
+const std::vector<TensorInfo>& Session::inputs() const { return live(impl_).inputs; }
+const std::vector<TensorInfo>& Session::outputs() const { return live(impl_).outputs; }
 
 std::optional<std::string> Session::metadata(std::string_view key) const {
   const Impl& impl = live(impl_);

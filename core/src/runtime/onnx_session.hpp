@@ -137,17 +137,16 @@ class Session {
   Session(Session&&) noexcept;
   Session& operator=(Session&&) noexcept;
 
-  // A moved-from Session holds no model: only destroy it or assign to it.
-  // metadata(), run() and warmup() on it throw RuntimeError InvalidInput; the
-  // noexcept accessors below require a session that was not moved from.
+  // A moved-from Session holds no model: destroy it or assign to it. Every
+  // other member function on it throws RuntimeError InvalidInput.
 
   // The provider the session was created with. ONNX Runtime may still run
   // individual nodes the provider does not support on CPU.
-  [[nodiscard]] Provider provider() const noexcept;
-  [[nodiscard]] const std::vector<ProviderAttempt>& attempts() const noexcept;
-  [[nodiscard]] const std::filesystem::path& model_path() const noexcept;
-  [[nodiscard]] const std::vector<TensorInfo>& inputs() const noexcept;
-  [[nodiscard]] const std::vector<TensorInfo>& outputs() const noexcept;
+  [[nodiscard]] Provider provider() const;
+  [[nodiscard]] const std::vector<ProviderAttempt>& attempts() const;
+  [[nodiscard]] const std::filesystem::path& model_path() const;
+  [[nodiscard]] const std::vector<TensorInfo>& inputs() const;
+  [[nodiscard]] const std::vector<TensorInfo>& outputs() const;
   // Custom metadata stored in the model, for example a recognizer's dictionary.
   [[nodiscard]] std::optional<std::string> metadata(std::string_view key) const;
 

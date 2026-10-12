@@ -131,9 +131,10 @@ Template:
   (rank, fixed dimensions, positive dimensions, overflow-safe element count)
   with the same helper as `run()` before allocating any buffer, so a wrong or
   huge shape is `InvalidInput` instead of a multi-GB allocation; opening a
-  session with a moved-from `Environment`, or calling `run()`, `warmup()` or
-  `metadata()` on a moved-from `Session`, is `InvalidInput`, not a null
-  dereference. The default-provider tests now check the recorded attempts
+  session with a moved-from `Environment`, or calling any member of a
+  moved-from `Session`, is `InvalidInput`, not a null dereference (so the
+  `Session` accessors are no longer `noexcept`). The default-provider tests
+  now check the recorded attempts
   (earlier providers failed with a reason, the selected one is last) so a
   listed GPU provider that fails on a machine is not a false failure; macOS
   still requires CoreML. Dev Mac: 25/25 ctest tests, 12 `runtime.*` cases.

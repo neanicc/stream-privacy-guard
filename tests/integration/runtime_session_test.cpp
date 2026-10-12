@@ -344,6 +344,11 @@ TEST_CASE("A moved session keeps working", "[runtime]") {
     CHECK_THAT(message, ContainsSubstring("moved from"));
     error_of(ErrorCode::InvalidInput, [&] { first.warmup({}); });
     error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(first.metadata("spg_fixture")); });
+    error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(first.provider()); });
+    error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(first.attempts()); });
+    error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(first.model_path()); });
+    error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(first.inputs()); });
+    error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(first.outputs()); });
     // NOLINTEND(bugprone-use-after-move)
   }
 }
