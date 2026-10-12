@@ -67,10 +67,11 @@ struct SecureHeapStats {
 // out of shared regions of kRegionBytes, so the policy engine's per-call
 // temporaries (a folded line of up to 4096 code points) reuse blocks without a
 // system call. Larger requests get a region of their own, unmapped when
-// released; the map, exclude, lock and their undo calls for such a region run
-// outside the heap's mutex, so they never stall another thread's small
-// allocation. Shared regions are kept for reuse until the heap is destroyed;
-// their free blocks are zero.
+// released. Every map, exclude and lock call (and their undo for a large
+// block) runs outside the heap's mutex, which guards only the free lists and
+// the region list, so a thread that grows the heap never stalls another
+// thread's allocation. Shared regions are kept for reuse until the heap is
+// destroyed; their free blocks are zero.
 class SecureHeap {
  public:
   static constexpr std::size_t kAlignment = 16;
@@ -117,6 +118,9 @@ class SecureHeap {
   [[nodiscard]] Region new_region(std::size_t bytes);
   // Unlocks, includes and unmaps a region; with or without mutex_ held.
   void release_region(const Region& region) noexcept;
+  // Takes mutex_ and records a region made by new_region() in regions_.
+  // Returns the held lock; on failure releases the region and rethrows.
+  [[nodiscard]] std::unique_lock<std::mutex> adopt(const Region& region);
   [[nodiscard]] void* allocate_large(std::size_t bytes);
   void wiped(const unsigned char* block, std::size_t bytes) const noexcept;
 

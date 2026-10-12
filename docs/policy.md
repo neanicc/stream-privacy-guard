@@ -93,7 +93,13 @@ worker thread; the OCR stage that calls it should bound the text it passes in.
 Its temporaries for a line of up to 4096 code points reuse blocks of the
 shared heap, so after warm-up a call makes no system call and holds the heap's
 lock only to take and return blocks; a longer line maps a region of its own
-per temporary (outside the lock).
+per temporary (outside the lock). Measured on the dev Mac (M-series, 10
+synthetic entries, `evaluate()` in a tight loop): no change single-threaded
+(about 26 µs for a 170-character line, 440 µs for 3000 characters); with four
+threads evaluating at once, a 170-character line went from about 28 to 33 µs
+because the threads share the heap's lock. The scheduler ticket should
+measure this against the frame budget; a per-class lock is the next step if
+it matters.
 
 **Requirement on callers (SPG-10 scheduler, SPG-07 OCR stage):** the
 `PolicyEngine` constructor and `evaluate()` throw `std::bad_alloc` when

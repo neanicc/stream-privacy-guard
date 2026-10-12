@@ -189,22 +189,26 @@ void SecureHeap::release_region(const Region& region) noexcept {
   platform_.unmap(region.base, region.bytes);
 }
 
-// The system calls for a large block run without mutex_: only registering the
-// region in regions_ needs it.
+std::unique_lock<std::mutex> SecureHeap::adopt(const Region& region) {
+  std::unique_lock lock{mutex_};
+  try {
+    regions_.push_back(region);
+  } catch (...) {
+    lock.unlock();
+    release_region(region);  // still zero: nothing was handed out
+    throw;
+  }
+  return lock;
+}
+
 void* SecureHeap::allocate_large(std::size_t bytes) {
   const std::size_t page = std::max<std::size_t>(platform_.page_size(), kAlignment);
   if (bytes > std::numeric_limits<std::size_t>::max() - page) {
     throw std::bad_alloc();
   }
   const Region region = new_region(round_up(bytes, page));
-  try {
-    const std::lock_guard lock{mutex_};
-    regions_.push_back(region);
-    ++live_blocks_;
-  } catch (...) {
-    release_region(region);  // still zero: nothing was handed out
-    throw;
-  }
+  const std::unique_lock lock = adopt(region);
+  ++live_blocks_;
   return region.base;
 }
 
@@ -213,16 +217,20 @@ void* SecureHeap::allocate(std::size_t bytes) {
   if (bytes > kMaxSmallBlock) {
     return allocate_large(bytes);
   }
-  const std::lock_guard lock{mutex_};
   const std::size_t index = size_class(bytes);
+  std::unique_lock lock{mutex_};
   if (free_lists_[index] == nullptr) {
+    // Map a new shared region without the lock, so other threads keep taking
+    // and returning blocks meanwhile. Another thread may grow the same class
+    // at the same time; both regions then join the free list.
+    lock.unlock();
     const std::size_t block = class_bytes(index);
     const std::size_t page = std::max<std::size_t>(platform_.page_size(), kAlignment);
-    regions_.reserve(regions_.size() + 1);  // may throw; nothing is mapped yet
     const Region region = new_region(round_up(std::max(kRegionBytes, block), page));
-    regions_.push_back(region);
-    // Thread the new blocks onto the free list, lowest address first.
-    void* next = nullptr;
+    lock = adopt(region);
+    // Thread the new blocks onto the free list, lowest address first, ahead
+    // of whatever it holds now.
+    void* next = free_lists_[index];
     for (std::size_t i = region.bytes / block; i-- > 0;) {
       unsigned char* const slot = region.base + i * block;
       std::memcpy(slot, &next, sizeof next);
@@ -246,12 +254,12 @@ void SecureHeap::deallocate(void* block, std::size_t bytes) noexcept {
     Region region;
     {
       const std::lock_guard lock{mutex_};
-      --live_blocks_;
       const auto found = std::find_if(regions_.begin(), regions_.end(),
                                       [block](const Region& r) { return r.base == block; });
       if (found == regions_.end()) {
         return;  // not ours; never happens through SecureAllocator or Secret
       }
+      --live_blocks_;
       region = *found;
       regions_.erase(found);
       // The region is no longer in regions_, so no other thread can reach it;

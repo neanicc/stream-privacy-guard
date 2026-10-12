@@ -230,6 +230,12 @@ TEST_CASE("a large block gets its own region, wiped and released when freed", "[
   CHECK(platform.unmapped == std::vector<Call>{region});
   CHECK(platform.included == std::vector<Call>{region});
   CHECK(heap.stats().regions == 0);
+
+  // A pointer the heap never handed out is ignored and leaves the count alone.
+  unsigned char foreign[16] = {};
+  heap.deallocate(foreign, size);
+  CHECK(heap.stats().live_blocks == 0);
+  CHECK(platform.unmapped.size() == 1);
 }
 
 TEST_CASE("a folded line of 4096 code points reuses a shared block", "[secure]") {
@@ -254,21 +260,23 @@ TEST_CASE("a folded line of 4096 code points reuses a shared block", "[secure]")
   CHECK(heap.stats().live_blocks == 0);
 }
 
-TEST_CASE("a large block's system calls run outside the heap's lock", "[secure]") {
-  // While the heap maps or unmaps a large region, another thread's small
-  // allocation must still go through (it has a free block, so it needs no
-  // system call of its own).
+TEST_CASE("growing or shrinking the heap runs its system calls outside the lock", "[secure]") {
+  // While the heap maps a large or a new shared region, or unmaps a large
+  // one, another thread's small allocation must still go through (it has a
+  // free block, so it needs no system call of its own).
   RecordingPlatform platform;
   spg::SecureHeap heap{platform};
   heap.deallocate(heap.allocate(8), 8);
 
   std::thread other;
   std::atomic<bool> other_done{false};
+  bool armed = false;
   bool ran_during_call = false;
-  const auto small_allocation_meanwhile = [&](std::size_t bytes) {
-    if (bytes <= spg::SecureHeap::kRegionBytes || other.joinable()) {
-      return;  // a shared region, or already started
+  const auto small_allocation_meanwhile = [&](std::size_t /*bytes*/) {
+    if (!armed) {
+      return;
     }
+    armed = false;
     other_done = false;
     other = std::thread([&heap, &other_done] {
       heap.deallocate(heap.allocate(8), 8);
@@ -282,21 +290,33 @@ TEST_CASE("a large block's system calls run outside the heap's lock", "[secure]"
   };
   constexpr std::size_t kLarge = 2 * spg::SecureHeap::kRegionBytes;
 
+  // Joins only after the heap call returned, so a held lock cannot hang the test.
+  const auto finish = [&] {
+    if (other.joinable()) {
+      other.join();
+    }
+    const bool ran = ran_during_call;
+    ran_during_call = false;
+    return ran;
+  };
   platform.on_map = small_allocation_meanwhile;
-  void* block = heap.allocate(kLarge);
-  if (other.joinable()) {
-    other.join();  // only after allocate() returned, so a held lock cannot hang the test
-  }
-  CHECK(ran_during_call);
-  platform.on_map = nullptr;
-
-  ran_during_call = false;
   platform.on_unmap = small_allocation_meanwhile;
+
+  armed = true;
+  void* block = heap.allocate(kLarge);
+  CHECK(finish());  // large region mapped
+
+  armed = true;
   heap.deallocate(block, kLarge);
-  if (other.joinable()) {
-    other.join();
-  }
-  CHECK(ran_during_call);
+  CHECK(finish());  // large region unmapped
+
+  armed = true;
+  void* mid = heap.allocate(1000);  // the 1 KiB class has no region yet
+  CHECK(finish());  // shared region mapped
+  CHECK(platform.mapped.size() == 3);
+  heap.deallocate(mid, 1000);
+
+  platform.on_map = nullptr;
   platform.on_unmap = nullptr;
   CHECK(heap.stats().live_blocks == 0);
 }

@@ -146,7 +146,8 @@ an entry that spg-core or the plugin makes lives in `SecureHeap`
 - Regions are page-aligned anonymous mappings (`mmap`, `VirtualAlloc`). Blocks
   up to 16 KiB (a folded line of 4096 code points) come from size classes in
   shared 64 KiB regions, kept for reuse; larger ones get a region of their
-  own, mapped and unmapped outside the heap's lock.
+  own. Mapping, exclusion and locking (and their undo) run outside the heap's
+  lock, which guards only the free lists and the region list.
 - Each region is excluded from crash dumps where the OS has a call for it,
   before any block in it is used: `madvise(MADV_DONTDUMP)` on Linux,
   `WerRegisterExcludedMemoryBlock` on Windows. macOS has none.

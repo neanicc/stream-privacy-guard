@@ -864,3 +864,15 @@ Template:
   wait, no hang). The read race itself is not reproducible without a hook
   between stat and open; the new case reads a ~127 KB list across every
   buffer growth.
+- Review fixes (staff review on `a2ff5a4`): a new shared region is now also
+  mapped, excluded and locked outside the heap's mutex (a concurrent grow of
+  the same class just adds both regions to the free list), and the
+  large-block "not ours" path no longer decrements the live-block count.
+  Merged `origin/main` (SPG-07, #41; its log entry first, in merge order).
+  Measured `evaluate()` before (main, plain `std::u32string`) and after on
+  the dev Mac with 10 synthetic entries: single-threaded unchanged (~26 µs
+  per 170-character line, ~440-450 µs per 3000 characters); four threads at
+  once, 170 characters: ~28 to ~33 µs from the shared lock; 3000
+  characters: unchanged. Recorded in `docs/policy.md` for the scheduler
+  ticket. Mutation check: mapping a shared region under the lock failed the
+  lock-scope unit case.
