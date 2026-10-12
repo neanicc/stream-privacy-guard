@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -14,6 +13,7 @@
 #include "spg/error.hpp"
 #include "spg/ground_truth.hpp"
 #include "spg/mask.hpp"
+#include "range_text.hpp"
 #include "spg/policy_config.hpp"
 #include "utf8.hpp"
 
@@ -70,12 +70,6 @@ void require_source_box(const Box& box, const std::string& what) {
 
 std::string ms_range(std::chrono::milliseconds lo, std::chrono::milliseconds hi) {
   return "must be in [" + std::to_string(lo.count()) + ", " + std::to_string(hi.count()) + "]";
-}
-
-std::string number_range(double lo, double hi) {
-  std::array<char, 64> text{};
-  (void)std::snprintf(text.data(), text.size(), "must be in [%g, %g]", lo, hi);
-  return text.data();
 }
 
 // False for NaN and infinities as well as values outside [lo, hi].
@@ -194,11 +188,11 @@ void validate(const PolicyConfig& config) {
     throw ContractError("policy config: fuzzy.min_partial_chars must be at least 1");
   }
   if (!in_range(config.margin_px, kMinMarginPx, kMaxMarginPx)) {
-    throw ContractError("policy config: margin_px " + number_range(kMinMarginPx, kMaxMarginPx));
+    throw ContractError("policy config: margin_px " + detail::range_text(kMinMarginPx, kMaxMarginPx));
   }
   if (!in_range(config.margin_ratio, kMinMarginRatio, kMaxMarginRatio)) {
     throw ContractError("policy config: margin_ratio " +
-                        number_range(kMinMarginRatio, kMaxMarginRatio));
+                        detail::range_text(kMinMarginRatio, kMaxMarginRatio));
   }
   for (std::size_t i = 0; i < config.watchlist.size(); ++i) {
     if (is_blank(config.watchlist[i].reveal())) {

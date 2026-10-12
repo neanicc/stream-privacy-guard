@@ -1598,6 +1598,13 @@ Template:
   and their tests drive scheduler mechanics directly. The one test that built
   an invalid PolicyConfig (`from_policy carries ...`: hold 0, no category)
   now uses valid values and checks `validate()` accepts them.
+- Schema: the policy JSON stays `"schema": 1` although it now rejects values
+  it used to accept (raised by both PR reviewers). Nothing outside
+  `json.cpp` and its tests calls `parse_policy_config`, and no release has
+  shipped, so no stored document can break; `docs/contracts.md` records the
+  tightening and that a later change rejecting what a released reader
+  accepted bumps `schema`. The "must be in [lo, hi]" text for both readers
+  comes from one internal helper (`core/src/contracts/range_text.hpp`).
 - Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21): after the
   catch-up, `scripts/ci/run.sh setup`, `build` and `test` pass, 329 ctest
   tests (plugin included). New fixtures `policy_config_floors.json`,

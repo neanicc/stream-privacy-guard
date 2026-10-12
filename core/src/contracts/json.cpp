@@ -3,10 +3,8 @@
 // exception text is never forwarded because it can quote the input.
 #include "spg/json.hpp"
 
-#include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -16,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "range_text.hpp"
 #include "spg/error.hpp"
 
 namespace spg {
@@ -251,12 +250,6 @@ Json write_rect(const Rect& rect) {
   return Json{{"x", rect.x}, {"y", rect.y}, {"w", rect.width}, {"h", rect.height}};
 }
 
-std::string range_rule(double lo, double hi) {
-  std::array<char, 64> text{};
-  (void)std::snprintf(text.data(), text.size(), "must be in [%g, %g]", lo, hi);
-  return text.data();
-}
-
 std::string item_path(std::string_view key, std::size_t index) {
   return std::string(key) + "[" + std::to_string(index) + "]";
 }
@@ -313,10 +306,10 @@ PolicyConfig parse_policy_config(std::string_view json) {
   config.hold = std::chrono::milliseconds{
       r.integer_or("hold_ms", kMinHold.count(), kMaxHold.count(), config.hold.count())};
   config.margin_px = r.float_number_or("margin_px", kMinMarginPx, kMaxMarginPx,
-                                       range_rule(kMinMarginPx, kMaxMarginPx), config.margin_px);
+                                       detail::range_text(kMinMarginPx, kMaxMarginPx), config.margin_px);
   config.margin_ratio =
       r.float_number_or("margin_ratio", kMinMarginRatio, kMaxMarginRatio,
-                        range_rule(kMinMarginRatio, kMaxMarginRatio), config.margin_ratio);
+                        detail::range_text(kMinMarginRatio, kMaxMarginRatio), config.margin_ratio);
   if (r.find("fallback") != nullptr) {
     const std::optional<FallbackMode> mode = parse_fallback_mode(r.string("fallback"));
     if (!mode) {
