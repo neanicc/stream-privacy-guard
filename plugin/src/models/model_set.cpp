@@ -13,6 +13,7 @@
 #include "detect/face_detector.hpp"
 #include "detect/text_detector.hpp"
 #include "models/sha256.hpp"
+#include "ocr/cached_recognizer.hpp"
 #include "ocr/text_recognizer.hpp"
 #include "runtime/onnx_session.hpp"
 #include "spg/lookahead.hpp"
@@ -47,8 +48,8 @@ constexpr std::array<PinnedModel, 3> kPinned = {{
 }};
 
 // The SPG-07 recognizer as a scan stage: one Secret per region, in order.
-// Every region is read on every cycle; the per-track recognition cache needs
-// track ids, which run_scan does not have (costs time, never recall).
+// make_stages() puts ocr::CachedRecognizer in front of it, so a region whose
+// crop is pixel-identical to one read recently is not read again (SPG-16e).
 class ModelRecognizer final : public TextRecognizer {
  public:
   explicit ModelRecognizer(std::shared_ptr<const ocr::TextRecognizer> impl) : impl_(std::move(impl)) {}
@@ -275,8 +276,9 @@ ScanStages make_stages(const std::shared_ptr<const LoadedModels>& models, const 
         std::shared_ptr<const detect::FaceDetector>(models, &models->faces));
     stages.text = std::make_shared<DetectorAdapter<detect::TextDetector>>(
         std::shared_ptr<const detect::TextDetector>(models, &models->text));
-    stages.recognizer =
-        std::make_shared<ModelRecognizer>(std::shared_ptr<const ocr::TextRecognizer>(models, &models->recognizer));
+    // One recognition cache per filter (per source), shared by its workers.
+    stages.recognizer = std::make_shared<ocr::CachedRecognizer>(
+        std::make_shared<ModelRecognizer>(std::shared_ptr<const ocr::TextRecognizer>(models, &models->recognizer)));
   }
   // Errors name a watch-list entry's index, never its text.
   stages.policy = std::make_shared<EnginePolicy>(std::make_shared<const PolicyEngine>(policy));

@@ -24,10 +24,15 @@ and `eval` only, default 200), `--scan-interval-ms MS` (the scheduler's
 `scan_interval`; default its own, 0), `--threads N` (ONNX Runtime
 intra-op threads per model; default its own choice) and
 `--recognizer-runs N` (recognizer model runs side by side in one cycle,
-`TextRecognizerConfig::parallel_runs`, in [1, 16]; default 4). The last
-three exist to measure scheduling and threading choices with `bench`
-(SPG-16, SPG-16c); the defaults are what the plugin runs with its default
-worker. Exit
+`TextRecognizerConfig::parallel_runs`, in [1, 16]; default 4) and
+`--no-recognition-cache` (`run`, `eval` and `bench`: read every text region
+on every cycle instead of reusing the text of a region whose crop is
+pixel-identical to one read within the last second; a hit returns what a
+read would, so plans do not change). These exist to measure scheduling,
+threading and caching choices with `bench` (SPG-16, SPG-16c, SPG-16e); the
+defaults are what the plugin runs with its default worker. Reports and the
+summary also give the cache's counts (`recognition_cache`: regions reused
+and regions read). Exit
 codes: 0 done (for `scrub`: no leak), 1 failed (a missing model, an
 unreadable frame, a suite whose frame count or frame size disagrees with
 `suite.json`, a policy file outside the limits in

@@ -184,11 +184,17 @@ struct ScanResult {
   bool detections_lost = false;
 };
 
-// Runs one cycle, stopping at the first failure. Never throws: any exception
-// from a stage (InferenceFailed, DecodeError, ContractError, bad_alloc, or a
-// non-std exception) or invalid output yields an incomplete result with the
-// detections found before it; an allocation failure while collecting them
-// sets detections_lost. Never logs, and keeps no text.
+// Runs one cycle in two lanes: faces, and text (detector, recognizer,
+// policy). With both enabled the face detector runs on a helper thread
+// beside the text detector and is joined before the recognizer starts (on
+// the calling thread when no thread can start), so a cycle waits for the
+// slower detector rather than both (SPG-16e). Each lane stops at its own first
+// failure; the result keeps every lane's valid boxes and names the first
+// failure in stage order (faces, text detector, recognizer, policy).
+// Never throws: any exception from a stage (InferenceFailed, DecodeError,
+// ContractError, bad_alloc, or a non-std exception) or invalid output yields
+// an incomplete result with the detections found; an allocation failure
+// while collecting them sets detections_lost. Never logs, and keeps no text.
 [[nodiscard]] ScanResult run_scan(const ScanStages& stages, const ScanJob& job,
                                   const ScanLimits& limits) noexcept;
 

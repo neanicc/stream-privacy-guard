@@ -8,7 +8,7 @@ fail-closed, retroactive-masking and temporal-hold invariants from
 
 | Piece | What it is |
 | --- | --- |
-| `run_scan()` | One detection cycle over one readback frame: faces, text regions, recognition, policy. Never throws; any exception, invalid output or missing detector for an enabled category makes the cycle incomplete, and an incomplete result still carries the valid boxes found before the failure ([partial cycles](#partial-cycles)). |
+| `run_scan()` | One detection cycle over one readback frame: faces, text regions, recognition, policy, with the face detector beside the text detector ([stage overlap](#stage-overlap)). Never throws; any exception, invalid output or missing detector for an enabled category makes the cycle incomplete, and an incomplete result still carries the valid boxes found before the failure ([partial cycles](#partial-cycles)). |
 | `Lookahead` | Single-threaded state machine: the frame ring, the bounded scan queue, cadence, coverage, retroactive masks, release and fallback. Tests and offline tools drive it directly with a `ManualClock`. |
 | `Scheduler` | `Lookahead` behind a mutex plus a pool of worker threads that call `run_scan()`. This is what the plugin (SPG-14) uses. |
 
@@ -113,13 +113,16 @@ The boxes found before the failure are real detections. Until SPG-10c
 reached the tracker: if the face detector missed on the next cycle, frames
 that cycle covered aired the face inside its hold.
 
-`run_scan()` stops at the first failure and returns an incomplete result whose
-`detections` keep what was found before it:
+`run_scan()` returns what running the stages one after another and stopping
+at the first failure returns: an incomplete result whose `detections` keep
+what was found before it. The face detector runs beside the text detector
+([stage overlap](#stage-overlap)), so when it fails the text detector may
+already have run, but none of its regions is kept and nothing is read:
 
 | Failure | Boxes kept |
 | --- | --- |
-| face detector throws | none (text never runs) |
-| face detector returns malformed output | its valid faces (text never runs) |
+| face detector throws | none (as if text never ran) |
+| face detector returns malformed output | its valid faces (as if text never ran) |
 | text detector throws | the faces |
 | text detector returns malformed output | the faces and its valid regions |
 | recognizer throws or returns the wrong count | the faces and every region |
@@ -278,6 +281,23 @@ a stage call. A detached worker owns the stages and its job through
 call returns. The plugin must not unload the module that holds the stage code
 while one is still running; SPG-14 decides how (for example, waiting on unload
 rather than on filter destroy).
+
+### Stage overlap
+
+With faces and text both enabled, `run_scan()` starts the face detector on a
+helper thread, runs the text detector on the worker's thread, joins the face
+detector, and only then runs the recognizer and the policy (SPG-16e). A cycle
+then waits for the slower detector instead of both. If no thread can start,
+the face detector runs on the worker's thread after the text detector. The
+result is the same either way, for any outcome of any stage.
+
+On the dev Mac (Apple M4, Core ML) both detectors run on the GPU and slow
+each other (text detection about 84 to 97 ms, faces 36 to 50 ms), but the
+cycle still gets shorter: realtime detection latency p50 fell from about 168
+to about 150 ms. Starting the face detector only beside the recognizer
+instead (CPU) did worse, as did running it on CPU. Two workers taking turns
+(one detecting while the other recognizes) were much worse: text detection
+and recognition slow each other on this fanless machine (agent-log SPG-16e).
 
 ## Using it
 

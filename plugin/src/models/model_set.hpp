@@ -120,7 +120,8 @@ struct LoadResult {
 [[nodiscard]] LoadResult load_models(std::span<const std::filesystem::path> dirs, const LoadOptions& options = {});
 
 // The run_scan stages for `policy`: the face detector, the text detector and
-// the recognizer from `models`, and a policy engine built from `policy`. With
+// the recognizer from `models` (behind a recognition cache of its own,
+// ocr::CachedRecognizer), and a policy engine built from `policy`. With
 // null `models` every detector is null, so a cycle with any category enabled
 // fails with ScanFailure::MissingStage and frames get the fallback. Throws
 // ContractError when the policy engine rejects `policy`.

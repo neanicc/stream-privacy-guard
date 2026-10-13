@@ -125,10 +125,13 @@ release) from the moment it is decoded until the verdict:
 | `Recognition::text`, `CtcResult::text`, the recognition cache's entries, `TextHit::text`, what `spg::TextRecognizer::recognize()` returns to `run_scan()` | `Secret` |
 | The model's output probabilities (`runtime::Tensor::data`; the most probable class per step spells the text) | Ordinary memory, zeroed once the batch is decoded or fails |
 | Folded, matching and reversed forms in `PolicyEngine::evaluate()` | `SecureU32String` |
-| Recognition cache fingerprints (crop pixels) | Ordinary memory, zeroed before release: `Fingerprint` zeroes its pixels when destroyed or assigned over, and the cache zeroes each one when the entry is replaced, erased, expires, is evicted or refused, and when the cache is destroyed |
+| Recognition cache fingerprints (crop pixels) | Ordinary memory, zeroed before release: `Fingerprint` zeroes its pixels when destroyed or assigned over, and the cache zeroes each one when the entry is replaced, erased, expires, is evicted or refused, and when the cache is destroyed. The same holds for the content-keyed cache in front of the scan stage (`ocr::CachedRecognizer`, SPG-16e), which is a `RecognitionCache` filed by a hash of each crop |
 
-The scan path adds no copy: `run_scan()` (`core/src/schedule/scan.cpp`) gets
-a `std::vector<Secret>` from the recognizer stage, compares each one's size
+The scan path adds one copy, also a `Secret`: `ocr::CachedRecognizer` (the
+recognizer stage in `spg-cli` and the plugin) keeps each text it read in its
+cache for at most `max_age` (1 s) of frame time. `run_scan()`
+(`core/src/schedule/scan.cpp`) gets a `std::vector<Secret>` from the
+recognizer stage, compares each one's size
 with `max_text_bytes` and passes it to the policy by reference;
 `recognize_tracks()` moves each `Secret` into its `TextHit`. Neither logs nor
 keeps text. The tests prove it with the heap's wipe observer: a decode buffer

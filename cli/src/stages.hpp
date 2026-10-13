@@ -5,7 +5,9 @@
 // stays inside the stages; nothing here logs or stores it.
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -45,12 +47,24 @@ struct StageOptions {
   // binarization threshold) instead of 0.5. Off for run, eval and bench,
   // which must score what the plugin runs.
   bool thorough = false;
+  // Put the content-keyed recognition cache (ocr::CachedRecognizer) in front
+  // of the recognizer, as the plugin does. Off only to measure it
+  // (--no-recognition-cache): a hit returns what a read would.
+  bool recognition_cache = true;
+};
+
+// Text regions the recognition cache answered and regions it read.
+struct RecognitionCounts {
+  std::uint64_t hits = 0;
+  std::uint64_t misses = 0;
 };
 
 struct OpenedStages {
   ScanStages stages;
   // Which execution provider each opened model runs on, for the report.
   std::string providers;
+  // The recognition cache's counts so far; empty without a cache.
+  std::function<RecognitionCounts()> recognition_counts;
 };
 
 // Opens the models `policy` needs: YuNet when Face is enabled, the text
