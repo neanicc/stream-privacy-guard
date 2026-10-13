@@ -187,4 +187,15 @@ TEST_CASE("a refit is due once per new size or frame rate, and retried after a f
   refits.done(k2160, k60fps);  // succeeds
   CHECK_FALSE(refits.due(k2160, k60fps, t0 + 2 + 2 * kRefitRetryNs));
   CHECK(refits.due(k1080, k60fps, t0 + 2 + 2 * kRefitRetryNs));  // the next resize is not delayed
+  // A refit marked done when it was asked for, whose build then fails on the
+  // build thread (SPG-14d): due again for the same size after the interval.
+  constexpr std::uint64_t t1 = t0 + 10 * kRefitRetryNs;
+  refits.done(k2160, k60fps);
+  refits.failed(t1);
+  CHECK_FALSE(refits.due(k2160, k60fps, t1 + 1));
+  CHECK_FALSE(refits.due(k2160, k60fps, t1 + kRefitRetryNs - 1));
+  REQUIRE(refits.due(k2160, k60fps, t1 + kRefitRetryNs));
+  CHECK_FALSE(refits.due(Size{0, 0}, k60fps, t1 + kRefitRetryNs));  // still never for a hidden source
+  refits.done(k2160, k60fps);
+  CHECK_FALSE(refits.due(k2160, k60fps, t1 + kRefitRetryNs + 1));
 }

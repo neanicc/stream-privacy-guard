@@ -43,14 +43,19 @@ void PipelineHost::offer(std::unique_ptr<PipelineSpec> spec) noexcept {
   }
 }
 
-void PipelineHost::fail() noexcept {
-  failed_.store(true);
+void PipelineHost::fail(Cover cover) noexcept {
   std::unique_ptr<PipelineSpec> replaced;
   try {
+    // Under the lock frame() reads them with, so it never pairs this failure
+    // with another call's reason.
     const std::lock_guard lock(handoff_mutex_);
+    fail_cover_.store(static_cast<std::uint8_t>(cover));
+    failed_.store(true);
     replaced = std::move(pending_);  // built for settings now superseded
   } catch (...) {
     // Cannot lock: the failure is flagged all the same.
+    fail_cover_.store(static_cast<std::uint8_t>(cover));
+    failed_.store(true);
   }
   has_news_.store(true, std::memory_order_release);
   if (replaced != nullptr && replaced->scheduler != nullptr) {
@@ -83,6 +88,7 @@ const DrawPlan& PipelineHost::frame(Timestamp t, Size source) noexcept {
         const std::lock_guard lock(handoff_mutex_);
         spec = std::move(pending_);
         cover_all_ = failed_.load();
+        cover_all_reason_ = static_cast<Cover>(fail_cover_.load());
         has_news_.store(false, std::memory_order_relaxed);
       }
       if (spec != nullptr) {
@@ -96,7 +102,7 @@ const DrawPlan& PipelineHost::frame(Timestamp t, Size source) noexcept {
     }
   }
   if (cover_all_) {
-    return solid(t, source, Cover::NoDetection);
+    return solid(t, source, cover_all_reason_);
   }
   if (failed_tick_ && *failed_tick_ == t) {
     return solid_;  // the same frame time rendered again: same answer

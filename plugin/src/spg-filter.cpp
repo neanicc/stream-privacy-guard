@@ -160,7 +160,7 @@ void log_store_error(StoreError error) {
 
 // A watch-list as last read or written for one reference. Copied out of the
 // state so that file I/O never runs while the mutex is held: OBS runs a video
-// filter's update on the video thread (deferred to the next tick), and the
+// filter's update on the graphics thread (deferred to the next tick), and the
 // watch-list buttons write and sync the file on the UI thread.
 struct WatchlistSnapshot {
   std::string ref;
@@ -816,8 +816,9 @@ void filter_video_render(void *data, gs_effect_t * /*effect*/) {
   }
 }
 
-// Video thread, before rendering: refits the lookahead to the VRAM budget
-// after a resize (a new scheduler generation, never on the render path).
+// Graphics thread, before rendering: asks for a lookahead refitted to the
+// VRAM budget after a resize (a new scheduler generation, built on the
+// filter's build thread, never here).
 void filter_video_tick(void *data, float /*seconds*/) {
   const auto *state = static_cast<const FilterState *>(data);
   if (state->render != nullptr) {

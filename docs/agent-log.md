@@ -1564,6 +1564,240 @@ Template:
   rebuilds nothing. Building schedulers off the graphics thread is SPG-14d;
   the model hand-over adds no model work to that path.
 
+## 2026-10-12 — SPG-17 Packaging and docs (#63)
+
+- Decision / change: `scripts/package.sh` (called by `scripts/ci/run.sh
+  package`) installs a new CMake component, `obs-spg`
+  (`cmake/SpgInstall.cmake`, included by the root `CMakeLists.txt` after
+  `plugin/`, so `plugin/CMakeLists.txt` is unchanged), into
+  `build/package-stage/`, adds `INSTALL.txt` for the OS, the GPL license,
+  `scripts/fetch_models.py` with `fetch_deps.py` and `models/manifest.json`
+  (so the fetch step works from the unpacked folder), runs
+  `build-aux/package_tool.py check` and writes
+  `dist/obs-spg-<version>-<os>.zip` (macOS, Windows) or `.tar.gz` (Linux) and
+  `SHA256SUMS.txt`. README gains Install, Usage, Limitations, Privacy and
+  Packaging sections; draft notes in `docs/release-notes/0.1.0.md` (no
+  release, tag or upload).
+- Decisions (no one to ask; smallest change, safety first):
+  (1) Layout is what OBS 32 loads per user: the macOS bundle for
+  `~/Library/Application Support/obs-studio/plugins/`, and
+  `obs-spg/bin/64bit` + `obs-spg/data` for `C:\ProgramData\obs-studio\plugins\`
+  and `~/.config/obs-studio/plugins/`. Archives, not a `.pkg` or an installer:
+  nothing to sign, and the same tree on every OS. (2) The macOS bundle
+  installs whole, so whatever the module build puts in it (ONNX Runtime in
+  `Contents/Frameworks` once SPG-14b lands) is packaged. On Windows and
+  Linux ONNX Runtime is installed beside the module under the name it is
+  loaded by (`onnxruntime.dll`, its SONAME) only when the module links it:
+  a configure-time walk of the module's link graph (static libraries'
+  `$<LINK_ONLY:>` included) decides, and prints `obs-spg package ships ONNX
+  Runtime: TRUE/FALSE`. On `main` today it is FALSE. (3) The check is the
+  package's test: every library the module imports must be shipped beside it
+  or be libobs or an allow-listed OS library, nothing shipped may be unused,
+  macOS rpaths must stay inside the bundle, the licenses and data must be
+  present, and no `.onnx` may be present without `--with-models`. Windows
+  imports are read from the PE file itself (no dumpbin needed). (4) macOS:
+  the installed bundle has a linker signature but no resource seal, so
+  `codesign --verify` rejects it; the script seals it with an ad-hoc
+  signature (as obs-plugintemplate does without an identity) after all files
+  are in place, and the check verifies it with `--strict --deep`. No
+  Developer ID signing or notarization exists; packages are documented as
+  unsigned. (5) No model weights by default (AGENTS.md); `--with-models`
+  (never in CI) copies the pinned models from `$SPG_CACHE_DIR` into
+  `data/models/<name>/<version>/<file>` after a size and SHA-256 check, with
+  their license texts. (6) License texts the prebuilt packages lack are
+  committed in `build-aux/package/licenses/` (OpenCV 4.9.0, YuNet, RapidOCR
+  3.9.2, fetched from their pinned tags); ONNX Runtime's LICENSE and
+  ThirdPartyNotices, OpenCV's bundled third-party licenses and nlohmann/json's
+  LICENSE.MIT are installed from the pinned inputs. A test keeps the notices'
+  versions in step with `deps/manifest.json` and `core/CMakeLists.txt`.
+- Evidence (automated, dev Mac, macOS 26.5.2 arm64): `scripts/ci/run.sh
+  setup`, `build`, `package`: `obs-spg-0.1.0-macos-arm64.zip` (20 files), the
+  check passes, the unzipped bundle passes `codesign --verify --strict
+  --deep`, and `python3 -I scripts/fetch_models.py --verify` run from the
+  unzipped folder finds the three cached models. `--with-models` writes a
+  9.7 MB package whose check passes. Against a local merge of PR #61 (not
+  pushed): configure prints `ships ONNX Runtime: TRUE`, the bundle has
+  `Contents/Frameworks/libonnxruntime.1.dylib`, the only rpath is
+  `@loader_path/../Frameworks` and the check passes; deleting the dylib from
+  the staged bundle fails it (missing import, broken seal). New ctest
+  `scripts.package_tool` (16 cases: PE import and delay-import parsing,
+  dependency rules per OS, layout and model checks, archive folder, modes
+  and owner scrubbing, checksums, notices in step with the pins). Windows and
+  Linux packages are built only by CI; see the PR's Validation section.
+- Eval delta: not affected (packaging and docs only).
+- Merged `main` after SPG-14b (#61) landed: configure now reports `ships
+  ONNX Runtime: TRUE`; the README status, limitations, INSTALL texts and
+  release notes say the plugin loads the models. The package contents per OS
+  from CI are listed in the PR's Validation section.
+- After that merge the Windows check failed: `obs-spg.dll` imports
+  `CONCRT140.dll`. Cause: the pinned static OpenCV (`opencv_core490.lib`) is
+  built with MSVC's Concurrency Runtime as its `parallel_for` backend
+  (`/DEFAULTLIB:"concrt"`, `Concurrency::structured_task_group`), and
+  SPG-14b links it into the module. Not removable without rebuilding
+  OpenCV: the static `libconcrt.lib` is `/MT` and cannot link into a `/MD`
+  module. Decision: `concrt140.dll` joins `msvcp140`/`vcruntime140` as part
+  of the Microsoft Visual C++ 2015-2022 Redistributable, which OBS 32
+  requires to start (`vc_runtime_outdated()` in `frontend/obs-main.cpp`
+  checks `msvcp140.dll` >= 14.40) and which installs all three in System32.
+  Shipping it beside the module instead would take a Microsoft binary out
+  of the GPL-2.0 system-library exception the other two rely on. The
+  requirement is now stated in INSTALL-windows.txt, the README and the
+  notices. Review follow-ups (Greptile): search paths are now resolved and
+  normalized (`$ORIGIN`, `@loader_path`) and must stay inside the plugin
+  folder or bundle and reach the shipped libraries' folder (`$ORIGIN/../lib`
+  and `@loader_path/../../../outside` fail); the libraries shipped beside the
+  module are read too, so a missing dependency of ONNX Runtime fails the
+  check, and a library loaded only by another shipped one counts as used.
+  Windows ONNX Runtime 1.30.0 imports `SETUPAPI.dll`, now allow-listed as
+  an OS DLL. Checked against the pinned ONNX Runtime binaries of all three
+  OSes: no problems. `scripts.package_tool` now has 25 cases, including ONNX
+  Runtime imported but not shipped (Linux and Windows fixtures, and a whole
+  `check()` on PE files), the guard against the install's link walk missing
+  it. CI on `bb191c5`: the package check passed on all three OSes with ONNX
+  Runtime beside the module.
+- Open issues or follow-ups: no live OBS install from a package has been
+  done; the live check should install from the CI artifact rather than the
+  build tree.
+
+## 2026-10-12 — SPG-14d Build schedulers off the graphics thread (#67)
+
+- Decision / change: OBS runs a filter's `update` and `video_tick` on the
+  graphics thread, which also runs `video_render`, so neither may construct a
+  `ThreadedScheduler` (worker threads, stages around the loaded models).
+  `publish` (settings), `tick` (VRAM refit) and the models' hand-over now only
+  record a request and post the build to a per-filter `TaskThread`, started
+  when the filter is created so asking never starts a thread. The rules live
+  in `GenerationBuilder` (`plugin/src/pipeline/builder.{hpp,cpp}`, no OBS):
+  (1) a settings change covers every frame (`Cover::SettingsChanged`, via a
+  new `PipelineHost::fail(Cover)`) from the request until its generation is
+  offered, since the running one scans with the old settings; (2) a rebuild of
+  the same settings (refit, models ready) keeps the running generation until
+  the new one is offered; (3) only the latest request is offered: one
+  superseded before it starts is never built, one superseded while building
+  goes to the reaper; (4) a failed build covers (`NoDetection`), a failed
+  rebuild (always of the current settings) is asked for again every
+  `kRefitRetryNs` (`RefitSchedule::failed` now forgets a fit marked done
+  when it was asked for), a failed settings change is not retried.
+  The build copies everything it needs and runs without the settings lock;
+  the build thread takes that lock only to hand the generation to
+  `PipelineHost` and log. `tick` only try-locks it. The filter's destructor
+  stops the build thread (a build in progress finishes, queued ones are
+  dropped). Review items from SPG-14c: the `&policy != &published_` guard is
+  gone, replaced by copies (`request_locked` takes the policy by value and
+  `tick`/`models_changed` pass a copy of `requested_`); `tick` has no catch
+  that logs any more, and the shared `log_not_started()` is `noexcept` with a
+  `static_assert` that `log` is `noexcept` (it formats into a stack buffer and
+  calls `blogva`, so it cannot throw or allocate in C++). Comments and docs
+  now say "graphics thread" for `video_tick`/`update` (`docs/plugin-render.md`
+  "Building generations", `docs/settings.md`, headers). Hold clamping is
+  untouched (SPG-08b changes it in parallel).
+- Evidence: 8 new `[build]` pipeline cases (all OSes): a settings change is
+  solid until its build runs and masks after; a rebuild keeps masking while
+  pending; superseded requests are never built or are retired, never offered;
+  failed builds cover and only rebuilds are retried, once per failure; a post
+  or prepare failure fails closed; `TaskThread` order and stop (the stop case
+  waits for `post` to refuse instead of sleeping); a build through a real
+  `TaskThread` records the thread it ran on, which is the build thread and
+  not the caller, with frames solid until the hand-over; 150 builds racing
+  with frames never draw a `Masked` frame from failing scans and never leave
+  more than two generations live. `RefitSchedule` gains a case for a fit
+  marked done whose build then failed. `plugin.loads` now waits for both
+  filters' "scanning with the detection models" lines, which the build thread
+  writes. Mutations: dropping the `SettingsChanged` cover failed 3 of the 8
+  `[build]` cases (35 assertions); building on the caller and handing over on
+  the executor failed the off-thread case (`built_on == thread.id()`). Dev
+  Mac (Apple M4): `scripts/ci/run.sh build` and `test` passed, 334/334,
+  on `main` at `79dd38b`; the `[build]` cases passed 8 repeated runs.
+- Eval delta: not affected. The core pipeline is unchanged (plugin-only);
+  `scripts/ci/run.sh eval` was not run.
+- Review follow-up (staff review and Greptile on the first push): requests
+  now wait in one slot in `GenerationBuilder` and at most one build task is
+  queued behind the running one, so repeated settings changes during a slow
+  build free the superseded copies of the settings at once instead of
+  queuing them (new case: 51 requests leave one task and free the first
+  request's copy; removing the one-task rule failed it). `tick` no longer
+  records a failed rebuild itself; `take_retry()` alone times the retry. The
+  off-thread case now holds the build behind a gate while it checks frames
+  (it could see a hand-over between its check and the frame), and a new case
+  constructs a `ThreadedScheduler` and a stage inside the build on a real
+  `TaskThread` with `SteadyClock` and checks both were made on the build
+  thread. `main` at `33203c0` merged (agent-log conflict only); `build`
+  and `test` passed, 337/337, and the 10 `[build]` cases passed 10 runs.
+- Second review round: a rebuild that superseded a settings change still
+  building (a resize meanwhile) and then failed was not retried, leaving the
+  source covered until the next settings change; any failed rebuild is now
+  retried, since it is always of the current settings (new assertions in
+  "a failed build covers, and only a rebuild is retried"). `PipelineHost::fail`
+  now stores the cover reason under the hand-off lock, so `frame()` never
+  pairs a failure with another call's reason. `build` and `test` passed
+  again after these changes (numbers in the PR).
+- Open issues or follow-ups: every settings change, including one that
+  cannot weaken detection (a longer hold, a wider margin), covers the source
+  until its generation is built; the staff review suggests covering only
+  when the new settings can scan less. Measure the cover time in the live
+  check first. Live check (OBS on a real source) of the solid frames during
+  a settings change: not done.
+
+## 2026-10-12 — SPG-11 CPU compositor and spg-cli (#49)
+
+- Decision / change: `spg::compose()` and `fit_mask_rects()` in
+  `core/include/spg/compose.hpp` and `core/src/compose/compositor.cpp`, and
+  `spg-cli run`, `eval` and `bench` in `cli/src/`; rules in [cli.md](cli.md).
+  `eval/run_eval.py` now runs `spg-cli eval` on the generated suites, and the
+  `THRESHOLDS: NOT RUN` path is gone from it and from `scripts/ci/run.sh`: a
+  missing or failing `spg-cli` is `THRESHOLDS: FAIL` in every mode.
+  Choices: (1) `run` and `eval` drive `spg::Lookahead` on a `ManualClock`
+  with simulated time: a fixed 200 ms cycle and 2 simulated workers, so plans
+  do not depend on runner speed. Real timing is `bench --realtime` on
+  `spg::Scheduler` and the wall clock (the local realtime suite, SPG-16).
+  (2) After the last real frame both drivers keep feeding padding frames (the
+  last frame repeated, never composed or written) until every real frame is
+  released, as a live source would. (3) Readback scale defaults to 1 (full
+  frame); SPG-14 decides the plugin's readback size and the CLI default must
+  follow. (4) `kMaskRectCapacity` = 64 rects per frame for the GPU effect's
+  fixed array; `fit_mask_rects()` drops contained rects, then merges the pair
+  whose hull adds the least area (stronger style wins), so coverage only
+  grows. `driver_config()` caps `max_retro_rects` and the tracker's
+  `max_rects_per_track` at the capacity. (5) Scoring stays in the Python
+  scorer; the CLI writes plans only. (6) PNG I/O uses stb_image
+  2.30 and stb_image_write 1.16, pinned by commit `31c1ad37` and per-header
+  SHA-256 in `cli/CMakeLists.txt`. (7) The per-track recognition cache is not
+  used, because `run_scan()` has no track ids: every region is read every
+  cycle (time, not recall).
+- Review fixes: (1) Ubuntu CI (GCC 13, `-O3 -Werror`) failed on a false
+  `-Wmaybe-uninitialized` in `std::optional<std::pair<FrameId,
+  BgraImage>>::emplace` in `cli/src/driver.cpp`; the eval job shares the
+  compile step and failed there too, before any suite ran. The last clean
+  frame is now held in plain members. (2) Staff review P2: a blur or
+  pixelate rect under 2 px on a side was drawn unchanged (a 1x1 box blur or
+  block is the pixel itself); such rects are now filled, with a unit case for
+  1x1, 1xN and Nx1 rects in both styles. P3 (prefetch thread and
+  `StageTimes`) declined: `StageTimes::add` takes its mutex. (3) Greptile,
+  after merging main (SPG-10b/10c/14/14b/14c, #65): the compositor left alpha
+  untouched, so black text on a transparent background stayed readable
+  through its alpha after any mask or fallback; blur and pixelate now mix
+  alpha too and a fill is opaque, as the GPU effect already does
+  ([plugin-render.md](plugin-render.md)). `fit_mask_rects()` counted the
+  overlap of two rects twice and could merge an overlapping pair over a
+  pair whose hull adds nothing; the cost is now the hull minus their union.
+  The realtime feed stamped a frame when decoding let it in, so a stalled
+  decoder slowed the feed instead of showing as latency; frames now keep
+  their due time. Policy calls now end the realtime cycle in the latency
+  log, and `run_eval.py` passes its `--cache` to `spg-cli` and prints the
+  realtime late-frame count. Each has a unit or driver test.
+- Open issues or follow-ups: live OBS not tested; the plugin (SPG-14) draws
+  with its GPU effect, not this compositor, and GPU parity with this
+  reference is SPG-14's; whether the blur defeats OCR is SPG-18's. The `NOT RUN` mention
+  in the human-owned autopilot skill is left for a human. Realtime
+  `late_frames` is reported (an `unscored:` line in the eval report) but not
+  scored: a limit needs the human-owned `eval/thresholds.toml`, tracked in
+  #68 (SPG-31, needs-human). The CI eval runs in simulated time with a fixed
+  200 ms cycle, so it is plan-logic evidence only; timing margin and failing
+  closed under load are scored by `bench --realtime` and the local realtime
+  suite, which SPG-16 (#17) must bring to its limits. `fit_mask_rects()` is
+  O(n^3) worst case; fine offline in `spg-cli`, to revisit before any per-frame
+  use in the plugin.
+
 ## 2026-10-12 — SPG-08b Reject fail-open policy configs (#28)
 
 - Decision / change: `validate(PolicyConfig)` and `parse_policy_config` now
@@ -1591,30 +1825,38 @@ Template:
   back. A config spg-core still rejects already fails closed: `FilterIssue::
   InvalidConfig` leaves no policy, which the render side covers whole
   (`Cover::NoDetection`). Margins are not plugin settings; the PolicyConfig
-  defaults (4 px, 0.25) are inside the new bounds. The CLI builds no
-  PolicyConfig yet. `SchedulerConfig` and `TrackerConfig` keep their
+  defaults (4 px, 0.25) are inside the new bounds. A second catch-up (main
+  at c338c0c) brought SPG-11's `spg-cli`, which reads every policy through
+  `parse_policy_config`: a policy below a floor exits 1 and writes no plans
+  (`cli_test.cpp` "a policy below a floor writes no plans"), and the eval
+  suite generators write defaults plus a synthetic watch-list, inside the
+  limits. `SchedulerConfig` and `TrackerConfig` keep their
   non-negative checks: they are internal, the VRAM fit (SPG-14c) may shorten
   the scheduler's lookahead below 100 ms (more frames covered, never fewer),
   and their tests drive scheduler mechanics directly. The one test that built
   an invalid PolicyConfig (`from_policy carries ...`: hold 0, no category)
   now uses valid values and checks `validate()` accepts them.
 - Schema: the policy JSON stays `"schema": 1` although it now rejects values
-  it used to accept (raised by both PR reviewers). Nothing outside
-  `json.cpp` and its tests calls `parse_policy_config`, and no release has
-  shipped, so no stored document can break; `docs/contracts.md` records the
+  it used to accept (raised by both PR reviewers). No release has shipped
+  and every in-tree writer stays inside the limits, so no stored document
+  can break; `docs/contracts.md` records the
   tightening and that a later change rejecting what a released reader
   accepted bumps `schema`. The "must be in [lo, hi]" text for both readers
   comes from one internal helper (`core/src/contracts/range_text.hpp`).
 - Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21): after the
-  catch-up, `scripts/ci/run.sh setup`, `build` and `test` pass, 329 ctest
-  tests (plugin included). New fixtures `policy_config_floors.json`,
+  second catch-up, `scripts/ci/run.sh setup`, `build` and `test` pass, 372
+  ctest tests (plugin and CLI included). New fixtures `policy_config_floors.json`,
   `policy_config_caps.json` (accepted) and `policy_config_rejected.tsv` (20
   cases, each error must name its field); struct-level `validate()` cases
   include NaN and infinite margins. `plugin/tests/settings_test.cpp` checks
   that every slider end, the old 250 ms hold and out-of-range scene-file
   values sanitize into a config `validate()` accepts.
-- Eval delta: none expected and not measured; the defaults are unchanged and
-  `run.sh eval` still has no pipeline to run until SPG-11 (`spg-cli run`).
+- Eval delta: none. `scripts/ci/run.sh eval` (ci mode, text suite, seed
+  20261012, dev Mac with CoreML) gives the same values as main's c338c0c
+  `eval-report` artifact: watchlist_pair_recall 1.0000, first-frame recall
+  1.0000, pii_pair_recall 0.9390, leak_frame_rate 0.1263 (FAIL, limit 0.02),
+  clean_frame_blur_area 0.0000, decoy_blur_rate 0.3987 (FAIL, limit 0.25);
+  `THRESHOLDS: FAIL` on both, as main's report-only eval job (#64) expects.
 - Open issues or follow-ups: the scheduler already counts a frame as scanned
   only through a cycle on a frame at most `retro_ms` after it (SPG-10,
   `lookahead_test.cpp` "a frame counts as scanned only by a cycle within

@@ -115,7 +115,7 @@ be in the new coordinates.
 | `iou_threshold` | 0.3 | SPG-09 starting point |
 | `velocity_smoothing` | 0.5 | SPG-09 starting point |
 | `max_prediction` | 500 ms | SPG-09 starting point |
-| `max_rects_per_track` | 8 | SPG-09 starting point; SPG-11 sets it from the blur effect's rect capacity |
+| `max_rects_per_track` | 8 | SPG-09 starting point; capped at the compositor's rect capacity (`kMaskRectCapacity`, 64 per frame, [cli.md](cli.md)), so eight tracks fit a frame unmerged |
 
 `TrackerConfig::from_policy()` takes hold, margin and lookahead from the policy.
 The margin and the tracker numbers have no eval evidence yet; SPG-12 tunes

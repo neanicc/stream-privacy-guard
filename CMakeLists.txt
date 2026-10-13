@@ -41,4 +41,6 @@ endif()
 # After enable_testing() so the plugin's own tests register.
 if(SPG_BUILD_PLUGIN)
   add_subdirectory(plugin)
+  # Install layout that scripts/package.sh stages (SPG-17).
+  include(SpgInstall)
 endif()

@@ -92,7 +92,11 @@ void RefitSchedule::done(Size source, Duration interval) noexcept {
 }
 
 void RefitSchedule::failed(std::uint64_t now_ns) noexcept {
-  retry_at_ns_ = now_ns + kRefitRetryNs;  // checked_ unchanged: due again then
+  // The failed fit may have been marked done when it was asked for (its
+  // build runs elsewhere and fails later): forget it, so it is due again.
+  checked_ = Size{};
+  interval_ = Duration{};
+  retry_at_ns_ = now_ns + kRefitRetryNs;
 }
 
 }  // namespace spg::plugin

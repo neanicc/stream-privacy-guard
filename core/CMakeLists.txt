@@ -49,6 +49,9 @@ target_sources(spg-core PRIVATE
   src/schedule/scheduler.cpp)
 target_link_libraries(spg-core PUBLIC Threads::Threads)
 
+# CPU reference compositor (SPG-11).
+target_sources(spg-core PRIVATE src/compose/compositor.cpp)
+
 # ONNX Runtime session wrapper; needs the prebuilt ONNX Runtime.
 if(SPG_WITH_DEPS)
   add_subdirectory(src/runtime)
