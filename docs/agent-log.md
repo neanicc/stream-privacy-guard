@@ -1883,12 +1883,13 @@ Template:
   back. A config spg-core still rejects already fails closed: `FilterIssue::
   InvalidConfig` leaves no policy, which the render side covers whole
   (`Cover::NoDetection`). Margins are not plugin settings; the PolicyConfig
-  defaults (4 px, 0.25) are inside the new bounds. A second catch-up (main
-  at c338c0c) brought SPG-11's `spg-cli`, which reads every policy through
+  defaults (4 px, 0.25) are inside the new bounds. Later catch-ups (main at
+  c338c0c, then 52db92e) brought SPG-11's `spg-cli`, which reads every policy through
   `parse_policy_config`: a policy below a floor exits 1 and writes no plans
   (`cli_test.cpp` "a policy below a floor writes no plans"), and the eval
   suite generators write defaults plus a synthetic watch-list, inside the
-  limits. `SchedulerConfig` and `TrackerConfig` keep their
+  limits; `spg-cli scrub` (SPG-18) builds a watch-list-only config with
+  default timing. `SchedulerConfig` and `TrackerConfig` keep their
   non-negative checks: they are internal, the VRAM fit (SPG-14c) may shorten
   the scheduler's lookahead below 100 ms (more frames covered, never fewer),
   and their tests drive scheduler mechanics directly. The one test that built
@@ -1902,16 +1903,16 @@ Template:
   accepted bumps `schema`. The "must be in [lo, hi]" text for both readers
   comes from one internal helper (`core/src/contracts/range_text.hpp`).
 - Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21): after the
-  second catch-up, `scripts/ci/run.sh setup`, `build` and `test` pass, 372
-  ctest tests (plugin and CLI included). New fixtures `policy_config_floors.json`,
+  last catch-up (main at 52db92e), `scripts/ci/run.sh setup`, `build` and
+  `test` pass, 381 ctest tests (plugin and CLI included). New fixtures `policy_config_floors.json`,
   `policy_config_caps.json` (accepted) and `policy_config_rejected.tsv` (20
   cases, each error must name its field); struct-level `validate()` cases
   include NaN and infinite margins. `plugin/tests/settings_test.cpp` checks
   that every slider end, the old 250 ms hold and out-of-range scene-file
   values sanitize into a config `validate()` accepts.
 - Eval delta: none. `scripts/ci/run.sh eval` (ci mode, text suite, seed
-  20261012, dev Mac with CoreML) gives the same values as main's c338c0c
-  `eval-report` artifact: watchlist_pair_recall 1.0000, first-frame recall
+  20261012, dev Mac with CoreML) gives the same values as the `eval-report`
+  artifacts of main's c338c0c and 52db92e Check runs: watchlist_pair_recall 1.0000, first-frame recall
   1.0000, pii_pair_recall 0.9390, leak_frame_rate 0.1263 (FAIL, limit 0.02),
   clean_frame_blur_area 0.0000, decoy_blur_rate 0.3987 (FAIL, limit 0.25);
   `THRESHOLDS: FAIL` on both, as main's report-only eval job (#64) expects.
