@@ -2118,8 +2118,7 @@ Template:
   540) split lines into word boxes in the integration tests. (3) The
   recognizer runs up to `parallel_runs` (4) crops at once on threads it
   starts and joins inside `recognize()`; the output does not depend on it.
-  (4) `FaceDetectorConfig::tile_cadence` spreads the scale-1 face tiles
-  round robin over calls; default 1. (5) `bench --realtime` fits mask plans
+  (4) Face tiles still run on every scan (below). (5) `bench --realtime` fits mask plans
   after the feed instead of on the feed thread (SPG-11 review P2), a
   throwing policy call still records its time and ends its cycle (P3), the
   CLI compositor keeps a frame for HoldLastScanned only when its plan has no
@@ -2149,12 +2148,15 @@ Template:
   give it that velocity today. The default stays at two workers. Switching to
   one needs motion-tolerant association in the tracker first (proposed
   follow-up, lane:policy).
-- Face tiling cadence (release-gate item): every scan (`tile_cadence` 1).
-  With two workers, cadence 2 gave faces recall 0.9995 to 0.9973 and leak
-  0.0009 to 0.0056 in the simulated eval (cadence 3 the same), a leak rise
-  over the 0.2 pp the merge gate allows, for about 20 ms a cycle. The
-  realtime suite replays the text suite, so faces cost counts there only as
-  cycle time.
+- Face tiling cadence (release-gate item): every scan. A temporary
+  `FaceDetectorConfig::tile_cadence` option ran the scale-1 tiles round robin
+  over calls. With two workers, cadence 2 gave faces recall 0.9995 to 0.9973
+  and leak 0.0009 to 0.0056 in the simulated eval (cadence 3 the same), a
+  leak rise over the 0.2 pp the merge gate allows, for about 20 ms a cycle.
+  The staff review asked for the option to go, because it can only lower
+  recall and nothing set it, so it was removed. Adding it back needs evidence
+  that lookahead and hold cover N cycles. The realtime suite replays the text
+  suite, so faces cost counts there only as cycle time.
 - Rejected with evidence: two workers staggered with `scan_interval` 120 or
   150 ms (fewer fail-closed frames than lockstep, far more than one worker,
   and no velocity pairs); ONNX Runtime threads 2, 4 or 6 instead of the
@@ -2170,6 +2172,21 @@ Template:
   `scripts/ci/run.sh eval --local` on this head printed `THRESHOLDS: FAIL`
   (decoy blur, and the realtime suite at 0.987 / 1641 ms during a load spike
   to 13 from other jobs; the paired runs above are the measurement).
-- Open: #17 stays open; its first done-when item is not met. Live OBS not
-  tested; the plugin uses the same defaults (two workers, fixed-shape text
-  detector, 1920 x 1088 tile, four recognizer runs).
+- Review follow-up. The recognizer's helper threads are plain
+  `std::thread`s, joined by a guard on every way out. Apple's libc++ has no
+  `std::jthread`, and MSVC's version imports MSVCP140_ATOMIC_WAIT.dll, which
+  the Windows package check refuses. That broke the macOS and Windows CI
+  builds. Stage timing in the CLI now records from a function instead of a
+  destructor (`timed_call`), so a failed allocation while recording fails
+  the cycle instead of terminating the process. New tests: `run_batches`
+  (every batch once, side by side, an error rethrown only after every lane
+  returns), a malformed batch among good ones failing the call, the output
+  not depending on `parallel_runs`, a 4K readback through the default tile
+  (nine tiles, lines at the far edges and one across all three columns), and
+  an allocation sweep over the timed stages.
+- Open: #17 closes with this PR, and its unmet done-when item moves on. The
+  realtime limits go to #84 (motion-tolerant tracker association) and #85
+  (one worker, re-measure). The release gate also carries over to #85. A
+  cheaper text pass for sources below 1080p is #86. Live OBS not tested;
+  the plugin uses the same defaults (two workers, fixed-shape text detector,
+  1920 x 1088 tile, four recognizer runs).
