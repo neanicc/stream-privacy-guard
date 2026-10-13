@@ -312,6 +312,40 @@ TEST_CASE("tile_crops takes rectangular tiles", "[text][tiles]") {
   }
 }
 
+TEST_CASE("The default text tile: one run up to 1080p, nine at scale 1 for 4K", "[text][tiles]") {
+  const spg::detect::TextDetectorConfig config;
+  const Size tile{config.tile_width, config.tile_height};
+  for (const Size frame : {Size{1920, 1080}, Size{1280, 720}, Size{960, 540}, Size{640, 360}}) {
+    INFO(frame.width << "x" << frame.height);
+    CHECK(spg::detect::tile_crops(frame, tile, config.tile_overlap).size() == 1);
+  }
+  const auto crops = spg::detect::tile_crops({3840, 2160}, tile, config.tile_overlap);
+  REQUIRE(crops.size() == 9);
+  std::vector<float> xs;
+  std::vector<float> ys;
+  for (const Rect& c : crops) {
+    CHECK(c.width == static_cast<float>(config.tile_width));
+    CHECK(c.height == 1088.0F);
+    const auto m = spg::detect::tile_input_mapping(c, tile, config.upscale_side);
+    CHECK(m.scale_x() == 1.0);
+    CHECK(m.scale_y() == 1.0);
+    xs.push_back(c.x);
+    ys.push_back(c.y);
+  }
+  const auto axis = [&](std::vector<float> starts, float span, float length) {
+    std::sort(starts.begin(), starts.end());
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    REQUIRE(starts.size() == 3);
+    CHECK(starts.front() == 0.0F);
+    CHECK(starts.back() + span == length);
+    for (std::size_t i = 1; i < starts.size(); ++i) {
+      CHECK(starts[i - 1] + span - starts[i] >= static_cast<float>(config.tile_overlap));
+    }
+  };
+  axis(xs, 1920.0F, 3840.0F);
+  axis(ys, 1088.0F, 2160.0F);
+}
+
 TEST_CASE("tile_input_mapping scales a crop up only to upscale_side", "[text][tiles]") {
   using spg::detect::tile_input_mapping;
   const Size tile{1920, 1088};

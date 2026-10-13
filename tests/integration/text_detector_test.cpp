@@ -334,6 +334,52 @@ TEST_CASE("TextDetector covers small lines at readback scale", "[text][detector]
   }
 }
 
+TEST_CASE("TextDetector tiles a readback larger than its default tile", "[text][detector][model]") {
+  SPG_REQUIRE_PPOCR_DET();
+  // A 4K readback (spg-cli only; the plugin reads back at most 1080p) is
+  // larger than the default 1920 x 1088 tile in both directions: nine tiles
+  // at scale 1. Lines near every far edge and one across all three tile
+  // columns must each come back as Source boxes that cover them.
+  const Scene scene{{3840, 2160}, {3840, 2160}, spg::PixelFormat::BGRA};
+  const TextDetectorConfig& config = detector().config();
+  const auto crops = spg::detect::tile_crops(scene.readback, Size{config.tile_width, config.tile_height},
+                                             config.tile_overlap);
+  REQUIRE(crops.size() == 9);
+  Canvas canvas(3840, 2160, {245, 245, 245});
+  const Bgr ink{20, 20, 20};
+  std::vector<Rect> truth;
+  const auto line = [&](const std::string& text, int x, int baseline, double height) {
+    const Rect box = spg::test::draw_text(canvas, text, x, baseline, height, ink);
+    REQUIRE(static_cast<double>(box.x) + box.width < 3839.0);
+    truth.push_back(to_source(box, scene));
+    return box;
+  };
+  (void)line("SPG SYNTHETIC LINE 0123", 40, 60, 20.0);           // top-left tile
+  (void)line("hello stream 42", 3400, 1100, 18.0);               // right column, across the first row seam
+  (void)line("QUICK BROWN FOX", 1700, 1640, 22.0);               // middle, across the second row seam
+  (void)line("TEST 555-0100", 3500, 2140, 16.0);                 // bottom-right corner
+  const Rect wide = line("lorem ipsum dolor sit amet SPG SYNTHETIC TILE SEAM LINE 0123456789 QUICK BROWN FOX "
+                         "lorem ipsum dolor sit amet",
+                         200, 760, 32.0);
+  // In no single tile: it starts before the second column and ends past the
+  // end of the second column.
+  REQUIRE(wide.x < 960.0F);
+  REQUIRE(static_cast<double>(wide.x) + wide.width > 2880.0);
+  const auto frame = spg::test::to_frame(canvas, scene.format);
+  const auto found = detector().detect(frame.view, scene.source);
+  INFO(found.size() << " boxes:" << boxes_text(found));
+  for (const spg::Detection& d : found) {
+    CHECK(d.box.space == spg::Space::Source);
+    CHECK(std::any_of(truth.begin(), truth.end(), [&](const Rect& t) { return overlaps(d.box.rect, t); }));
+  }
+  for (std::size_t i = 0; i < truth.size(); ++i) {
+    INFO("line " << i << " at " << truth[i].x << "," << truth[i].y << " size " << truth[i].width << "x"
+                 << truth[i].height);
+    CHECK(std::any_of(found.begin(), found.end(),
+                      [&](const spg::Detection& d) { return covers(d.box.rect, truth[i], kSlack); }));
+  }
+}
+
 TEST_CASE("TextDetector merges a line that crosses a tile edge", "[text][detector][model]") {
   SPG_REQUIRE_PPOCR_DET();
   // 1600 px wide readback in 640 x 640 tiles: they start at x = 0, 480 and
