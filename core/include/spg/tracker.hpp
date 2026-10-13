@@ -112,35 +112,39 @@ struct TrackMotion {
 //     track's estimated velocity for min(t - td, max_prediction), as the hull
 //     of b and the moved box, so between detection cycles the mask only grows.
 //   * Following (SPG-12b): the hold of a confirmed moving track follows the
-//     track while the track is still being updated. Confirmations taken in
-//     frame order are measured: once a box's center is at least
-//     follow_min_move from the last measured box, its move from that box is
-//     a measurement (closer ones are skipped). A measurement is consistent
-//     when both edges of the box moved at least one pixel along the axis the
-//     measured velocity is larger on (x on a tie), in its direction; and,
-//     unless it starts a run, it lies on the same axis and in the same
-//     direction as the measurement before it, at a speed along that axis
-//     within follow_speed_ratio of that one's. A confirmation whose width or
-//     height differs by more than a quarter from the last measured box ends
-//     the run, as does an inconsistent measurement that is not a translation;
-//     a translation that does not continue the run starts a new one. A
-//     confirmation that is not measured more than the hold after the last
-//     measurement ends the run (the track stopped), and the next run starts
-//     from it. A track whose last follow_after measurements form one
-//     consistent run is confirmed moving. A detection of such a track is
-//     followed on frame time t when all of these hold: it was taken in frame
-//     order at or after the confirmation the run started from; no update()
-//     since it missed the track; a later detection of the same run was seen
-//     in (td, t]; and the track was confirmed at or after t. Its coverage on
-//     t is then the track's: the mask of the newest detection of the run
-//     seen at or before t, which is held as above. An update() that does not
-//     find a track (a missed cycle, in or out of frame order) ends its run,
-//     and no detection the track held before it is ever followed. Nothing is
-//     followed on frame times after the track's last confirmation (tracking
-//     lost, or not updated yet), and a late detection, a detection taken
-//     before a resize and any detection of a track that is not confirmed
-//     moving are never followed. With follow_after 0 nothing is ever
-//     followed.
+//     track while the track is still being updated. With follow_after 0
+//     nothing is ever followed. Otherwise:
+//     1. Measurement. Confirmations taken in frame order are measured
+//        against the last measured box (the track's first box to begin
+//        with) once the box center has moved at least follow_min_move from
+//        it; closer ones are skipped.
+//     2. Consistency. A measurement is consistent when both edges of the box
+//        moved at least one pixel along the axis the measured velocity is
+//        larger on (x on a tie), in its direction, and, unless it starts a
+//        run, it lies on the axis and in the direction of the measurement
+//        before it, at a speed along that axis within follow_speed_ratio of
+//        that one's. A consistent measurement extends the run; a translation
+//        that does not continue it starts a new run.
+//     3. End of a run. The run ends on a measurement that is not a
+//        translation, a confirmation whose width or height differs by more
+//        than a quarter from the last measured box, a skipped confirmation
+//        more than the hold after the last measurement (the track stopped;
+//        the next run starts from it), a resize, and an update() that does
+//        not find the track (a missed cycle, in or out of frame order).
+//     4. Confirmed moving. The track's last follow_after measurements form
+//        one consistent run.
+//     5. Followed. A detection with frame time td of a confirmed moving
+//        track is followed on frame time t when all of these hold: it was
+//        taken in frame order, after the last resize, at or after the
+//        confirmation the run started from; no update() since it missed the
+//        track; a later detection of the run was seen in (td, t]; and the
+//        track was confirmed at or after t. Its coverage on t is then the
+//        mask of the newest detection of the run seen at or before t, which
+//        is held as above.
+//     6. Never followed. A late detection, a detection taken before a resize
+//        or a missed cycle, any detection of a track that is not confirmed
+//        moving, and anything on a frame time after the track's last
+//        confirmation (tracking lost, or not updated yet).
 //   * Updates only add: masks(t) after update() contains every rect masks(t)
 //     returned before, for any t the retention still covers, except the rects
 //     of detections the update made followed on t.

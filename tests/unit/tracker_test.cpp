@@ -9,6 +9,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -918,6 +919,8 @@ struct Fed {
   // started its track (a new track: no motion measured).
   std::size_t call = 0;
   bool first = false;
+  // The scene object it was taken from (ground truth, unknown to the tracker).
+  std::size_t object = 0;
 };
 
 struct Object {
@@ -1005,7 +1008,10 @@ std::vector<Region> expected_regions(const Fed& fed, double sx, double sy,
 //   * the track was confirmed at or after t;
 //   * the track can be confirmed moving: at least follow_after in-order
 //     detections after any resize and after its last miss that did not start
-//     the track (each measures at most one step of the run).
+//     the track (each measures at most one step of the run);
+//   * its object was detected again later, at or before t: following never
+//     uncovers an object's newest detection, whichever track took it (tracks
+//     that swap objects or take over another object's line).
 // Every other detection, including the newest one of each track at or before
 // t and every detection on frames after its track's last confirmation
 // (tracking loss), stays covered. Returns how many times a detection was
@@ -1034,6 +1040,8 @@ std::uint64_t run_hold_property(bool follow) {
     std::size_t calls = 0;
     // The last update() call that did not find each track seen before it.
     std::map<spg::TrackId, std::size_t> last_miss;
+    // The object of each generated detection, by (frame time, index).
+    std::map<std::pair<std::int64_t, std::size_t>, std::size_t> object_of;
     // Records the detections of the update() just made with `batch`.
     const auto record = [&](const std::vector<Detection>& batch, Timestamp when) {
       REQUIRE(motions.size() == batch.size());
@@ -1050,7 +1058,8 @@ std::uint64_t run_hold_property(bool follow) {
             in_order = in_order && f.seen < when;
           }
         }
-        fed.push_back(Fed{batch[k].box.rect, when, false, track, in_order, calls, first});
+        const std::size_t object = object_of.at({when.time_since_epoch().count(), k});
+        fed.push_back(Fed{batch[k].box.rect, when, false, track, in_order, calls, first, object});
       }
       for (const Fed& f : fed) {
         if (f.call < calls && found.count(f.track) == 0) {
@@ -1071,8 +1080,10 @@ std::uint64_t run_hold_property(bool follow) {
       }
       bool later = false;
       bool updated = false;
+      bool seen_again = false;
       std::size_t measured = 0;
       for (const Fed& f : fed) {
+        seen_again = seen_again || (f.object == d.object && f.seen > d.seen && f.seen <= t);
         if (f.track != d.track) {
           continue;
         }
@@ -1081,7 +1092,7 @@ std::uint64_t run_hold_property(bool follow) {
         updated = updated || f.seen >= t;
         measured += (usable && !f.first && f.call > missed) ? 1U : 0U;
       }
-      return later && updated && measured >= config.follow_after;
+      return later && updated && seen_again && measured >= config.follow_after;
     };
 
     const int frames = scene.uniform_int(60, 200);
@@ -1148,7 +1159,8 @@ std::uint64_t run_hold_property(bool follow) {
       // One detection cycle: each object found with some probability (a
       // miss is tracking loss), with jitter; occasionally delivered late.
       std::vector<Detection> detections;
-      for (const Object& o : objects) {
+      for (std::size_t oi = 0; oi < objects.size(); ++oi) {
+        const Object& o = objects[oi];
         if (!scene.chance(0.75)) {
           continue;
         }
@@ -1161,6 +1173,7 @@ std::uint64_t run_hold_property(bool follow) {
                     Space::Source};
         d.kind = o.kind;
         d.score = 0.8F;
+        object_of[{frame_time.time_since_epoch().count(), detections.size()}] = oi;
         detections.push_back(d);
       }
       const bool deliver_late = scene.chance(0.15);

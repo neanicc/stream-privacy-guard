@@ -2138,7 +2138,11 @@ Template:
   same-size decoy line scrolling through it, the secret missed on up to four
   overlapping cycles: every secret box keeps its hold. It holds by
   association (the secret's own box always wins its track), so it also
-  passes with the follow guards removed. AGENTS.md wording: #82
+  passes with the follow guards removed. The property test also checks the
+  scene's ground truth: following never uncovers an object's newest
+  detection, whichever track took it. Disabling the size, translation and
+  speed checks of the run fails it on seed 1062; without that condition the
+  property test passed the same mutation. AGENTS.md wording: #82
   (`needs-human`).
 - Rejected with evidence: measuring each confirmation against the previous
   one. The eval's two workers confirm frames 17 ms apart, where a chat line

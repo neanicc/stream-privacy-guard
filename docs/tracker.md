@@ -129,9 +129,13 @@ run again with following on (random `follow_after` 1 to 3, speed ratio 1 to 3
 and minimum move 1 to 8 px): every detection that may not be followed by the
 rule in the table stays covered, and the scenes do follow some. That rule is
 derived in the test from what was delivered (order, resize, misses and the
-count of confirmations), not from the tracker's run state; whether a box
-belongs to the current run needs the measurement rule itself, so unit cases
-pin it. Unit cases cover the rule: one
+count of confirmations), not from the tracker's run state. It also uses the
+scene's ground truth: a detection may only be followed once its own object
+was detected again at or before `t`, so following never uncovers an
+object's newest detection, whichever track took it (swapped or taken-over
+tracks). With the run's consistency checks disabled, that condition fails.
+Whether a box belongs to the current run needs the measurement rule itself,
+so unit cases pin it. Unit cases cover the rule: one
 measurement does not confirm, a reversal, an axis change, a more than twofold
 speed change, a size change over a quarter, growth in place, a sub-pixel shift
 and a drift under the minimum move do not either, two workers' confirmations

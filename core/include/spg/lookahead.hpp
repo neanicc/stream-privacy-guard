@@ -129,9 +129,11 @@ struct SchedulerStats {
 //   * Hold: plan rects include Tracker::masks(t), so a detection stays masked
 //     for the hold, except on frames where its confirmed moving track follows
 //     it (a newer detection of the track pins the text; see Tracker,
-//     "Following"). A resize only adds coverage, a late cycle only adds
-//     coverage except by confirming such a track, and a box from before a
-//     resize keeps its scaled margin and is never followed.
+//     "Following"). A resize, a late cycle and a cycle that misses a track
+//     only add coverage. Only an in-order cycle that finds a track that is
+//     then confirmed moving can remove some: the track's older boxes on
+//     frames up to that cycle's frame. A box from before a resize keeps its
+//     scaled margin and is never followed.
 //   * Partial cycles: the detections of an incomplete result (found by the
 //     stages that finished before a failure) are held and masked
 //     retroactively like a complete cycle's, but the cycle covers no frame.
