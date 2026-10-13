@@ -5,7 +5,7 @@
 #include <chrono>
 #include <exception>
 #include <fstream>
-#include <iterator>
+#include <system_error>
 #include <mutex>
 #include <span>
 #include <string>
@@ -29,32 +29,43 @@ bool blank(std::string_view line) noexcept {
                      [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f'; });
 }
 
-// Wipes a std::string's buffer before it is released.
-class WipedString {
+// A buffer allocated once at its final size and wiped before it is released,
+// so no reallocation leaves a copy of the file behind.
+class WipedBuffer {
  public:
-  WipedString() = default;
-  WipedString(const WipedString&) = delete;
-  WipedString& operator=(const WipedString&) = delete;
-  ~WipedString() { secure_wipe(text.data(), text.size()); }
-  std::string text;
+  explicit WipedBuffer(std::size_t size) : bytes(size) {}
+  WipedBuffer(const WipedBuffer&) = delete;
+  WipedBuffer& operator=(const WipedBuffer&) = delete;
+  ~WipedBuffer() { secure_wipe(bytes.data(), bytes.size()); }
+  std::vector<char> bytes;
 };
 
 }  // namespace
 
 std::vector<Secret> read_planted(const std::filesystem::path& file) {
-  WipedString content;
+  std::error_code ec;
+  const std::uintmax_t size = std::filesystem::file_size(file, ec);
+  if (ec) {
+    throw CliError("cannot open " + file.string());
+  }
+  // A planted list is a few lines; the cap keeps the one allocation small.
+  constexpr std::uintmax_t kMaxPlantedBytes = std::uintmax_t{1} << 20U;
+  if (size > kMaxPlantedBytes) {
+    throw CliError(file.string() + " is larger than 1 MiB; a planted list holds a few lines");
+  }
+  WipedBuffer content(static_cast<std::size_t>(size));
   {
     std::ifstream in(file, std::ios::binary);
     if (!in) {
       throw CliError("cannot open " + file.string());
     }
-    content.text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    if (in.bad()) {
+    in.read(content.bytes.data(), static_cast<std::streamsize>(content.bytes.size()));
+    if (static_cast<std::uintmax_t>(in.gcount()) != size) {
       throw CliError("cannot read " + file.string());
     }
   }
   std::vector<Secret> planted;
-  std::string_view rest = content.text;
+  std::string_view rest(content.bytes.data(), content.bytes.size());
   while (!rest.empty()) {
     const std::size_t end = rest.find('\n');
     std::string_view line = rest.substr(0, end);
@@ -188,20 +199,28 @@ ScrubResult scrub(const FrameSource& source, const ScanStages& stages, const Pla
       if (i >= source.count) {
         return;
       }
+      // Everything a worker runs, the progress callback included, is
+      // caught here: an exception never escapes a thread (std::terminate)
+      // or skips the joins below.
       try {
         scan_one(i);
-      } catch (...) {
         const std::lock_guard lock(mutex);
-        if (!first_error) {
-          first_error = std::current_exception();
+        ++done;
+        if (options.progress) {
+          options.progress(done);
+        }
+      } catch (...) {
+        try {
+          const std::lock_guard lock(mutex);
+          if (!first_error) {
+            first_error = std::current_exception();
+          }
+        } catch (...) {
+          // The lock failed; `failed` still stops the scrub and the caller
+          // gets a generic error below.
         }
         failed.store(true, std::memory_order_relaxed);
         return;
-      }
-      const std::lock_guard lock(mutex);
-      ++done;
-      if (options.progress) {
-        options.progress(done);
       }
     }
   };
@@ -225,6 +244,9 @@ ScrubResult scrub(const FrameSource& source, const ScanStages& stages, const Pla
   }
   if (first_error) {
     std::rethrow_exception(first_error);
+  }
+  if (failed.load()) {
+    throw CliError("a scrub worker failed");
   }
 
   ScrubResult result;

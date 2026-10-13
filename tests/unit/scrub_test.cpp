@@ -12,6 +12,7 @@
 #include <memory>
 #include <sstream>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -254,7 +255,7 @@ TEST_CASE("scrub passes a recording where nothing planted is readable", "[cli][s
                            "--report", (dir / "report.json").string(), "--fps", "30", "--sensitivity", "normal"});
   INFO(r.out << r.err);
   REQUIRE(r.code == spg::cli::kExitOk);
-  CHECK(r.out.find("PASS: no planted string is readable in any of the 4 frames") != std::string::npos);
+  CHECK(r.out.find("PASS: no planted string was found readable in any of the 4 frames") != std::string::npos);
   CHECK(r.out.find("planted #1: not readable in any frame") != std::string::npos);
   CHECK(r.out.find("leak:") == std::string::npos);
   const nlohmann::json report = nlohmann::json::parse(slurp(dir / "report.json"));
@@ -263,6 +264,40 @@ TEST_CASE("scrub passes a recording where nothing planted is readable", "[cli][s
   CHECK(report["sensitivity"] == "normal");
   CHECK(report["fps"] == 30);
   CHECK(report["planted"][1]["first_frame"].is_null());
+}
+
+TEST_CASE("scrub that reads no text at all is not a pass", "[cli][scrub]") {
+  const fs::path dir = scratch("nothing");
+  write_frames(dir, {kNothing, kNothing, kNothing});
+  write_planted(dir / "planted.txt");
+  const Ran r = scrub_cli({"--frames", (dir / "frames").string(), "--planted", (dir / "planted.txt").string(),
+                           "--report", (dir / "report.json").string()});
+  INFO(r.out << r.err);
+  CHECK(r.code == spg::cli::kExitFailure);
+  CHECK(r.out.find("NOTHING CHECKED: no text region was read in any of the 3 frames") != std::string::npos);
+  CHECK(r.out.find("PASS") == std::string::npos);
+  CHECK(nlohmann::json::parse(slurp(dir / "report.json"))["result"] == "nothing_read");
+}
+
+TEST_CASE("a throwing progress callback fails the scrub instead of the process", "[cli][scrub]") {
+  std::vector<spg::Secret> planted;
+  planted.emplace_back(std::string(kSecond));
+  const spg::cli::PlantedMatcher matcher(planted, spg::FuzzyLimits{});
+  spg::ScanStages stages;
+  stages.text = std::make_shared<PixelDetector>();
+  stages.recognizer = std::make_shared<PixelRecognizer>();
+  const spg::cli::FrameSource source{20, 60, [](std::size_t) { return frame_showing(kGarbled); }};
+  spg::cli::StageTimes times;
+  for (const std::size_t workers : {std::size_t{1}, std::size_t{4}}) {
+    spg::cli::ScrubOptions options;
+    options.workers = workers;
+    options.progress = [](std::size_t done) {
+      if (done == 3) {
+        throw std::runtime_error("progress sink failed");
+      }
+    };
+    CHECK_THROWS_AS(spg::cli::scrub(source, stages, matcher, options, times), std::runtime_error);
+  }
 }
 
 TEST_CASE("scrub output does not depend on the number of workers", "[cli][scrub]") {

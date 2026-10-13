@@ -75,11 +75,13 @@ log line, and the run continues unless the step says to stop.
    and the log has a new `watch-list saved: <n> entries` line. Add the four
    strings again before continuing. Record any button that did not refresh
    the list.
-4. **Undo and redo never restore typed text.** Type a planted string into the
-   field slowly, wait two seconds, move a slider, press **Add entry**, then
+4. **Undo and redo never restore typed text.** Select the entry for
+   `742 Evergreen Terrace` (the second) and press **Remove selected entry**,
+   so adding it again is not a duplicate. Type `742 Evergreen Terrace` into
+   the field slowly, wait two seconds, move a slider, press **Add entry**, then
    undo and redo several times (Edit menu). Expect: the field keeps showing
-   dots while typing, Add stores the entry, and no undo or redo step puts
-   text back into the field. Then type text, do not press Add, close and
+   dots while typing, Add stores the entry (four entries again), and no undo
+   or redo step puts text back into the field. Then type text, do not press Add, close and
    reopen the properties: the field is empty and **Add entry** adds nothing
    ("Nothing was added: the entry is empty.").
 5. **Not in the scene collection.** Scene Collection > Export to
@@ -261,11 +263,12 @@ planted strings' numbers, never their text, and writes no frames.
    720p frame took about 0.85 s of text detection per worker, so 1800 frames
    of 1080p can take 30 to 60 minutes; set `--workers` to the number of
    performance cores. The exit code is 0 when no
-   planted string is readable in any frame (last line `PASS: ...`), 3 when at
-   least one is (`LEAK: ...`, with one `leak: frame <n> (<file>, <s> s):
-   planted #<i> at x <x> y <y>, <w>x<h>` line per region), and 1 when the
-   scrub could not finish (a frame it cannot read, missing models): a frame
-   that was not checked never counts as clean.
+   planted string was found readable in any frame (last line `PASS: ...`), 3
+   when at least one was (`LEAK: ...`, with one `leak: frame <n> (<file>,
+   <s> s): planted #<i> at x <x> y <y>, <w>x<h>` line per region), and 1 when
+   the scrub could not finish (a frame it cannot read, missing models) or
+   read no text at all (`NOTHING CHECKED: ...`, a wrong folder or wrong-scale
+   frames): a frame that was not checked never counts as clean.
 3. **Pass condition: zero leak frames.** Open every flagged frame
    (`~/spg-live/frames/<file>`) and look at the box: record the frame, the
    time, which planted string, whether it is really readable, and what was
@@ -274,16 +277,26 @@ planted strings' numbers, never their text, and writes no frames.
    third of the mask's shorter side and 8 px; the whole-source fallback at
    least 1/16 of the shorter side and 16 px): record its size.
 4. **Positive control.** Record 5 s with the filter disabled and the planted
-   strings on screen, extract and scrub it the same way. Expect exit code 3
-   and every planted string flagged; if one is not, scrub cannot see it in
+   strings on screen. Extract it into its own empty folder and give it its
+   own report, so it never mixes with the session's frames or overwrites its
+   report:
+
+   ```sh
+   mkdir -p ~/spg-live/control-frames
+   ffmpeg -i ~/Movies/<control>.mkv -vf fps=60 -start_number 0 ~/spg-live/control-frames/%06d.png
+   build/cli/spg-cli scrub --frames ~/spg-live/control-frames --planted ~/spg-live/planted.txt \
+     --fps 60 --report ~/spg-live/control.json --workers 4
+   ```
+
+   Expect exit code 3 and every planted string flagged; if one is not, scrub cannot see it in
    this setup (too small, unusual font) and part F proves nothing about it:
    record which, and check those frames by eye.
 5. **What scrub does not check.** Faces, and text the OCR cannot read at all.
    Step through the face scenario (E5) and every scene switch and resize (E4)
    frame by frame by eye (for example `ffplay` or QuickTime, arrow keys) and
    record any face or planted string that is sharp in any frame.
-6. Delete the frames (`rm -rf ~/spg-live/frames`) and keep or delete the
-   recording; never upload either.
+6. Delete the frames (`rm -rf ~/spg-live/frames ~/spg-live/control-frames`)
+   and keep or delete the recordings; never upload any of them.
 
 ## Record
 

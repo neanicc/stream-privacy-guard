@@ -569,8 +569,15 @@ int cmd_scrub(std::span<const std::string_view> args, std::ostream& out, std::os
                                {"last_frame", frames.empty() ? json(nullptr) : json(frames.back())}});
   }
   print_stages(out, *times);
-  if (leak_frames.empty()) {
-    out << "PASS: no planted string is readable in any of the " << result.frames << " frames\n";
+  // A scrub that read no text at all checked nothing (a wrong folder, frames
+  // at the wrong scale, a detector that sees nothing): never a pass.
+  const bool nothing_read = result.regions == 0;
+  if (nothing_read) {
+    out << "NOTHING CHECKED: no text region was read in any of the " << result.frames
+        << " frames, so this is not a pass; check the frames and run a positive control\n";
+  } else if (leak_frames.empty()) {
+    out << "PASS: no planted string was found readable in any of the " << result.frames
+        << " frames (scrub finds only what its OCR reads; limits in docs/cli.md)\n";
   } else {
     out << "LEAK: a planted string is readable in " << leak_frames.size() << " of " << result.frames
         << " frames; look at each one\n";
@@ -583,7 +590,7 @@ int cmd_scrub(std::span<const std::string_view> args, std::ostream& out, std::os
     write_json(*report, json{{"schema", 1},
                              {"command", "scrub"},
                              {"version", version()},
-                             {"result", leak_frames.empty() ? "pass" : "leak"},
+                             {"result", !leak_frames.empty() ? "leak" : nothing_read ? "nothing_read" : "pass"},
                              {"fps", seq.fps},
                              {"frames", result.frames},
                              {"text_regions", result.regions},
@@ -597,7 +604,10 @@ int cmd_scrub(std::span<const std::string_view> args, std::ostream& out, std::os
                              {"leaks", leaks},
                              {"stages", stages}});
   }
-  return leak_frames.empty() ? kExitOk : kExitLeak;
+  if (!leak_frames.empty()) {
+    return kExitLeak;
+  }
+  return nothing_read ? kExitFailure : kExitOk;
 }
 
 }  // namespace

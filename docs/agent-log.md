@@ -1836,6 +1836,17 @@ Template:
   frames: the planted lines on sharp frames and the decoy). This is
   synthetic evidence that the SPG-14 cell sizes defeat this OCR on these
   sizes; it is not live evidence.
+- Review fixes (Claude staff review, Greptile): (1) a scrub that read no
+  text region at all prints `NOTHING CHECKED` and exits 1, never `PASS`; the
+  PASS line says scrub finds only what its OCR reads. (2) The planted file is
+  read into one buffer of its exact size (at most 1 MiB), so no reallocation
+  leaves an unwiped copy. (3) The progress callback runs inside the worker's
+  catch, so a throwing callback fails the scrub instead of terminating.
+  (4) The GPU emulation samples every mask from the untouched frame, as the
+  plugin does, and the name and card masks now overlap. (5) live-check A4
+  removes an entry before re-adding it (a duplicate is refused), and the
+  positive control uses its own frame folder and report. `run.sh build` and
+  `test`: 378/378 passed.
 - Eval delta: not affected (scrub is a new command; `run`/`eval`/`bench`
   open the stages exactly as before).
 - Open issues or follow-ups: the live run and the human leak test (#19's

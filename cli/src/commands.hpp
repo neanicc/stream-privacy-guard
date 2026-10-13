@@ -31,8 +31,9 @@ struct CliHooks {
 };
 
 // `args` excludes the program name. Returns the process exit code: 0 on
-// success, 1 when the command failed, 2 for a usage error, 3 when scrub found
-// a leak.
+// success, 1 when the command failed (for scrub also: no text was read at
+// all, so nothing was checked), 2 for a usage error, 3 when scrub found a
+// leak.
 [[nodiscard]] int run_cli(std::span<const std::string_view> args, std::ostream& out, std::ostream& err,
                           const CliHooks& hooks = {});
 

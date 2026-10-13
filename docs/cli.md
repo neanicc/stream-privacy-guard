@@ -160,12 +160,15 @@ flagged frame and checks faces by eye. Code: `cli/src/scrub.cpp`.
   0.3 instead of 0.5. `run`, `eval` and `bench` keep the plugin's settings.
 - **Output.** One `leak: frame <i> (<file>, <s> s): planted #<n> at x y, WxH`
   line per matching region, a line per planted string (frames, first and
-  last), the stage table, then `PASS: ...` or `LEAK: ...`. `--report` writes
+  last), the stage table, then `PASS: ...`, `LEAK: ...` or, when no
+  text region was read in any frame, `NOTHING CHECKED: ...` (exit 1: a wrong
+  folder or a detector that sees nothing is not a pass). `--report` writes
   the same as JSON (`result`, `leak_frame_indices`, `leaks` with frame, file,
   time, box, detector score and planted numbers, per-string counts, stage
   timing). Progress goes to stderr every 100 frames.
 - **Secrecy.** Planted strings and recognized text are `Secret`s; the
-  planted file's buffer is wiped once split. Output, errors and the report
+  planted file (at most 1 MiB) is read into one buffer of its exact size,
+  never reallocated, and wiped once split. Output, errors and the report
   hold frame numbers, file names, times, boxes and planted numbers only; a
   planted string that cannot be matched (no letters or digits) is named by
   number. `scrub` writes no frames.
@@ -203,12 +206,15 @@ reaching output. `tests/integration/cli_pipeline_test.cpp`: `spg-cli run` on
 the pinned models over 36 drawn frames (watch-list line and card covered from
 their first frame, face covered, decoy not masked); skips without the models.
 `tests/unit/scrub_test.cpp` (`cli.*`, `[scrub]`): `scrub` with fake stages
-(leak frames, times, boxes and numbers; pass; same output with 1 and 4
-workers; exit 1 on an unreadable frame or a short recognizer; planted-file
-parsing; neither planted string in any output).
+(leak frames, times, boxes and numbers; pass; no text read is exit 1, not a
+pass; same output with 1 and 4 workers; exit 1 on an unreadable frame or a
+short recognizer; a throwing progress callback is an error, not a
+terminate; planted-file parsing; neither planted string in any output).
 `tests/integration/scrub_pipeline_test.cpp`: `scrub` on the pinned models
 over nine drawn 1280x720 frames with three planted strings (20 px name line,
-20 px card, 56 px line): flagged when sharp, not flagged under the CPU
+20 px card whose mask overlaps the name's, 56 px line): flagged when sharp,
+not flagged under the CPU
 compositor's blur and pixelate, an emulation of the plugin's GPU effect
-(its own `mask_levels.cpp`, Smooth and Blocks) or either whole-source blur.
+(its own `mask_levels.cpp`, Smooth and Blocks, each mask sampled from the
+untouched frame) or either whole-source blur.
 Eval numbers are in [agent-log.md](agent-log.md) and the PR.

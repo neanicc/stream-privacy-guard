@@ -121,13 +121,15 @@ void put(spg::BgraImage& image, std::uint32_t x, std::uint32_t y, const float* b
   }
 }
 
-// Draws `rect` (Source pixels) as the GPU effect does: from the level
-// mask_level() picks, over the region mask_region() rounds it out to.
-void gpu_mask(spg::BgraImage& image, const spg::Rect& rect, bool blocks) {
+// Draws `rect` (Source pixels) onto `image` as the GPU effect does: from the
+// level mask_level() picks, built from the untouched frame `source` (the
+// plugin reduces the frame once, before any mask is drawn), over the region
+// mask_region() rounds it out to.
+void gpu_mask(spg::BgraImage& image, const spg::BgraImage& source, const spg::Rect& rect, bool blocks) {
   const std::uint32_t level = spg::plugin::mask_level(rect, image.size());
   const auto region = spg::plugin::mask_region(rect, image.size(), level);
   REQUIRE(region.has_value());
-  const Level texels = reduce(image, level);
+  const Level texels = reduce(source, level);
   const double sx = static_cast<double>(image.width) / texels.width;
   const double sy = static_cast<double>(image.height) / texels.height;
   float px[4];
@@ -183,7 +185,7 @@ Drawn draw_frame(Cover cover) {
         spg::test::draw_text(canvas, "chat: " + std::string(kName) + " joined", 80, 200, 20.0, {230, 230, 230}));
   }
   if (cover != Cover::NoPlanted && cover != Cover::NameOnly) {
-    d.planted_ink.push_back(spg::test::draw_text(canvas, "card " + std::string(kCard), 80, 280, 20.0, {230, 230, 230}));
+    d.planted_ink.push_back(spg::test::draw_text(canvas, "card " + std::string(kCard), 80, 236, 20.0, {230, 230, 230}));
     d.planted_ink.push_back(spg::test::draw_text(canvas, std::string(kStreet), 80, 460, 56.0, {240, 240, 240}));
   }
   d.image = to_bgra(canvas);
@@ -198,11 +200,13 @@ Drawn draw_frame(Cover cover) {
       spg::compose(d.image, plan, spg::FallbackAction::None);
       break;
     case Cover::GpuBlur:
-    case Cover::GpuPixelate:
+    case Cover::GpuPixelate: {
+      const spg::BgraImage source = d.image;
       for (const spg::MaskRect& m : plan.rects) {
-        gpu_mask(d.image, m.box.rect, cover == Cover::GpuPixelate);
+        gpu_mask(d.image, source, m.box.rect, cover == Cover::GpuPixelate);
       }
       break;
+    }
     case Cover::CpuWhole:
       plan.fallback = true;
       spg::compose(d.image, plan, spg::FallbackAction::BlurSource);
@@ -269,6 +273,13 @@ TEST_CASE("scrub on the pinned models flags sharp planted strings and none under
   REQUIRE(code == spg::cli::kExitLeak);
 
   const nlohmann::json report = nlohmann::json::parse(slurp(dir / "report.json"));
+  // The name and card masks overlap, as masks of neighbouring lines do.
+  {
+    const Drawn sharp = draw_frame(Cover::Sharp);
+    const spg::Rect overlap = spg::intersection(mask_over(sharp.planted_ink[0]), mask_over(sharp.planted_ink[1]));
+    REQUIRE(overlap.width > 0.0F);
+    REQUIRE(overlap.height > 0.0F);
+  }
   // Only the sharp frames leak: frame 0 (all three) and frame 8 (the name).
   CHECK(report["leak_frame_indices"] == nlohmann::json({0, 8}));
   CHECK(report["planted"][0]["leak_frames"] == 2);
