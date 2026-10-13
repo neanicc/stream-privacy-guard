@@ -100,6 +100,26 @@ TEST_CASE("pii: IPv4 and IPv6 addresses", "[policy][pii]") {
   CHECK_FALSE(found(Category::PiiIp, "2001:db8:3a09"));        // three groups
 }
 
+// The lost-"::" rule trades some over-blur for recall. These are clean
+// on-screen strings it must leave alone, so the over-blur stays bounded to
+// runs of 4 to 7 hex groups with two groups of 3 or more characters.
+TEST_CASE("pii: the lost-gap IPv6 rule leaves clean text alone", "[policy][pii]") {
+  using spg::Category;
+  CHECK_FALSE(found(Category::PiiIp, "[12:30:45] chat is live"));     // chat timestamp
+  CHECK_FALSE(found(Category::PiiIp, "split 01:23:45.678"));          // speedrun timer
+  CHECK_FALSE(found(Category::PiiIp, "uptime 1:02:03:04"));           // d:hh:mm:ss
+  CHECK_FALSE(found(Category::PiiIp, "mac 00:1a:2b:3c:4d:5e"));       // MAC address
+  CHECK_FALSE(found(Category::PiiIp, "16:9 at 1080p, John 3:16"));    // ratios, verses
+  CHECK_FALSE(found(Category::PiiIp, "score 1:100:2:3"));             // one long group
+  CHECK_FALSE(found(Category::PiiIp, "bad:cafe:face"));               // three groups
+  CHECK_FALSE(found(Category::PiiIp, "1:2:3:4:5:6:7:8:9:10"));        // ten groups
+  CHECK_FALSE(found(Category::PiiIp, "aaaaa:bbbbb:ccccc:ddddd"));     // groups too long
+  CHECK_FALSE(found(Category::PiiIp, "2026-10-12 12:30:45"));         // date and time
+  // Accepted over-blur, by design (recall over precision): four hex groups,
+  // two of them three long, read as an address that lost its "::".
+  CHECK(found(Category::PiiIp, "12:345:678:90"));
+}
+
 TEST_CASE("pii: street addresses and PO boxes", "[policy][pii]") {
   using spg::Category;
   CHECK(found(Category::PiiAddress, "221B Synth Street"));

@@ -1982,16 +1982,34 @@ Template:
   detection now costs about 37 ms p50 per cycle on the dev Mac instead of
   6.5 ms (9 model runs at 1080p), and 97.6 ms instead of 11.5 ms on the CI
   Ubuntu runner (CPU provider; cycle p50 607.8 ms against 506.6 ms on main,
-  where the 500 ms lookahead is already exceeded by text detection). The
-  realtime suite stays SPG-16's (fail-closed 0.96, p95 744 ms in this run;
-  0.97 and 988 ms before), which should decide whether tiles run every scan
-  or every Nth one with the hold covering the gaps.
-- Open issues or follow-ups: first-frame recall misses (a) toasts whose
+  where the 500 ms lookahead is already exceeded by text detection).
+- Realtime suite (dev Mac, CoreML, plugin off, only the realtime replay of
+  the full text suite, default seed, main `67b637b` and head built side by
+  side, runs interleaved): fail-closed / p95 latency was 0.704 / 568 ms,
+  0.813 / 620 ms and 0.904 / 739 ms on main against 0.874 / 635 ms,
+  0.896 / 702 ms and 0.961 / 733 ms on head (paired deltas +0.170, +0.083,
+  +0.056). `face_detect` p50 went from 7.8-8.2 ms to 64-70 ms; text
+  detection, which already misses the 400 ms latency limit alone, drifted
+  from 285 to 352 ms p50 across the runs on both builds, so run-to-run noise
+  is as large as the delta. The rise is the cost of the scale-1 face tiles,
+  and it fails closed (whole-source blur), never open.
+- Decision: tiles stay on by default in this PR, because they close the
+  faces-suite leak (0.110 to 0.0009). The tiling cadence (every scan, or
+  every Nth scan with the hold covering the gaps) is SPG-16's to choose and
+  record before the plugin ships; the input is on #17
+  (issuecomment-6137130728). The realtime limits were already failing on
+  main and remain SPG-16's.
+- Follow-up issues: SPG-12b #75 (decoy blur on scrolling text, needs a
+  human decision on hold semantics for moving tracks or the margin) and
+  SPG-12c #76 (local first-frame recall on slide-ins). A clean-text test pins
+  what the lost-`::` IPv6 rule must leave alone (timestamps, timers, MAC
+  addresses, ratios), so its over-blur stays bounded.
+- Open issues or follow-ups: first-frame recall misses (#76) are (a) toasts whose
   ease-out slide is nearly over when a cycle first sees them, so a constant
   velocity measured 16 ms apart under-projects; (b) a partially typed entry
   scored against its full box; (c) a chat line entering two frames before the
   sequence ends. The simulated workers run in lockstep (cycles 16 ms apart
   every 200 ms), which halves the useful scan rate; staggering them is a
-  cadence question for SPG-16. Decoy blur needs a policy decision on hold
+  cadence question for SPG-16 (#17). Decoy blur (#75) needs a policy decision on hold
   semantics for confirmed moving tracks or on the margin. Synthetic eval only;
   live OBS not tested.
