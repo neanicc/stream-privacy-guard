@@ -96,6 +96,12 @@ inline constexpr std::size_t kRecognizerRunBudget = 4;
 // crop at a time.
 [[nodiscard]] std::size_t recognizer_parallel_runs(std::size_t workers) noexcept;
 
+// Scan workers in every filter's scheduler: the core default
+// (SchedulerConfig::workers). The filter sets its scheduler's worker count
+// from this, and load_models() sizes the recognizer from it, so the run
+// budget holds whatever SchedulerConfig::from_policy() does with workers.
+[[nodiscard]] std::size_t filter_scan_workers();
+
 struct LoadOptions {
   // Platform default execution providers with CPU fallback, or CPU only.
   bool cpu_only = false;
@@ -107,10 +113,9 @@ struct LoadResult {
 };
 
 // locate_models(), then opens and warms up each model. The recognizer runs
-// recognizer_parallel_runs(SchedulerConfig{}.workers) crops at once, sized
-// for the workers every filter's scheduler gets (SchedulerConfig::from_policy
-// keeps the default). Slow (hundreds of milliseconds to seconds): never call
-// it on the graphics or UI thread.
+// recognizer_parallel_runs(filter_scan_workers()) crops at once, sized for
+// the workers every filter's scheduler gets. Slow (hundreds of milliseconds
+// to seconds): never call it on the graphics or UI thread.
 // Throws only std::bad_alloc.
 [[nodiscard]] LoadResult load_models(std::span<const std::filesystem::path> dirs, const LoadOptions& options = {});
 

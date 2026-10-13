@@ -2575,6 +2575,15 @@ Template:
   18. The test now runs twice: two workers with the strict check on every
   frame, and the default with the same check on every frame outside the
   12 frames (one 200 ms cycle) after the lines appear.
+- Review fixes. The window is computed from the driver's default cycle and
+  the test's frame rate, and the test requires frames past it so the
+  strict check still runs. The realtime fitting test checks each plan's
+  rects directly: a fallback plan no longer passes the coverage check on
+  its whole-source blur alone. The `push` and `release` timers cover only
+  the scheduler calls, not the CLI's bookkeeping between them. The plugin
+  sets every filter's scheduler worker count from `filter_scan_workers()`,
+  the same count `load_models()` sizes the recognizer for, so a change to
+  `SchedulerConfig::from_policy()` cannot break the run budget.
 - Also: `eval/run_eval.py --workers N` passes a worker count to every
   `spg-cli` call and records it (`workers:` line, report.json), as #90
   asks; #90 is left open for its owner to close.

@@ -181,9 +181,10 @@ TEST_CASE("The pinned models are the manifest's three", "[models]") {
 TEST_CASE("Recognizer runs in flight per filter stay within the budget", "[models]") {
   using spg::plugin::kRecognizerRunBudget;
   using spg::plugin::recognizer_parallel_runs;
-  // The default scheduler's workers get the whole budget between them (#85:
+  // A filter's scheduler workers get the whole budget between them (#85:
   // two workers with 4 runs each put 8 on one session).
-  const std::size_t workers = spg::SchedulerConfig{}.workers;
+  const std::size_t workers = spg::plugin::filter_scan_workers();
+  CHECK(workers == spg::SchedulerConfig{}.workers);
   CHECK(workers * recognizer_parallel_runs(workers) <= kRecognizerRunBudget);
   CHECK(recognizer_parallel_runs(1) == kRecognizerRunBudget);
   for (std::size_t w = 1; w <= kRecognizerRunBudget; ++w) {
