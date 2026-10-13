@@ -72,6 +72,10 @@ struct TextRecognizerConfig {
   // returning. A 48x320 crop scales poorly over ONNX Runtime's threads (dev
   // Mac: 4.0 ms on 4 threads, 9.4 ms on 1), so a frame with many lines reads
   // faster with crops side by side (SPG-16: chat frames, about 25 regions).
+  // Thread budget: each scheduler worker inside recognize() adds up to
+  // parallel_runs - 1 threads, so the default two workers can have 8 runs
+  // in flight on one session, all sharing that session's ONNX Runtime
+  // intra-op pool (SessionOptions::intra_op_threads).
   std::size_t parallel_runs = 4;
   LineSplitParams lines;
 };
