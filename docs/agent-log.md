@@ -2614,3 +2614,81 @@ Template:
 - Eval delta: none; this changes limits, not code.
 - Open issues or follow-ups: #97 SPG-42, cutting decoy blur without a leak
   path, toward the original 0.25 target.
+
+## 2026-10-13 — SPG-16e Heavy-frame cycle with one worker (#96)
+
+- Method. Dev Mac: MacBook Air, Apple M4 (fanless), 16 GB, macOS 26.5.2,
+  ONNX Runtime 1.30.0 with Core ML. Profiling with `spg-cli bench
+  --realtime` on the local text suite (seed 20261012, 1920 x 1080, as the
+  realtime suite runs), `sample` call trees, and a temporary count-only
+  probe in the recognizer (regions, read jobs, input widths; no text; not
+  committed). A/B options were compared in one binary through temporary
+  environment switches (not committed), in interleaved rounds.
+- Where the heavy cycles go. On main e89ec32 one quiet run gave stage p50 /
+  p95 face 36 / 50 ms, text detection 82 / 107 ms, recognition 42 / 112 ms
+  (max 200); the failing frames were in the chat sequences (seq-000, 010,
+  020). A chat cycle reads about 25 one-line regions, one model run each,
+  about 12,000 input columns in all; no region needs extra views. Text
+  detection is one Core ML run on the GPU (pre- and post-processing are
+  about 3% of it); recognition is ONNX Runtime on the CPU (98% inside
+  `Session::run`). Faces also run on Core ML.
+- Changes. (1) `run_scan()` starts the face detector on a helper thread
+  beside the text detector and joins it before recognition, so a cycle
+  waits for the slower detector instead of both. Its result is exactly what
+  running the stages one after another returns, for every outcome of every
+  stage (a failed face lane ends the cycle with its boxes, as if text never
+  ran); if no thread can start, faces run on the worker's thread.
+  (2) `ocr::CachedRecognizer`, in front of the recognizer stage in spg-cli
+  and the plugin (one per filter): a `RecognitionCache` filed by a hash of
+  each region's readback crop. A region is answered from it only when an
+  entry holds the same crop size and every byte of the same pixels, read at
+  most `max_age` (1 s) earlier. Text that changes in place (typing), moves
+  over other pixels, or changes by one pixel is read again in the same
+  cycle it is first seen changed; text that moves with exactly its pixels
+  is not. `spg-cli` reports the cache's counts and takes
+  `--no-recognition-cache` to measure it.
+- Decision: content keys instead of track ids. `run_scan()` has no tracks,
+  and a pixel-exact key is stricter than "the track's pixels changed": any
+  change to the crop is a miss, and a hash collision is caught by the pixel
+  comparison. Exact reuse from the previous cycle measured 18 to 20% of
+  regions on the chat sequences (their lines scroll over a gradient through
+  a translucent panel, so most crops change) and 60 to 93% elsewhere.
+- Decision: no cheaper text pass (#86). Its saving would come from fewer
+  input pixels for text that is already small; the suite's 720p sequences
+  (12 px fonts) are the smallest text it can vouch for, and a 1080p frame
+  scaled to 720p would put 14 px UI text near 9 px. Not built.
+- Rejected with evidence (realtime bench, interleaved):
+  - Face detector beside the recognizer instead of the text detector:
+    face 54 to 58 ms and recognition slower (CPU contention); fewer gains.
+  - Face detector on CPU: fail-closed 0.022 and 0.031 against 0 and 0.002.
+  - Two workers taking turns (one detects while the other recognizes): text
+    detection 145 to 160 ms and recognition 89 to 102 ms against 104 and 64
+    with one worker; fail-closed 0.116 and 0.193 under load. On this
+    fanless machine GPU detection and CPU recognition slow each other.
+  - Recognizer threading (`--threads 1 --recognizer-runs 8` or 10,
+    `--threads 2 --recognizer-runs 4`), recognizer runs 6 or 8, Core ML
+    `SpecializationStrategy=FastPrediction` and
+    `AllowLowPrecisionAccumulationOnGPU`: no change beyond noise.
+- Machine state. The Mac ran on battery for the whole session; at 18:48 it
+  was at 3% and throttling (every stage about 30% slower than an hour
+  before, on both revisions). Load from my own runs and that drain make the
+  realtime numbers below noisy.
+- Simulated eval (`run.sh eval --local`, same generated suites): every mask
+  plan of the local text and faces suites is byte-identical to main
+  e89ec32's, so every text and faces metric is unchanged: watch-list pair
+  recall 0.9992 (3996/3999), first-frame 0.9623 (51/53), PII 0.9990
+  (4158/4162), text leak 0.0036 (7/1919), clean blur 0.0025, decoy blur
+  0.5284 (2459/4654); face recall 1.0, face leak 0, faces clean blur 0. The
+  cache answered 1796 of 3728 text-suite regions (48%) and 414 of 590 in
+  the faces suite.
+- Realtime, `run.sh eval --local`, fail-closed / p95 latency, in run order
+  (load is the 1-minute average before the run): main 17:36 0.0104 / 256
+  ms (load 2.1); branch 18:34 0 / 231 ms (2.9); main 18:37 0.215 / 402 ms
+  (2.9); branch 18:41 0.170 / 413 ms (3.0); main 18:45 0.235 / 409 ms
+  (3.0). The last three ran on a battery under 5%, throttled (text
+  detection p50 about 127 ms on both revisions against 82 to 96 ms before);
+  they show the branch ahead of main in the same state, not the quiet
+  distribution #96 asks for.
+- Open: the five-run branch / three-run main realtime series on a quiet,
+  powered machine was not finished in this session (see the PR). Live OBS
+  not tested.
