@@ -285,6 +285,13 @@ std::vector<MaskRect> fit_mask_rects(std::span<const MaskRect> rects, std::size_
   }
   std::vector<MaskRect> out(rects.begin(), rects.end());
   drop_contained(out);
+  // Cost: each merge rescans all pairs and reruns drop_contained(), both
+  // O(n^2), for at most n - capacity merges, so O(n^3) in the worst case. A
+  // released plan holds at most max_retro_rects (capped at kMaskRectCapacity
+  // by the CLI's driver_config()) retro rects plus max_rects_per_track per
+  // live track, and only spg-cli calls this, once per released frame,
+  // offline. The plugin does not; revisit this before calling it per frame
+  // on the render path.
   while (out.size() > capacity) {
     // The pair whose hull adds the least area beyond what the two rects
     // already cover together (their union, not the sum of their areas).

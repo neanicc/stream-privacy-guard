@@ -1709,5 +1709,13 @@ Template:
 - Open issues or follow-ups: live OBS not tested; the plugin (SPG-14) draws
   with its GPU effect, not this compositor, and GPU parity with this
   reference is SPG-14's; whether the blur defeats OCR is SPG-18's. The `NOT RUN` mention
-  in the human-owned autopilot skill is left for a human.
+  in the human-owned autopilot skill is left for a human. Realtime
+  `late_frames` is reported (an `unscored:` line in the eval report) but not
+  scored: a limit needs the human-owned `eval/thresholds.toml`, tracked in
+  #68 (SPG-31, needs-human). The CI eval runs in simulated time with a fixed
+  200 ms cycle, so it is plan-logic evidence only; timing margin and failing
+  closed under load are scored by `bench --realtime` and the local realtime
+  suite, which SPG-16 (#17) must bring to its limits. `fit_mask_rects()` is
+  O(n^3) worst case; fine offline in `spg-cli`, to revisit before any per-frame
+  use in the plugin.
 

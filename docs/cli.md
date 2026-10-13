@@ -46,7 +46,12 @@ policy's lookahead, retro window, hold, margin and fallback.
   behind, the delay is spent from the frame's lookahead and counted in its
   detection latency (and fail-closed frames) rather than slowing the feed
   the workers see. Frames pushed more than one period late are counted as
-  `late_frames`, which `eval/run_eval.py` prints with the realtime line.
+  `late_frames`. `eval/run_eval.py` prints the count with the realtime line
+  and on its own `unscored: realtime late_frames N` line. **Nothing scores
+  it yet:** a late-frame limit needs a key in the human-owned
+  `eval/thresholds.toml`, tracked in #68 (SPG-31). Until then a replay that
+  feeds late but stays inside the lookahead passes; its delay still counts
+  in detection latency and fail-closed frames, which are scored.
 - **Padding.** After the last frame both keep pushing copies of it until every
   real frame is released. A live source keeps producing frames; without them
   the last `retro` of every sequence could never be covered by a later scan
@@ -59,6 +64,23 @@ policy's lookahead, retro window, hold, margin and fallback.
   simulated end, or in realtime the end of the cycle's last stage call,
   policy calls included; the apply under the scheduler's lock is not
   included).
+
+### What each driver is evidence for
+
+The CI eval (`scripts/ci/run.sh eval`, which runs `spg-cli eval`) uses the
+simulated driver with a fixed 200 ms cycle. A cycle that takes 2 s of wall
+time on a loaded runner still counts as 200 ms, so the CI eval is evidence
+about plan logic only: retroactive coverage, hold and margin, fallback rules,
+rect fitting, and recall and over-blur on the generated frames. It says
+nothing about timing margin, about how close a cycle comes to the lookahead
+deadline, or about failing closed when the machine is slow. Its detection
+latency is simulated time.
+
+Timing evidence comes from `bench --realtime` (the threaded scheduler on the
+wall clock) and the local realtime suite (`scripts/ci/run.sh eval --local`),
+which scores the fail-closed rate and p95 detection latency. Tuning them to
+pass is SPG-16 (#17). Neither is live OBS evidence: the plugin draws with its
+own GPU effect ([live-check.md](live-check.md)).
 
 ## Stage timing
 
@@ -98,6 +120,8 @@ BGRA pixels. It is the reference the GPU effect (SPG-14) must match or exceed.
   whose hull adds the least area beyond their union (overlap counted once)
   merges until 64 remain (stronger style wins).
   Every input rect stays inside some output rect, so fitting only adds blur.
+  Fitting is O(n^3) in the worst case (each merge rescans all pairs); only
+  `spg-cli` calls it, offline, once per released frame. The plugin does not.
   The scheduler's `max_retro_rects` (64) and the tracker's
   `max_rects_per_track` (8, so eight tracks fit unmerged) are capped at the
   capacity by `driver_config()`.

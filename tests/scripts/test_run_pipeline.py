@@ -173,6 +173,19 @@ class DriverTests(unittest.TestCase):
         _, stdout, _ = self.run_driver("local", cli)
         self.assertIn("pipeline: realtime 20 frames, 0 fail-closed, 30 padding, 3 late;", stdout)
 
+    def test_realtime_late_frames_are_labeled_unscored(self) -> None:
+        # No late-frame limit exists yet (#68); the count must still be visible,
+        # including zero, and say that nothing scores it.
+        for late in (0, 3):
+            with self.subTest(late=late):
+                _, stdout, _ = self.run_driver("local", FakeCli("oracle", late_frames=late))
+                self.assertIn(f"unscored: realtime late_frames {late} (no limit in thresholds.toml yet, #68)",
+                              stdout.splitlines())
+
+    def test_ci_mode_prints_no_late_frame_line(self) -> None:
+        _, stdout, _ = self.run_driver("ci", FakeCli("oracle"))
+        self.assertNotIn("unscored:", stdout)
+
     def test_local_mode_fails_slow_detection(self) -> None:
         code, stdout, report = self.run_driver("local", FakeCli("oracle", latency_ms=900.0))
         self.assertEqual(code, 1)

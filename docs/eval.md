@@ -151,3 +151,11 @@ realtime suite. A missing or failing `spg-cli` prints `THRESHOLDS: FAIL` in
 every mode; there is no "not run" outcome. The report lines include each
 suite's frame and fail-closed counts and stage medians. SPG-16 tunes the
 realtime numbers.
+
+The CI eval is plan-logic evidence only. Its suites run in simulated time
+with a fixed cycle, so it cannot show timing margin or fail-closed behavior
+on a slow machine ([cli.md](cli.md#what-each-driver-is-evidence-for)).
+Timing evidence is `spg-cli bench --realtime` and the local realtime suite,
+owned by SPG-16 (#17). The realtime report also prints an
+`unscored: realtime late_frames N` line: no limit scores late frames until
+a human adds one to `thresholds.toml`, tracked in #68 (SPG-31).

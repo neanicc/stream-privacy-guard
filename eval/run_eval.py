@@ -10,7 +10,12 @@
    every generated suite and score its mask plans. In local mode also replay
    the text suite's sequences at the `[suite.realtime]` resolution through
    `spg-cli bench --realtime` (the realtime suite: wall clock, worker
-   threads) and score its fail-closed rate and detection latency.
+   threads) and score its fail-closed rate and detection latency. Its
+   late-frame count is printed on an `unscored:` line: no limit scores it
+   until #68 adds one to thresholds.toml.
+
+The text and faces suites run in simulated time with a fixed cycle, so they
+are evidence about plan logic, not timing margin (docs/cli.md).
 
 A missing or failing spg-cli is an error and prints `THRESHOLDS: FAIL`, in
 every mode: no run passes without the pipeline.
@@ -67,6 +72,17 @@ def _timing_line(name: str, timing: dict) -> str:
             f"{timing['padding_frames']} padding{late}; " + ", ".join(parts))
 
 
+def _late_frames_line(bench: dict) -> str:
+    """The realtime late-frame count, always printed and labeled as not scored.
+
+    thresholds.toml has no late-frame limit yet; adding one is a human change
+    tracked in #68 (SPG-31). The delay of a late frame still counts in its
+    detection latency and fail-closed frames, which are scored.
+    """
+    return (f"unscored: realtime late_frames {int(bench.get('late_frames', 0))} "
+            f"(no limit in thresholds.toml yet, #68)")
+
+
 def run_pipeline(build_dir: Path, suite_dir: Path, plans_dir: Path, cache: Path) -> dict:
     """Run spg-cli on every sequence in suite_dir, writing <plans_dir>/<seq>/mask_plans.jsonl.
 
@@ -87,7 +103,8 @@ def run_realtime(build_dir: Path, source_dir: Path, plans_dir: Path, spec: dict,
 
     A frame the replay could not feed on time keeps its due timestamp in
     spg-cli, so the delay counts in its latency and fail-closed frames
-    (docs/cli.md); the late count is printed with the timing line.
+    (docs/cli.md); the late count is printed with the timing line and on an
+    unscored line (no limit yet, #68).
 
     Returns the realtime suite run (those sequences' ground truth, the
     realtime plans and the per-cycle latencies) and the bench report.
@@ -171,7 +188,8 @@ def main(argv: list[str]) -> int:
             runs["realtime"], bench = run_realtime(args.build_dir, suite_dirs[REALTIME_SOURCE], plans_dir, realtime,
                                                    args.cache)
             lines.append(_timing_line("realtime", bench))
-        print("\n".join(line for line in lines if line.startswith("pipeline:")))
+            lines.append(_late_frames_line(bench))
+        print("\n".join(line for line in lines if line.startswith(("pipeline:", "unscored:"))))
         report = scoring.evaluate(thresholds, runs, args.mode)
     except Exception as exc:  # noqa: BLE001 - any failure must end in a FAIL verdict
         print(f"run_eval: error: {exc}", file=sys.stderr)
