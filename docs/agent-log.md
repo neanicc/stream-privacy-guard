@@ -2596,3 +2596,21 @@ Template:
   tracks); or (c) raise the default lookahead from 500 ms (plan section
   4) so two cycles fit, which delays the stream and audio further. Live
   OBS not tested.
+
+## 2026-10-13 — SPG-12b Owner decisions: decoy limit and blocking eval (#75, #64)
+
+- Decision / change: option 2 on #75. `decoy_blur_rate_max` goes from 0.25 to
+  0.55. #94 (the hold follows confirmed moving tracks) is closed. It still
+  measured 0.47, so it needed a higher limit anyway. It also left 1,011 of
+  148,151 compared frames uncovered when text turns back. A missed frame has
+  already aired, and recall comes before precision, so the small decoy gain
+  does not justify the leak path. The #82 AGENTS.md exception is reverted
+  because no code relies on it now. The synthetic eval job blocks merges
+  again (#64, reverting #65), because CI-mode thresholds now pass.
+- Evidence: synthetic eval on main 5de5ca6, `bash scripts/ci/run.sh eval --local`:
+  decoy_blur_rate 0.5284 locally and 0.4255 in CI. All other text and face
+  limits pass. Realtime fail-closed (0.0481, local only) is tracked in #96,
+  where option (b) was chosen: keep 0.01 and speed up the heaviest frames.
+- Eval delta: none; this changes limits, not code.
+- Open issues or follow-ups: #97 SPG-42, cutting decoy blur without a leak
+  path, toward the original 0.25 target.

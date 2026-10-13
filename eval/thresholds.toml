@@ -14,7 +14,7 @@ watchlist_first_frame_recall_min = 0.95
 pii_pair_recall_min = 0.90
 leak_frame_rate_max = 0.02
 clean_frame_blur_area_max = 0.03
-decoy_blur_rate_max = 0.25
+decoy_blur_rate_max = 0.55
 
 [suite.faces]
 required_in = ["local"]
