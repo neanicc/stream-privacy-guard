@@ -365,7 +365,7 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     state.track.kind = detection.kind;
     state.motion = Motion{detection.box.rect, frame_time, frame_time, Velocity{}, false, false};
     state.since_gate = state.motion;
-    follow_measure(state.follow, detection.box.rect, frame_time);
+    detail::follow_measure(state.follow, detection.box.rect, frame_time);
     hold(state, make_held(detection.box.rect, frame_time, Velocity{}));
     if (motions != nullptr) {
       (*motions)[di].track = state.track.id;
@@ -445,12 +445,12 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box, 
     state.follow = Follow{};
     state.follow.barrier = state.next_seq;
     if (forward) {
-      follow_measure(state.follow, box, frame_time);
+      detail::follow_measure(state.follow, box, frame_time);
     }
   } else {
     advance(state.since_gate, frame_time, box);
     if (forward) {
-      follow_measure(state.follow, box, frame_time);
+      detail::follow_measure(state.follow, box, frame_time);
     }
   }
   Track& track = state.track;
@@ -475,7 +475,7 @@ void Tracker::hold(TrackState& state, Held held) {
   state.held.push_back(held);
 }
 
-void Tracker::follow_measure(Follow& follow, const Rect& box, Timestamp frame_time) noexcept {
+void detail::follow_measure(Follow& follow, const Rect& box, Timestamp frame_time) noexcept {
   // Measured from the checkpoint, not the last box, over at least
   // kMinBaseline: two workers' paired cycles land a frame apart, and a pixel
   // or two of move between them is neither a translation nor a stop.
@@ -720,6 +720,29 @@ void Tracker::track_masks(const TrackState& state, Timestamp t, std::int64_t wid
                    static_cast<double>(box.x) + static_cast<double>(box.width) + std::max(ax, bx) + held.margin_x,
                    static_cast<double>(box.y) + static_cast<double>(box.height) + std::max(ay, by) +
                        held.margin_y));
+    // And where its own velocity puts it, as holding it would predict it,
+    // from the back of a's mask on along the run: text that runs on past b
+    // between the sightings (an overshoot, or a stop past b) stays covered
+    // as far as holding the box where it was seen covers it, and nothing
+    // behind a, which the text has left, is masked again.
+    const double dt = seconds(std::clamp(t - held.seen, Duration::zero(), config_.max_prediction));
+    double x0 = static_cast<double>(box.x) + static_cast<double>(held.low.dx_per_s) * dt - held.margin_x;
+    double y0 = static_cast<double>(box.y) + static_cast<double>(held.low.dy_per_s) * dt - held.margin_y;
+    double x1 = static_cast<double>(box.x) + static_cast<double>(box.width) +
+                static_cast<double>(held.high.dx_per_s) * dt + held.margin_x;
+    double y1 = static_cast<double>(box.y) + static_cast<double>(box.height) +
+                static_cast<double>(held.high.dy_per_s) * dt + held.margin_y;
+    const Rect& ab = a->box;
+    if (follow.along_x) {
+      x0 = follow.positive ? std::max(x0, static_cast<double>(ab.x) - a->margin_x) : x0;
+      x1 = follow.positive ? x1 : std::min(x1, static_cast<double>(ab.x) + static_cast<double>(ab.width) + a->margin_x);
+    } else {
+      y0 = follow.positive ? std::max(y0, static_cast<double>(ab.y) - a->margin_y) : y0;
+      y1 = follow.positive ? y1 : std::min(y1, static_cast<double>(ab.y) + static_cast<double>(ab.height) + a->margin_y);
+    }
+    if (x0 < x1 && y0 < y1) {
+      add(held.seen, pixel_rect(x0, y0, x1, y1));
+    }
   }
   if (on) {
     const double mx = std::max(a->margin_x, b->margin_x);

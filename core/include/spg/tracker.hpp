@@ -108,6 +108,34 @@ struct TrackMotion {
   friend bool operator==(const TrackMotion&, const TrackMotion&) = default;
 };
 
+namespace detail {
+
+// Tracker internals, here so a unit test can drive them on their own.
+//
+// Whether a track is confirmed moving (SPG-12b). Measured from a checkpoint
+// box, so the short gap between two workers' paired cycles (a pixel or two)
+// neither counts nor breaks the run.
+struct Follow {
+  Rect checkpoint;
+  Timestamp checkpoint_time{};
+  bool has_checkpoint = false;
+  int translations = 0;      // steady, the same way, from run_start
+  bool along_x = true;       // their axis
+  bool positive = true;      // and direction along it
+  double speed = 0.0;        // of the last one along that axis, px/s
+  Timestamp run_start{};     // boxes seen before it never move
+  // A box seen kMinBaseline or more after the checkpoint did not translate
+  // from it: the text rested there, so a run that starts from this
+  // checkpoint starts at its first translation instead.
+  bool rested = false;
+  std::uint64_t barrier = 0;  // boxes held before this seq never move
+};
+
+// A forward detection moved the track to `box` on `frame_time`.
+void follow_measure(Follow& follow, const Rect& box, Timestamp frame_time) noexcept;
+
+}  // namespace detail
+
 // Follows detections across frames and answers which Source-space regions
 // must be masked on the frame with a given timestamp.
 //
@@ -226,24 +254,7 @@ class Tracker {
     bool late = false;      // a detection that did not move its track forward
     std::uint64_t seq = 0;  // order held in its track
   };
-  // Whether a track is confirmed moving (SPG-12b). Measured from a checkpoint
-  // box, so the short gap between two workers' paired cycles (a pixel or two)
-  // neither counts nor breaks the run.
-  struct Follow {
-    Rect checkpoint;
-    Timestamp checkpoint_time{};
-    bool has_checkpoint = false;
-    int translations = 0;      // steady, the same way, from run_start
-    bool along_x = true;       // their axis
-    bool positive = true;      // and direction along it
-    double speed = 0.0;        // of the last one along that axis, px/s
-    Timestamp run_start{};     // boxes seen before it never move
-    // A box seen kMinBaseline or more after the checkpoint did not translate
-    // from it: the text rested there, so a run that starts from this
-    // checkpoint starts at its first translation instead.
-    bool rested = false;
-    std::uint64_t barrier = 0;  // boxes held before this seq never move
-  };
+  using Follow = detail::Follow;
   // What confirm() measures from a run of detections: the latest box (in
   // frame time) and its frame time, the earliest frame time, the velocity
   // estimate and whether the box translated (see TrackMotion).
@@ -280,8 +291,6 @@ class Tracker {
   [[nodiscard]] Rect mask_rect(const Held& held, Timestamp t) const noexcept;
   // Appends `held` to the track with the next seq.
   static void hold(TrackState& state, Held held);
-  // A forward detection moved the track to `box` on `frame_time`.
-  static void follow_measure(Follow& follow, const Rect& box, Timestamp frame_time) noexcept;
   // Masks of one track on frame time `t`, merged into `slots` time buckets.
   void track_masks(const TrackState& state, Timestamp t, std::int64_t width, std::int64_t first,
                    std::span<Box> slots) const noexcept;

@@ -58,7 +58,7 @@ including a zero hold and rect caps from 1 to 12), once with follow off and
 once with it on. Monotone growth is checked during each scene, from a frame
 time inside a still-retained detection's hold, so every comparison is between
 non-empty masks (with follow on, only after every detection fed: 39,123
-comparisons). The follow run checks 56,402 released boxes against the Follow
+comparisons). The follow run checks 55,927 released boxes against the Follow
 row, and every other box against Hold. Unit cases cover association,
 prediction, expiry, pruning, validation, resize (including a 2x upscale and two
 chained resizes), a 60 s hold with 600 held detections (followed and not), and
@@ -72,7 +72,11 @@ seen, a resize mid-run holding every box from before it, and the line below
 taking over a line scrolling at 150 to 300 px/s after missed cycles (2,400
 scenes): the line's boxes hold where they were seen, and it is covered
 wherever holding every box where it was seen covers it (a scheduler test
-checks the same at one and two workers).
+checks the same at one and two workers). Text that turns between two
+sightings is a property test of its own (see the known limit under
+[Follow](#follow-spg-12b)), and a table drives the run state
+(`detail::follow_measure`) on its own: baseline, confirmation, steadiness,
+speed changes, a neighbour's short move, turns, rests and stops.
 
 ## Follow (SPG-12b)
 
@@ -116,10 +120,36 @@ held boxes of a confirmed moving track where the track went instead.
   than `a` are left out. The hull of `a` and `b`, grown by the larger of
   their margins, is added. Text that moved one way between two sightings is
   inside that hull on every frame time between them, whatever its speed
-  profile, so no frame depends on the velocity estimate.
+  profile, so no frame depends on the velocity estimate. Each moved box also
+  keeps its own constant-velocity prediction, as holding it would predict
+  it, cut to start at the back of `a`'s mask along the run: text that runs on
+  past `b` and comes back by it (an overshoot, or a stop past `b`) stays
+  covered as far as holding the box where it was seen covers it, and no
+  position behind `a`, which the run has left, is masked again.
 - **Held where seen.** Late detections, boxes from before the run, boxes held
   before a gate pairing or resize (they may be another object's), and every
   box on frame times after the track's last detection.
+
+**Known limit: text that turns back between two sightings.** Follow
+assumes the text did not go back past `a` between `a` and `b`. A turn that
+the next sighting sees breaks the run (a move against it, or a change of
+speed), and that sighting lands before the frames between `a` and `b` are
+released, so they are held where seen. What Follow does not see is text that
+turns back past `a` and is back on the run's steady path by `b`, with every
+cycle between them missed: on those frames it is covered only as far as
+`a`'s own mask reaches back, where holding every box where it was seen would
+have covered the positions the run left. That is the trade the AGENTS.md
+temporal-hold exception makes (a newer detection of the track pins the text),
+and covering those positions again is the decoy blur Follow removes. A
+property test pins it (600 scenes of a steady run that then overshoots `b`
+and comes back, stops past `b`, turns back past `a`, or jumps from `a` to
+`b`, at 40 to 300 px/s along x or y, one or two workers, one to four missed
+cycles between `a` and `b`): on every frame where holding every box where it
+was seen covers the text where it is, following covers it too, except on
+1,011 of 148,151 compared frames, all with the text turned back behind `a`.
+Before the moved boxes kept their own prediction, overshoots and stops past
+`b` were uncovered on 55 such frames too. Only the live scrolling-chat leak
+test (#71) can say how often a real chat does this.
 
 What Follow releases is where the text has been: the hull of `a` and `b`
 covers where it is, and each moved box keeps its own size and margin there.

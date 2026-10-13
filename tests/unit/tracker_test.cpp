@@ -1387,6 +1387,68 @@ TEST_CASE("tracker: a neighbouring line that takes over a fast track leaves the 
   CHECK(compared > 100'000);
 }
 
+TEST_CASE("tracker: follow_measure confirms, restarts and ends runs (table)", "[tracker]") {
+  // The run state of one track, driven on its own by forward boxes. A 300 x
+  // 30 line at x 100 unless a step gives x; y falls as it scrolls up.
+  struct Step {
+    std::int64_t ms;
+    float y;
+    float x = 100.0F;
+  };
+  struct Row {
+    const char* name;
+    std::vector<Step> steps;
+    int translations;
+    std::int64_t run_start_ms;
+    std::int64_t checkpoint_ms;
+    bool rested;
+    bool along_x;
+    bool positive;
+  };
+  const std::vector<Row> rows{
+      {"the first box sets the checkpoint", {{0, 600}}, 0, 0, 0, false, true, true},
+      {"a paired cycle inside the 100 ms baseline is not measured", {{0, 600}, {17, 598}}, 0, 0, 0, false, true,
+       true},
+      {"a first translation starts a run at the checkpoint", {{0, 600}, {100, 591}}, 1, 0, 100, false, false, false},
+      {"two steady translations confirm the run", {{0, 600}, {100, 591}, {200, 582}}, 2, 0, 200, false, false,
+       false},
+      {"a move off by 2 px stays steady", {{0, 600}, {100, 591}, {200, 580}}, 2, 0, 200, false, false, false},
+      {"a change of speed restarts the run at its box", {{0, 600}, {100, 591}, {200, 570}}, 1, 200, 200, false,
+       false, false},
+      {"a neighbour a line short of a long gap's move restarts the run at its box",
+       {{0, 600}, {100, 560}, {400, 474}}, 1, 400, 400, false, false, false},
+      {"a turn starts a new run from the checkpoint it left", {{0, 600}, {100, 591}, {200, 582}, {300, 591}}, 1, 200,
+       300, false, false, true},
+      {"a box at rest marks the checkpoint rested", {{0, 600}, {100, 591}, {200, 591}}, 1, 0, 100, true, false,
+       false},
+      {"a first translation after a rest starts the run at its box", {{0, 600}, {100, 600}, {200, 591}}, 1, 200, 200,
+       false, false, false},
+      {"a move at the run's speed after a short rest goes on with it",
+       {{0, 600}, {100, 591}, {200, 591}, {300, 582}}, 2, 0, 300, false, false, false},
+      {"a change of speed after a rest restarts the run at its box", {{0, 600}, {100, 591}, {200, 591}, {300, 560}},
+       1, 300, 300, false, false, false},
+      {"no translation for longer than the stop window ends the run",
+       {{0, 600}, {100, 591}, {200, 582}, {500, 582}}, 0, 0, 500, false, false, false},
+      {"a steady run along x", {{0, 400, 100}, {100, 400, 130}, {200, 400, 160}}, 2, 0, 200, false, true, true},
+  };
+  for (const Row& row : rows) {
+    INFO(row.name);
+    spg::detail::Follow follow;
+    for (const Step& s : row.steps) {
+      spg::detail::follow_measure(follow, Rect{s.x, s.y, 300.0F, 30.0F}, at_ms(s.ms));
+    }
+    CHECK(follow.has_checkpoint);
+    CHECK(follow.translations == row.translations);
+    CHECK(follow.run_start == at_ms(row.run_start_ms));
+    CHECK(follow.checkpoint_time == at_ms(row.checkpoint_ms));
+    CHECK(follow.rested == row.rested);
+    if (row.translations > 0) {
+      CHECK(follow.along_x == row.along_x);
+      CHECK(follow.positive == row.positive);
+    }
+  }
+}
+
 // --- Property tests --------------------------------------------------------
 //
 // Seeded random scenes: several objects of both kinds moving at constant or
@@ -1775,4 +1837,185 @@ TEST_CASE("tracker: a followed track stays covered where it went (property)", "[
   INFO("released " << counts.released << ", monotone checks " << counts.monotone_checks);
   CHECK(counts.released > 0);
   CHECK(counts.monotone_checks > 0);
+}
+
+namespace {
+
+// `g` lies inside the union of `masks` (not necessarily inside one rect): the
+// cells the mask edges cut `g` into are each inside some mask.
+bool union_covers(const std::vector<Box>& masks, const Region& g) {
+  std::vector<double> xs{g.x0, g.x1};
+  std::vector<double> ys{g.y0, g.y1};
+  for (const Box& b : masks) {
+    const Region r = region_of(b.rect);
+    for (const double x : {r.x0, r.x1}) {
+      if (x > g.x0 && x < g.x1) {
+        xs.push_back(x);
+      }
+    }
+    for (const double y : {r.y0, r.y1}) {
+      if (y > g.y0 && y < g.y1) {
+        ys.push_back(y);
+      }
+    }
+  }
+  std::sort(xs.begin(), xs.end());
+  std::sort(ys.begin(), ys.end());
+  for (std::size_t i = 0; i + 1 < xs.size(); ++i) {
+    for (std::size_t j = 0; j + 1 < ys.size(); ++j) {
+      if (xs[i + 1] <= xs[i] || ys[j + 1] <= ys[j]) {
+        continue;
+      }
+      const double mx = (xs[i] + xs[i + 1]) / 2.0;
+      const double my = (ys[j] + ys[j + 1]) / 2.0;
+      const bool in = std::any_of(masks.begin(), masks.end(), [&](const Box& b) {
+        const Region r = region_of(b.rect);
+        return r.x0 <= mx && mx <= r.x1 && r.y0 <= my && my <= r.y1;
+      });
+      if (!in) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// How the text moves between two sightings a and b of a confirmed moving
+// run, with every cycle between them missed. Only `Jump` stays inside the
+// hull of a and b; the others leave it on the way.
+enum class Turn {
+  Overshoot,  // on past b, then back to it
+  Stop,       // on past b, rests there, then back to it
+  Reverse,    // back past a, then on to b
+  Jump,       // rests at a, then jumps to b (scrolling in steps)
+};
+
+}  // namespace
+
+TEST_CASE("tracker: text that turns between two sightings is covered wherever holding covers it (property)",
+          "[tracker][property]") {
+  // SPG-12b staff review: Follow masks a frame between two sightings a and b
+  // of a confirmed moving run with the hull of a and b, and moves the older
+  // boxes there; it assumes the text went one way from a to b. Here it does
+  // not: after a steady run, the text overshoots b and comes back, stops
+  // past b, or turns back past a, while every cycle between a and b is
+  // missed, and it is back on its steady path by b, so b is steady and the
+  // run goes on. On every frame where holding every box where it was seen
+  // (follow off) covers the text where it actually is, following must cover
+  // it too, with one known limit (docs/tracker.md): text that turned back
+  // behind a, onto positions the run already left, is covered only as far
+  // as a's own mask reaches. Those frames are counted, not failed.
+  constexpr std::uint32_t kTurnScenes = 600;
+  constexpr std::int64_t kEnd = 2000;
+  int compared = 0;  // frames where follow off covers the text
+  int turning = 0;   // of them, frames between a and b off the hull
+  int behind_a = 0;  // of them, uncovered with the text turned back behind a
+  int uncovered = 0;  // any other uncovered frame
+  int by_turn[4] = {0, 0, 0, 0};  // uncovered frames per Turn, behind_a included
+  std::string first_failure;
+  for (std::uint32_t seed = 1; seed <= kTurnScenes; ++seed) {
+    Scene scene(seed);
+    const bool along_x = scene.chance(0.25);
+    const double sign = scene.chance(0.8) ? -1.0 : 1.0;  // mostly up or left, like chat
+    const double speed = scene.uniform(40.0, 300.0);
+    const double w = along_x ? scene.uniform(40.0, 200.0) : scene.uniform(150.0, 400.0);
+    const double h = scene.uniform(18.0, 40.0);
+    const auto turn = static_cast<Turn>(scene.uniform_int(0, 3));
+    const bool paired = scene.chance(0.5);
+    const std::int64_t step = paired ? 200 : 100;
+    // a: a cycle after the run is confirmed; b: one to four cycles later.
+    const std::int64_t ta = step * scene.uniform_int(paired ? 3 : 5, paired ? 6 : 12);
+    const std::int64_t tb = ta + step * scene.uniform_int(1, 4);
+    // How far past the hull the text goes: from a few pixels to two boxes.
+    const double extent = along_x ? w : h;
+    const double past = scene.uniform(4.0, 2.0 * extent);
+    // Position along the run: steady, except between a and b.
+    const auto steady = [&](double ms) { return sign * speed * ms / 1000.0; };
+    const double pa = steady(static_cast<double>(ta));
+    const double pb = steady(static_cast<double>(tb));
+    const auto along = [&](std::int64_t ms_i) {
+      const auto ms = static_cast<double>(ms_i);
+      if (ms_i <= ta || ms_i >= tb) {
+        return steady(ms);
+      }
+      const double u = (ms - static_cast<double>(ta)) / static_cast<double>(tb - ta);
+      switch (turn) {
+        case Turn::Overshoot:
+          // Out to past b by mid-way, back by b.
+          return u < 0.5 ? pa + (pb + sign * past - pa) * (u / 0.5) : pb + sign * past * (1.0 - (u - 0.5) / 0.5);
+        case Turn::Stop:
+          // Past b by a quarter of the way, resting there until three quarters.
+          if (u < 0.25) {
+            return pa + (pb + sign * past - pa) * (u / 0.25);
+          }
+          return u < 0.75 ? pb + sign * past : pb + sign * past * (1.0 - (u - 0.75) / 0.25);
+        case Turn::Reverse:
+          // Back past a by mid-way, then on to b.
+          return u < 0.5 ? pa - sign * past * (u / 0.5)
+                         : pa - sign * past + (pb - pa + sign * past) * ((u - 0.5) / 0.5);
+        case Turn::Jump:
+          return u < 0.8 ? pa : pb;
+      }
+      return steady(ms);
+    };
+    const auto box_at = [&](std::int64_t ms) {
+      const double p = along(ms);
+      return along_x ? Rect{static_cast<float>(900.0 + p), 400.0F, static_cast<float>(w), static_cast<float>(h)}
+                     : Rect{100.0F, static_cast<float>(900.0 + p), static_cast<float>(w), static_cast<float>(h)};
+    };
+    std::vector<std::pair<std::int64_t, std::vector<Rect>>> cycles;
+    for (std::int64_t base = 0; base <= kEnd; base += step) {
+      for (const std::int64_t ms : {base, paired ? base + 17 : base}) {
+        if ((!cycles.empty() && cycles.back().first == ms) || (ms > ta && ms < tb)) {
+          continue;  // one cycle per frame; every cycle between a and b is missed
+        }
+        // Some other cycles are missed too, never a or b.
+        if (ms != ta && ms != tb && scene.chance(0.1)) {
+          continue;
+        }
+        Rect r = box_at(ms);
+        r.x += static_cast<float>(scene.uniform(-1.0, 1.0));
+        r.y += static_cast<float>(scene.uniform(-1.0, 1.0));
+        cycles.push_back({ms, {r}});
+      }
+    }
+    TrackerConfig on;
+    TrackerConfig off = on;
+    off.follow_moving_tracks = false;
+    const Replay followed = replay_lines(on, cycles, kEnd + 750);
+    const Replay held = replay_lines(off, cycles, kEnd + 750);
+    for (std::size_t f = 0; f < followed.released.size(); ++f) {
+      const auto ms = static_cast<std::int64_t>(10 * f);
+      const Region truth = region_of(box_at(ms));
+      if (!union_covers(held.released[f], truth)) {
+        continue;
+      }
+      ++compared;
+      const double p = along(ms);
+      turning += (ms > ta && ms < tb && (p < std::min(pa, pb) - 1.0 || p > std::max(pa, pb) + 1.0)) ? 1 : 0;
+      if (union_covers(followed.released[f], truth)) {
+        continue;
+      }
+      ++by_turn[static_cast<int>(turn)];
+      if (turn == Turn::Reverse && ms > ta && ms < tb && sign * (p - pa) < 0.0) {
+        ++behind_a;
+        continue;
+      }
+      if (uncovered++ == 0) {
+        const char* const names[] = {"overshoot", "stop", "reverse", "jump"};
+        first_failure = "seed " + std::to_string(seed) + ", " + names[static_cast<int>(turn)] + ", " +
+                        std::to_string(static_cast<int>(speed)) + " px/s, " + (along_x ? "x" : "y") +
+                        ", paired " + std::to_string(static_cast<int>(paired)) + ", a " + std::to_string(ta) +
+                        " ms, b " + std::to_string(tb) + " ms, past " + std::to_string(static_cast<int>(past)) +
+                        " px, frame " + std::to_string(ms) + " ms";
+      }
+    }
+  }
+  INFO("frames compared " << compared << ", off the hull of a and b " << turning << ", turned back behind a "
+                           << behind_a << ", other uncovered " << uncovered << " (per turn: overshoot "
+                           << by_turn[0] << ", stop " << by_turn[1] << ", reverse " << by_turn[2] << ", jump "
+                           << by_turn[3] << ")");
+  INFO(first_failure);
+  CHECK(uncovered == 0);
+  CHECK(turning > 1000);
 }
