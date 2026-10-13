@@ -81,12 +81,16 @@ std::shared_ptr<ScriptedDetector> face_from(std::int64_t from_ms) {
   });
 }
 
-bool covers(const spg::MaskPlan& plan, const spg::Rect& r) {
-  return plan.fallback || std::any_of(plan.rects.begin(), plan.rects.end(), [&](const spg::MaskRect& m) {
-           const spg::Rect& b = m.box.rect;
-           return b.x <= r.x && b.y <= r.y && b.x + b.width >= r.x + r.width && b.y + b.height >= r.y + r.height;
-         });
+// Whether one of the plan's rects contains `r`, whatever the plan's fallback.
+bool rects_cover(const spg::MaskPlan& plan, const spg::Rect& r) {
+  return std::any_of(plan.rects.begin(), plan.rects.end(), [&](const spg::MaskRect& m) {
+    const spg::Rect& b = m.box.rect;
+    return b.x <= r.x && b.y <= r.y && b.x + b.width >= r.x + r.width && b.y + b.height >= r.y + r.height;
+  });
 }
+
+// Whether the plan hides `r` on air: a fallback plan covers the whole source.
+bool covers(const spg::MaskPlan& plan, const spg::Rect& r) { return plan.fallback || rects_cover(plan, r); }
 
 fs::path scratch(const std::string& name) {
   const fs::path dir = fs::path(SPG_CLI_TEST_DIR) / name;
@@ -490,20 +494,27 @@ TEST_CASE("realtime plans are fitted to the compositor's rect capacity after the
                                         spg::cli::DriverOptions{}, times, *cycles);
   static_assert(150 > spg::kMaskRectCapacity, "a scanned plan must need fitting");
   REQUIRE(r.plans.size() == 30);
+  // Whether a frame airs clean or fails closed depends on wall-clock timing
+  // (a slow runner fails frames closed), but either way its plan lists the
+  // rects of every cycle that reached it, and every plan is fitted. Every
+  // cycle saw all 150 faces, so a plan with any rect had all 150 before
+  // fitting. A plan with no rect was released before any cycle reached it.
+  // The rects are checked directly, fallback or not: a fallback plan's
+  // whole-source blur must not stand in for what fitting kept.
   std::size_t fitted = 0;
   for (const spg::MaskPlan& p : r.plans) {
     REQUIRE(p.rects.size() <= spg::kMaskRectCapacity);
-    if (p.fallback) {
-      continue;  // a slow runner may fail frames closed; those blur whole
+    if (p.rects.empty()) {
+      continue;
     }
     ++fitted;
     for (const spg::Detection& d : many) {
-      REQUIRE(covers(p, d.box.rect));
+      REQUIRE(rects_cover(p, d.box.rect));
     }
   }
-  // At least one plan came from a scan of all 150 faces, so it had more raw
-  // rects than the capacity and went through fitting; fallback plans alone
-  // would pass the checks above without any.
+  // At least one plan had more raw rects than the capacity and went through
+  // fitting. This needs one cycle to finish before the last real frame is
+  // released, not any frame to make its deadline.
   REQUIRE(fitted > 0);
 }
 
@@ -645,6 +656,7 @@ TEST_CASE("bench reports stage timing and the fail-closed rate", "[cli]") {
     CHECK(report["frames"] == 10);
     CHECK(report["workers"] == spg::SchedulerConfig{}.workers);
     CHECK(report["scan_interval_ms"] == 0.0);
+    CHECK(report["recognizer_runs"] == spg::cli::StageOptions{}.recognizer_runs);
     REQUIRE(report["sequences"].size() == 1);
     CHECK(report["sequences"][0]["name"] == "seq-001");
     CHECK(report["latencies_ms"].size() > 0);
@@ -653,13 +665,15 @@ TEST_CASE("bench reports stage timing and the fail-closed rate", "[cli]") {
   }
   SECTION("scheduling knobs reach the report") {
     const Ran r = cli({"bench", "--realtime", "--suite", suite.string(), "--resolution", "96x54", "--workers", "1",
-                       "--scan-interval-ms", "50", "--threads", "2", "--report", (suite / "knobs.json").string()});
+                       "--scan-interval-ms", "50", "--threads", "2", "--recognizer-runs", "2", "--report",
+                       (suite / "knobs.json").string()});
     INFO(r.err);
     REQUIRE(r.code == 0);
     const nlohmann::json report = nlohmann::json::parse(slurp(suite / "knobs.json"));
     CHECK(report["workers"] == 1);
     CHECK(report["scan_interval_ms"] == 50.0);
     CHECK(report["threads"] == 2);
+    CHECK(report["recognizer_runs"] == 2);
   }
   SECTION("a resolution no sequence has") {
     const Ran r = cli({"bench", "--suite", suite.string(), "--resolution", "1920x1080"});
@@ -683,6 +697,8 @@ TEST_CASE("usage errors exit 2 and failures exit 1", "[cli]") {
   CHECK(cli({"bench", "--suite", suite.string(), "--scan-interval-ms", "-1"}).code == 2);
   CHECK(cli({"bench", "--suite", suite.string(), "--scan-interval-ms", "soon"}).code == 2);
   CHECK(cli({"bench", "--suite", suite.string(), "--threads", "0"}).code == 2);
+  CHECK(cli({"bench", "--suite", suite.string(), "--recognizer-runs", "0"}).code == 2);
+  CHECK(cli({"bench", "--suite", suite.string(), "--recognizer-runs", "17"}).code == 2);
   CHECK(cli({"eval", "--suite", (suite / "nope").string(), "--plans", "x"}).code == 1);
   CHECK(cli({"--version"}).out.rfind("spg-cli ", 0) == 0);
   CHECK(cli({"--help"}).out.find("usage: spg-cli") != std::string::npos);

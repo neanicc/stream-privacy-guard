@@ -30,6 +30,7 @@
 #include "models/model_hub.hpp"
 #include "models/model_set.hpp"
 #include "models/sha256.hpp"
+#include "spg/lookahead.hpp"
 #include "spg/scan.hpp"
 #include "synthetic_frames.hpp"
 #include "synthetic_text.hpp"
@@ -175,6 +176,26 @@ TEST_CASE("The pinned models are the manifest's three", "[models]") {
     CHECK(std::string_view{pin.sha256}.size() == 64);
     CHECK(pin.size > 0);
   }
+}
+
+TEST_CASE("Recognizer runs in flight per filter stay within the budget", "[models]") {
+  using spg::plugin::kRecognizerRunBudget;
+  using spg::plugin::recognizer_parallel_runs;
+  // A filter's scheduler workers get the whole budget between them (#85:
+  // two workers with 4 runs each put 8 on one session).
+  const std::size_t workers = spg::plugin::filter_scan_workers();
+  CHECK(workers == spg::SchedulerConfig{}.workers);
+  CHECK(workers * recognizer_parallel_runs(workers) <= kRecognizerRunBudget);
+  CHECK(recognizer_parallel_runs(1) == kRecognizerRunBudget);
+  for (std::size_t w = 1; w <= kRecognizerRunBudget; ++w) {
+    CAPTURE(w);
+    CHECK(recognizer_parallel_runs(w) >= 1);
+    CHECK(w * recognizer_parallel_runs(w) <= kRecognizerRunBudget);
+  }
+  // Past the budget each worker still reads (one crop at a time), and a
+  // zero worker count is treated as one.
+  CHECK(recognizer_parallel_runs(kRecognizerRunBudget + 3) == 1);
+  CHECK(recognizer_parallel_runs(0) == kRecognizerRunBudget);
 }
 
 TEST_CASE("Missing models are reported and the stages fail closed", "[models]") {

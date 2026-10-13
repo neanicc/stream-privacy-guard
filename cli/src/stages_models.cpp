@@ -74,6 +74,9 @@ std::string provider_name(const runtime::Session& session) {
 
 }  // namespace
 
+static_assert(StageOptions{}.recognizer_runs == ocr::TextRecognizerConfig{}.parallel_runs,
+              "spg-cli must run the recognizer's default parallel runs");
+
 OpenedStages open_stages(const ModelPaths& models, const PolicyConfig& policy, const StageOptions& options) {
   runtime::SessionOptions session;
   if (options.cpu_only) {
@@ -99,8 +102,10 @@ OpenedStages open_stages(const ModelPaths& models, const PolicyConfig& policy, c
           detect::TextDetector::open(*env, models.text_detector, text_config, session));
       out.providers += "text_detect=" + provider_name(text->session()) + " ";
       out.stages.text = std::make_shared<OwningDetector<detect::TextDetector>>(env, text);
+      ocr::TextRecognizerConfig rec_config;
+      rec_config.parallel_runs = options.recognizer_runs;
       auto rec = std::make_shared<const ocr::TextRecognizer>(
-          ocr::TextRecognizer::open(*env, models.text_recognizer, {}, session));
+          ocr::TextRecognizer::open(*env, models.text_recognizer, rec_config, session));
       out.providers += "recognize=" + provider_name(rec->session());
       out.stages.recognizer = std::make_shared<OcrRecognizer>(env, rec);
     }

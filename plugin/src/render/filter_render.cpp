@@ -199,6 +199,8 @@ void FilterRender::request_locked(Kind kind, std::optional<PolicyConfig> policy,
     // scanned.
     if (policy && loaded != nullptr) {
       SchedulerConfig config = SchedulerConfig::from_policy(*policy);
+      // The count load_models() sized the shared recognizer's runs for.
+      config.workers = filter_scan_workers();
       // Clamped again where consumed (settings are clamped when read), then
       // shortened to what the ring can hold within the VRAM budget.
       config.lookahead = lookahead;

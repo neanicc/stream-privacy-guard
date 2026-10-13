@@ -15,6 +15,7 @@
 #include "models/sha256.hpp"
 #include "ocr/text_recognizer.hpp"
 #include "runtime/onnx_session.hpp"
+#include "spg/lookahead.hpp"
 #include "spg/policy.hpp"
 
 namespace spg::plugin {
@@ -216,6 +217,12 @@ ModelReport locate_models(std::span<const std::filesystem::path> dirs, ModelFile
   return report(ModelStatus::Ready, "", "");
 }
 
+std::size_t recognizer_parallel_runs(std::size_t workers) noexcept {
+  return std::max<std::size_t>(1, kRecognizerRunBudget / std::max<std::size_t>(1, workers));
+}
+
+std::size_t filter_scan_workers() { return SchedulerConfig{}.workers; }
+
 LoadResult load_models(std::span<const std::filesystem::path> dirs, const LoadOptions& options) {
   ModelFiles files;
   LoadResult out;
@@ -234,7 +241,9 @@ LoadResult load_models(std::span<const std::filesystem::path> dirs, const LoadOp
     opening = kPinned[1].name;
     detect::TextDetector text = detect::TextDetector::open(*env, bytes_of(files.text), {}, session);
     opening = kPinned[2].name;
-    ocr::TextRecognizer recognizer = ocr::TextRecognizer::open(*env, bytes_of(files.recognizer), {}, session);
+    ocr::TextRecognizerConfig reading;
+    reading.parallel_runs = recognizer_parallel_runs(filter_scan_workers());
+    ocr::TextRecognizer recognizer = ocr::TextRecognizer::open(*env, bytes_of(files.recognizer), reading, session);
     std::string providers = std::string("faces=") + std::string(runtime::to_string(faces.session().provider())) +
                             ", text=" + std::string(runtime::to_string(text.session().provider())) +
                             ", recognizer=" + std::string(runtime::to_string(recognizer.session().provider()));

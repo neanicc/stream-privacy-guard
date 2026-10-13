@@ -2151,6 +2151,10 @@ TEST_CASE("from_policy carries the policy's timing, fallback and margins", "[sch
   CHECK(config.mask_style == spg::MaskStyle::SolidFill);
   CHECK(config.tracker.margin_px == 7.0F);
   CHECK(config.scan.categories == policy.categories);
+  // The worker count is not a policy field: the plugin sizes the recognizer
+  // for the default (plugin filter_scan_workers()).
+  CHECK(config.workers == SchedulerConfig{}.workers);
+  CHECK(SchedulerConfig::from_policy(spg::PolicyConfig{}).workers == SchedulerConfig{}.workers);
 }
 
 TEST_CASE("recognized text and stage errors never reach output streams", "[schedule]") {
