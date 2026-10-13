@@ -93,7 +93,14 @@ class Tracker {
   // detection still holds but does not move its track. Validates every
   // detection first and throws ContractError (changing nothing) when one is
   // invalid or not in Source space. Then drops expired detections.
-  void update(Timestamp frame_time, std::span<const Detection> detections);
+  //
+  // When `velocities` is not null it is resized to detections.size() and
+  // entry i receives the velocity of the track detection i joined, after the
+  // update: the track's estimate when it has one, zero for a detection that
+  // started a track or joined one with no motion measurement yet. The
+  // scheduler back-projects retroactive masks with it.
+  void update(Timestamp frame_time, std::span<const Detection> detections,
+              std::vector<Velocity>* velocities = nullptr);
 
   // Source-space rects to mask on the frame with timestamp `t`: per track, the
   // hull of each time bucket's held masks (see max_rects_per_track). A rect

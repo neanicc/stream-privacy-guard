@@ -93,6 +93,11 @@ TEST_CASE("pii: IPv4 and IPv6 addresses", "[policy][pii]") {
   CHECK_FALSE(found(Category::PiiIp, "aa:bb:cc:dd:ee:ff"));
   CHECK_FALSE(found(Category::PiiIp, "std::move"));
   CHECK_FALSE(found(Category::PiiIp, "1::2::3"));
+  // OCR read "::" as one ':' (SPG-12, a HUD line on the text suite).
+  CHECK(found(Category::PiiIp, "Server 2001:db8:3a09:2728"));
+  CHECK(found(Category::PiiIp, "ip:2001:db8:cc6:bc63"));
+  CHECK_FALSE(found(Category::PiiIp, "12:30:45:07"));          // no group of three or more
+  CHECK_FALSE(found(Category::PiiIp, "2001:db8:3a09"));        // three groups
 }
 
 TEST_CASE("pii: street addresses and PO boxes", "[policy][pii]") {
@@ -128,6 +133,22 @@ TEST_CASE("pii: credential and stream key formats", "[policy][pii]") {
   CHECK_FALSE(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9 then a space"));  // header alone
   CHECK_FALSE(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9.ab"));            // payload too short
   CHECK_FALSE(found(Category::PiiToken, "Eyjafjallajokull.is"));                 // too short for a header
+}
+
+TEST_CASE("pii: tokens survive OCR misreads", "[policy][pii]") {
+  using spg::Category;
+  // A small-font token on the text suite was read with I as '|' and with a
+  // stray space (SPG-12); the '|' ended the body after 16 characters.
+  CHECK(found(Category::PiiToken, "ghp_SYNTHETIC0123456|SYNTHETIC0123456789"));
+  CHECK(found(Category::PiiToken, "|ive_123456789_SYNTHETICabcdefghij"));  // l of live_ read as '|'
+  CHECK(found(Category::PiiToken, "ghp_SYNTHETIC0 123456SYNTHETIC0123456789"));
+  CHECK(found(Category::PiiToken, "ghp_SYNTH3TIC xyzw0123 SYNTHETIC"));  // needs both splits
+  // A split needs runs of at least six characters on both sides and a digit
+  // somewhere in the body, at most two splits join, and a JWT never splits.
+  CHECK_FALSE(found(Category::PiiToken, "ghp_SYNTH3TIC xyzw SYNTHETICabcdef"));
+  CHECK_FALSE(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9 tomorrow"));
+  CHECK_FALSE(found(Category::PiiToken, "live_streaming starting tomorrow evening"));
+  CHECK_FALSE(found(Category::PiiToken, "ghp_SYNTH3 abcdef ghijkl mnopqrstuv"));
 }
 
 TEST_CASE("pii: only enabled categories are reported", "[policy][pii]") {

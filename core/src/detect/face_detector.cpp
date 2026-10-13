@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "detect/source_clip.hpp"
+#include "detect/text_detector.hpp"
 #include "spg/error.hpp"
 
 namespace spg::detect {
@@ -37,6 +38,53 @@ void check_config(const FaceDetectorConfig& config) {
   if (config.top_k == 0) {
     throw FaceDetectorError("face detector: top_k must be at least 1");
   }
+}
+
+// The float length from `origin` that reaches at least `far`.
+float outward_length(float origin, double far) {
+  auto length = static_cast<float>(far - static_cast<double>(origin));
+  while (static_cast<double>(origin) + static_cast<double>(length) < far) {
+    length = std::nextafter(length, std::numeric_limits<float>::infinity());
+  }
+  return length;
+}
+
+void check_overlap(const FaceDetectorConfig& config, Size input) {
+  if (config.tiles && config.tile_overlap >= std::min(input.width, input.height)) {
+    throw FaceDetectorError("face detector: tile_overlap must be below the input's shorter side");
+  }
+}
+
+// Joins the passes' boxes, best score first (ties by position, so the result
+// does not depend on the order the passes ran in): a box overlapping a kept one
+// by more than `iou_threshold` is merged into it as their hull. A tile can see
+// only part of a face that a tile edge cuts; dropping the whole-frame box for
+// that part would uncover the rest, so overlapping boxes only grow.
+std::vector<Detection> merge_passes(std::vector<Detection> detections, float iou_threshold) {
+  std::sort(detections.begin(), detections.end(), [](const Detection& a, const Detection& b) {
+    if (a.score != b.score) {
+      return a.score > b.score;
+    }
+    return std::pair{a.box.rect.y, a.box.rect.x} < std::pair{b.box.rect.y, b.box.rect.x};
+  });
+  std::vector<Detection> kept;
+  for (const Detection& d : detections) {
+    const auto overlapping = std::find_if(kept.begin(), kept.end(), [&](const Detection& k) {
+      return iou(k.box.rect, d.box.rect) > iou_threshold;
+    });
+    if (overlapping == kept.end()) {
+      kept.push_back(d);
+      continue;
+    }
+    Rect& r = overlapping->box.rect;
+    const Rect& b = d.box.rect;
+    const float x0 = std::min(r.x, b.x);
+    const float y0 = std::min(r.y, b.y);
+    const double x1 = std::max(static_cast<double>(r.x) + r.width, static_cast<double>(b.x) + b.width);
+    const double y1 = std::max(static_cast<double>(r.y) + r.height, static_cast<double>(b.y) + b.height);
+    r = Rect{x0, y0, outward_length(x0, x1), outward_length(y0, y1)};
+  }
+  return kept;
 }
 
 // The model's static input size, or FaceDetectorError.
@@ -139,6 +187,7 @@ FaceDetector::FaceDetector(runtime::Session session, const FaceDetectorConfig& c
     : session_(std::move(session)), config_(config) {
   check_config(config_);
   input_ = check_input(session_);
+  check_overlap(config_, input_);
   const auto& outputs = session_.outputs();
   for (std::size_t s = 0; s < yunet::kStrides.size(); ++s) {
     const auto stride = static_cast<std::int64_t>(yunet::kStrides[s]);
@@ -168,17 +217,32 @@ FaceDetector::FaceDetector(runtime::Session session, const FaceDetectorConfig& c
 
 std::vector<Detection> FaceDetector::detect(const FrameView& frame, Size source) const {
   validate(frame);
-  const SpaceMap map{ReadbackMapping(source, frame.size()), face_input_mapping(frame.size(), input_)};
-  const std::vector<float> tensor = to_input_tensor(render_model_input(frame, *map.model_input));
+  const ReadbackMapping readback(source, frame.size());
   const std::array<std::int64_t, 4> shape{1, 3, static_cast<std::int64_t>(input_.height),
                                           static_cast<std::int64_t>(input_.width)};
-  const std::array<runtime::TensorView, 1> inputs{{{tensor, shape}}};
-  const std::vector<runtime::Tensor> outputs = session_.run(inputs);
+  // One model run on the part of the readback `input_map` letterboxes into the input.
+  const auto run = [&](const ModelInputMapping& input_map) {
+    const SpaceMap map{readback, input_map};
+    const std::vector<float> tensor = to_input_tensor(render_model_input(frame, *map.model_input));
+    const std::array<runtime::TensorView, 1> inputs{{{tensor, shape}}};
+    const std::vector<runtime::Tensor> outputs = session_.run(inputs);
+    const auto strides = stride_outputs(outputs, output_index_, input_);
+    std::vector<yunet::Candidate> candidates = yunet::decode(strides, input_, config_.score_threshold);
+    candidates = yunet::suppress(std::move(candidates), config_.nms_iou_threshold, config_.top_k);
+    return to_source_detections(candidates, map);
+  };
 
-  const auto strides = stride_outputs(outputs, output_index_, input_);
-  std::vector<yunet::Candidate> candidates = yunet::decode(strides, input_, config_.score_threshold);
-  candidates = yunet::suppress(std::move(candidates), config_.nms_iou_threshold, config_.top_k);
-  return to_source_detections(candidates, map);
+  std::vector<Detection> found = run(face_input_mapping(frame.size(), input_));
+  const Size readback_size = frame.size();
+  if (!config_.tiles || (readback_size.width <= input_.width && readback_size.height <= input_.height)) {
+    return found;
+  }
+  const std::uint32_t tile = std::min(input_.width, input_.height);
+  for (const Rect& crop : tile_crops(readback_size, tile, config_.tile_overlap)) {
+    std::vector<Detection> more = run(ModelInputMapping(crop, input_, Fit::LetterboxTopLeft));
+    found.insert(found.end(), more.begin(), more.end());
+  }
+  return merge_passes(std::move(found), config_.nms_iou_threshold);
 }
 
 }  // namespace spg::detect

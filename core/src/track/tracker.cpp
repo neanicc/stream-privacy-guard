@@ -186,9 +186,13 @@ Rect Tracker::predicted(const Track& track, Timestamp t) const noexcept {
   return moved(track.box.rect, track.velocity, seconds(ahead));
 }
 
-void Tracker::update(Timestamp frame_time, std::span<const Detection> detections) {
+void Tracker::update(Timestamp frame_time, std::span<const Detection> detections,
+                     std::vector<Velocity>* velocities) {
   for (const Detection& detection : detections) {
     validate(detection);
+  }
+  if (velocities != nullptr) {
+    velocities->assign(detections.size(), Velocity{});
   }
 
   // Candidate (track, detection) pairs of the same kind whose IoU clears the
@@ -229,7 +233,11 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     }
     track_taken[c.track] = true;
     detection_taken[c.detection] = true;
-    confirm(tracks_[c.track], frame_time, detections[c.detection].box.rect);
+    TrackState& state = tracks_[c.track];
+    confirm(state, frame_time, detections[c.detection].box.rect);
+    if (velocities != nullptr && state.has_velocity) {
+      (*velocities)[c.detection] = state.track.velocity;
+    }
   }
 
   for (std::size_t di = 0; di < detections.size(); ++di) {

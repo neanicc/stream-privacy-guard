@@ -1797,3 +1797,57 @@ Template:
   suite, which SPG-16 (#17) must bring to its limits. `fit_mask_rects()` is
   O(n^3) worst case; fine offline in `spg-cli`, to revisit before any per-frame
   use in the plugin.
+
+## 2026-10-12 — SPG-12 Accuracy pass, first slice (#13)
+
+- Measured first (eval at `c338c0c`, `scripts/ci/run.sh eval` and
+  `--local`, with `spg-cli` on the generated suites; diagnosis printed boxes,
+  policy flags and the punctuation shape of recognized text only, never text):
+  every CI text leak frame (36 of 285) was one `ghp_` token in a 720p toast,
+  read with `I` as `|` and a stray space, so the token rule cut the body at 16
+  characters. In the full text suite the largest leak was an IPv6 address
+  whose `::` OCR read as `:`, then slide-in toasts whose retroactive rect sat
+  where the cycle saw them. Both faces-suite leaks (119 of 1080 frames) were
+  faces of 43 and 62 Source px that the whole-frame YuNet pass (1/3 scale at
+  1080p) never found. Decoy blur comes from the two scrolling chat
+  sequences (all 356 CI decoy pairs): a secret's held boxes stay put for the
+  750 ms hold while lines scroll through them, and the margin
+  (`4 + 0.25 * min(w, h)` on a DB box about 1.8 times the glyph height) reaches
+  into neighbouring lines. The policy flagged no decoy.
+- Decision / change: (1) PII tokens: `|` reads as `l`, and a body may join
+  across up to two single spaces between runs of at least 6 characters when
+  it holds a digit (JWTs never join), [policy.md](policy.md). (2) IPv6: a run
+  of 4 to 7 hex groups with no `::`, two of them 3 or more long, counts (OCR
+  lost the `::`); times and MAC addresses do not. (3) Retroactive rects are
+  also back-projected along the velocity of the track the detection joined
+  (`Tracker::update` reports it), capped at `max_prediction`; the static rect
+  stays, so this only adds blur ([scheduler.md](scheduler.md#masks)).
+  (4) `FaceDetector` adds scale-1 tiles (input-sized, 128 px overlap) when the
+  frame is larger than the input, with one Source-space NMS over all passes.
+- Rejected with evidence: a tighter DB `unclip_ratio` (1.6 or 1.8) lowered
+  decoy blur (0.405 to 0.372 / 0.390) but brought the token leak back (PII
+  recall 0.944, leak 0.116). Margin and hold are policy defaults (SPG-08b,
+  #66, is changing their floors), so they were only measured on the two chat
+  sequences: decoy 0.583 at the defaults, 0.424 with `margin_ratio` 0,
+  0.528 with a 400 ms hold, 0.443 with both 400 ms and 0.1. Even
+  `margin_ratio` 0 leaves the CI decoy rate near 0.29, over the 0.25 limit:
+  the held boxes of scrolling text are the floor.
+- Eval (CI mode, head vs main `c338c0c`): watch-list pair 1.000 (=),
+  first-frame 1.000 (=), PII pair 1.000 (+0.061), leak 0.000 (-0.126, PASS),
+  clean blur 0.000 (=), decoy 0.405 (+0.007, FAIL). Local text suite (full
+  profile, main's `spg-cli` scored on the same generated suite): watch-list
+  pair 0.998 (+0.002), first-frame 0.943 (+0.038, FAIL by one instance of
+  53), PII pair 0.997 (+0.063), leak 0.0099 (-0.134, PASS), clean blur 0.0027
+  (=), decoy 0.509 (+0.006, FAIL). Faces: pair 0.992 (+0.046), leak 0.0157
+  (-0.095, PASS), clean blur 0 (=). Face detection now costs about 37 ms p50
+  per cycle on the dev Mac instead of 6.5 ms (9 model runs at 1080p); the
+  realtime suite stays SPG-16's (fail-closed 0.98, p95 812 ms in this run).
+- Open issues or follow-ups: first-frame recall misses (a) toasts whose
+  ease-out slide is nearly over when a cycle first sees them, so a constant
+  velocity measured 16 ms apart under-projects; (b) a partially typed entry
+  scored against its full box; (c) a chat line entering two frames before the
+  sequence ends. The simulated workers run in lockstep (cycles 16 ms apart
+  every 200 ms), which halves the useful scan rate; staggering them is a
+  cadence question for SPG-16. Decoy blur needs a policy decision on hold
+  semantics for confirmed moving tracks or on the margin. Synthetic eval only;
+  live OBS not tested.

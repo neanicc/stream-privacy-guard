@@ -498,6 +498,52 @@ TEST_CASE("a detection masks earlier buffered frames within the retro window", "
   }
 }
 
+TEST_CASE("retroactive masks follow a moving track back to the frames before it was found", "[schedule]") {
+  // A box slides in from the right at 1 px/ms (a toast or a scrolling line):
+  // x = 700 - (t - 1150) from 1150 on. Cycles at 1200 and 1210 find it; the
+  // second confirms its track with a velocity. On 1150 the box is 60 px right
+  // of where the 1210 cycle saw it, beyond the margin, so a static
+  // retroactive rect would leave it uncovered (SPG-12, text suite seq-001).
+  const auto box_at = [](std::int64_t t) {
+    return Rect{static_cast<float>(700 - (t - 1150)), 200.0F, 80.0F, 16.0F};
+  };
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 100ms;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const std::int64_t ms = spg::to_ns(t) / 1'000'000;
+                                    std::vector<Detection> out;
+                                    if (ms >= 1150) {
+                                      const Rect b = box_at(ms);
+                                      out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                    }
+                                    return out;
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  for (std::int64_t t = 1110; t <= 1300; t += 10) {
+    const bool scan = t == 1200 || t == 1210 || t == 1250 || t == 1300;
+    sim.push(t, scan);
+    if (scan) {
+      sim.scan_now();
+    }
+  }
+  const auto out = sim.release_at(1800);
+  REQUIRE(out.size() == 20);
+  for (const ReleasedFrame& r : out) {
+    const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+    CHECK(r.action == FallbackAction::None);
+    if (t >= 1150) {
+      INFO("frame " << t);
+      CHECK(covered_by(r.plan, box_at(t)));
+    }
+    if (t >= 1200) {
+      continue;
+    }
+    // The static rect where the 1210 cycle found it is still there too.
+    CHECK(covered_by(r.plan, box_at(1210)));
+  }
+}
+
 TEST_CASE("a frame counts as scanned only by a cycle within retro after it", "[schedule]") {
   SchedulerConfig config = small_config();
   config.lookahead = 500ms;

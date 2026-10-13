@@ -161,9 +161,15 @@ instead of holding the partial list.
   a detection, so this is what blurs a secret from its first frame.
 
 A fallback frame's plan still lists these rects (`plan.fallback` is set).
-Retroactive rects are static boxes: a secret that moved between `t` and `ts`
-is covered where it was found, plus the margin. Back-projecting with the track
-velocity is left for SPG-12 to measure on the scroll and slide-in sequences.
+Each retroactive box is masked where it was found, plus the margin. When the
+box joined a track that has a velocity (`Tracker::update` reports it) and no
+resize came between the cycle's frame and `t`, it is also masked moved back
+along that velocity by `ts - t` (capped at the tracker's `max_prediction`),
+with the same margin: where a sliding or scrolling secret was on the earlier
+frame. The static rect stays, so back-projection only adds blur. SPG-12
+measured why: a toast token sliding in at about 480 px/s on the text suite
+was first scanned 100 ms after it appeared, and the static rect covered only
+57-89% of it on its first five frames.
 Per frame, a rect contained in another is dropped, and past `max_retro_rects`
 they merge into one hull (more blur, never less).
 

@@ -5,6 +5,7 @@
 // Source-to-Source operations (margins, a source resize); conversions between
 // coordinate spaces stay in core/src/frame/geometry.cpp.
 
+#include "spg/detection.hpp"
 #include "spg/geometry.hpp"
 
 namespace spg::mask {
@@ -21,6 +22,10 @@ namespace spg::mask {
 // rounded outward to whole pixels. Returns `box` rounded outward when the
 // sizes are equal or either has a zero dimension.
 [[nodiscard]] Rect scale_between(const Rect& box, Size from, Size to) noexcept;
+
+// `box` moved by `velocity` (Source pixels per second) for `seconds`, which
+// may be negative, rounded outward to whole pixels.
+[[nodiscard]] Rect moved(const Rect& box, Velocity velocity, double seconds) noexcept;
 
 // Smallest whole-pixel rect containing both.
 [[nodiscard]] Rect hull(const Rect& a, const Rect& b) noexcept;

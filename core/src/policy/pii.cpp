@@ -244,8 +244,31 @@ std::vector<Text> runs(Text t, Pred in_run) {
   return out;
 }
 
+// OCR often reads the "::" of a compressed address as one ':'
+// ("2001:db8:3a09::2728" as "2001:db8:3a09:2728"). Without "::", four to
+// seven hex groups of one to four characters, at least two of them three or
+// more long, count too; a time ("12:30:45") has three groups and a MAC
+// address ("aa:bb:cc:dd:ee:ff") only two-character groups.
+bool ipv6_lost_gap(Text run) {
+  if (run.find(U"::") != Text::npos) {
+    return false;
+  }
+  const std::vector<Text> groups = split(run, U':');
+  if (groups.size() < 4 || groups.size() > 7) {
+    return false;
+  }
+  std::size_t long_groups = 0;
+  for (const Text g : groups) {
+    if (g.empty() || g.size() > 4 || !std::all_of(g.begin(), g.end(), is_hex)) {
+      return false;
+    }
+    long_groups += g.size() >= 3 ? 1 : 0;
+  }
+  return long_groups >= 2;
+}
+
 bool ipv6_candidate(Text run) {
-  return std::count(run.begin(), run.end(), U':') >= 2 && ipv6(run);
+  return std::count(run.begin(), run.end(), U':') >= 2 && (ipv6(run) || ipv6_lost_gap(run));
 }
 
 bool has_ip(Text t, Text d) {
@@ -370,17 +393,59 @@ bool has_jwt(Text t) {
   return false;
 }
 
-bool has_token(Text t) {
+// OCR splits a long unbroken string with a stray space now and then. A body
+// may continue past up to kMaxTokenSplits single spaces when the runs on both
+// sides have at least kMinTokenPiece characters; a body that needs a split
+// must hold a digit, so words after a short prefix-like word ("live_stream
+// starting tonight") do not count. Random keys almost always hold a digit.
+// JWTs ("eyj") never split: a header alone is not a token (has_jwt()).
+constexpr std::size_t kMaxTokenSplits = 2;
+constexpr std::size_t kMinTokenPiece = 6;
+
+std::size_t base64url_run(Text t, std::size_t begin) noexcept {
+  std::size_t end = begin;
+  while (end < t.size() && base64url(t[end])) {
+    ++end;
+  }
+  return end - begin;
+}
+
+// Characters of the token body starting at `begin`, spaces not counted.
+std::size_t token_body(Text t, std::size_t begin, bool may_split) {
+  std::size_t run = base64url_run(t, begin);
+  std::size_t total = run;
+  bool digit = std::any_of(t.begin() + static_cast<std::ptrdiff_t>(begin),
+                           t.begin() + static_cast<std::ptrdiff_t>(begin + run), is_digit);
+  std::size_t joined = total;  // body length that already stands without a split
+  for (std::size_t splits = 0; may_split && splits < kMaxTokenSplits && run >= kMinTokenPiece; ++splits) {
+    const std::size_t space = begin + run;
+    if (space >= t.size() || t[space] != U' ') {
+      break;
+    }
+    const std::size_t next = base64url_run(t, space + 1);
+    if (next < kMinTokenPiece) {
+      break;
+    }
+    digit = digit || std::any_of(t.begin() + static_cast<std::ptrdiff_t>(space + 1),
+                                 t.begin() + static_cast<std::ptrdiff_t>(space + 1 + next), is_digit);
+    begin = space + 1;
+    run = next;
+    total += next;
+  }
+  return digit ? total : joined;
+}
+
+bool has_token(Text raw) {
+  // In a token, '|' can only be an OCR reading of l or I.
+  SecureU32String view(raw);
+  std::replace(view.begin(), view.end(), U'|', U'l');
+  const Text t(view);
   for (const TokenFormat& format : kTokenFormats) {
     for (std::size_t at = t.find(format.prefix); at != Text::npos; at = t.find(format.prefix, at + 1)) {
       if (at > 0 && (is_alnum(t[at - 1]) || t[at - 1] == U'_')) {
         continue;
       }
-      std::size_t end = at + format.prefix.size();
-      while (end < t.size() && base64url(t[end])) {
-        ++end;
-      }
-      if (end - at - format.prefix.size() >= format.min_body) {
+      if (token_body(t, at + format.prefix.size(), format.prefix != U"eyj") >= format.min_body) {
         return true;
       }
     }
