@@ -23,6 +23,7 @@
 
 #include "commands.hpp"
 #include "driver.hpp"
+#include "fail_alloc.hpp"
 #include "image_io.hpp"
 #include "inputs.hpp"
 #include "schedule_fakes.hpp"
@@ -415,6 +416,66 @@ TEST_CASE("a policy call that throws still ends its cycle and counts its time", 
   CHECK(times->summary().at("policy").max_ms >= 50.0);
 }
 
+TEST_CASE("a failed allocation while timing a stage reaches the caller as an exception", "[cli]") {
+  // Recording a stage's time allocates (a new stage name, a new cycle). A
+  // failure there, on a call that returns or on one that throws, must reach
+  // the caller, where run_scan() fails the cycle closed; recording from a
+  // destructor would end the process instead.
+  const spg::BgraImage frame = gray_frame(64, 48, 100);
+  for (const bool policy_throws : {false, true}) {
+    const auto stages_for_one_cycle = [policy_throws] {
+      spg::ScanStages raw;
+      raw.text = std::make_shared<ScriptedDetector>([](Timestamp, spg::Size) {
+        return std::vector<spg::Detection>{spg_test::text_at(4, 4, 20, 8)};
+      });
+      raw.recognizer = std::make_shared<ScriptedRecognizer>([](const spg::Detection&) { return std::string("x"); });
+      raw.policy = std::make_shared<ScriptedPolicy>([policy_throws] {
+        if (policy_throws) {
+          throw std::runtime_error("policy failed");
+        }
+      });
+      // Fresh logs each time, so recording into them allocates.
+      return spg::cli::timed(raw, std::make_shared<spg::cli::StageTimes>(), std::make_shared<spg::cli::CycleLog>());
+    };
+    const auto run_cycle = [&](const spg::ScanStages& stages) {
+      const spg::FrameView view = frame.view(spg::SteadyClock{}.now());
+      const std::vector<spg::Detection> regions = stages.text->detect(view, frame.size());
+      for (const spg::Secret& text : stages.recognizer->recognize(view, frame.size(), regions)) {
+        (void)stages.policy->evaluate(text);
+      }
+    };
+    // One unfailed cycle first, so one-time setup (the secure heap behind
+    // Secret) is done and the sweep sees only a cycle's allocations.
+    if (policy_throws) {
+      CHECK_THROWS_AS(run_cycle(stages_for_one_cycle()), std::runtime_error);
+    } else {
+      CHECK_NOTHROW(run_cycle(stages_for_one_cycle()));
+    }
+    for (std::uint64_t n = 0;; ++n) {
+      REQUIRE(n < 10000);
+      const spg::ScanStages stages = stages_for_one_cycle();
+      bool threw = false;
+      bool fired = false;
+      {
+        const spg_test::FailAllocations fail(n);
+        try {
+          run_cycle(stages);
+        } catch (...) {
+          threw = true;
+        }
+        fired = fail.fired();
+      }
+      INFO("policy throws " << policy_throws << ", allocation " << n);
+      if (!fired) {
+        CHECK(threw == policy_throws);
+        CHECK(n > 0);
+        break;
+      }
+      CHECK(threw);
+    }
+  }
+}
+
 TEST_CASE("realtime plans are fitted to the compositor's rect capacity after the feed", "[cli]") {
   spg::cli::StageTimes times;
   auto cycles = std::make_shared<spg::cli::CycleLog>();
@@ -427,16 +488,23 @@ TEST_CASE("realtime plans are fitted to the compositor's rect capacity after the
   const spg::ScanStages stages = spg::cli::timed(raw, std::make_shared<spg::cli::StageTimes>(), cycles);
   const auto r = spg::cli::run_realtime(memory_source(30, 60, 640, 400), faces_only(), stages,
                                         spg::cli::DriverOptions{}, times, *cycles);
+  static_assert(150 > spg::kMaskRectCapacity, "a scanned plan must need fitting");
   REQUIRE(r.plans.size() == 30);
+  std::size_t fitted = 0;
   for (const spg::MaskPlan& p : r.plans) {
     REQUIRE(p.rects.size() <= spg::kMaskRectCapacity);
     if (p.fallback) {
       continue;  // a slow runner may fail frames closed; those blur whole
     }
+    ++fitted;
     for (const spg::Detection& d : many) {
       REQUIRE(covers(p, d.box.rect));
     }
   }
+  // At least one plan came from a scan of all 150 faces, so it had more raw
+  // rects than the capacity and went through fitting; fallback plans alone
+  // would pass the checks above without any.
+  REQUIRE(fitted > 0);
 }
 
 TEST_CASE("timing summaries use nearest-rank percentiles", "[cli]") {

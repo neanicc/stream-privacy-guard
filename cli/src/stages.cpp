@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -24,30 +26,33 @@ using steady = std::chrono::steady_clock;
 thread_local Timestamp t_cycle_readback{};
 thread_local bool t_in_cycle = false;
 
-// Records one call's duration and, for the cycle log, when it ended.
-class CallTimer {
- public:
-  CallTimer(std::string_view stage, StageTimes& times, CycleLog* cycles, Timestamp readback)
-      : stage_(stage), times_(times), cycles_(cycles), readback_(readback), start_(steady::now()) {
-    t_cycle_readback = readback;
-    t_in_cycle = true;
-  }
-  CallTimer(const CallTimer&) = delete;
-  CallTimer& operator=(const CallTimer&) = delete;
-  ~CallTimer() {
-    times_.add(stage_, elapsed_ms(start_, steady::now()));
-    if (cycles_ != nullptr) {
-      cycles_->note(readback_, SteadyClock{}.now());
+// Runs call() and records its duration and, for the cycle log, when it
+// ended: on the way out, so a call that throws (which fails the cycle) still
+// counts its time and ends its cycle. `readback` names the cycle; unset means
+// the cycle this thread is in, if any. Recording can throw (it allocates); it
+// does so from a plain function, never a destructor, so a failed record is
+// one more exception for run_scan() to fail the cycle on, never a terminate.
+template <class Call>
+auto timed_call(std::string_view stage, StageTimes& times, CycleLog* cycles, std::optional<Timestamp> readback,
+                const Call& call) {
+  const auto start = steady::now();
+  const auto record = [&] {
+    times.add(stage, elapsed_ms(start, steady::now()));
+    if (cycles != nullptr && (readback || t_in_cycle)) {
+      cycles->note(readback.value_or(t_cycle_readback), SteadyClock{}.now());
     }
-  }
-
- private:
-  std::string_view stage_;
-  StageTimes& times_;
-  CycleLog* cycles_;
-  Timestamp readback_;
-  steady::time_point start_;
-};
+  };
+  auto result = [&] {
+    try {
+      return call();
+    } catch (...) {
+      record();
+      throw;
+    }
+  }();
+  record();
+  return result;
+}
 
 class TimedDetector final : public Detector {
  public:
@@ -55,8 +60,10 @@ class TimedDetector final : public Detector {
                 std::shared_ptr<CycleLog> cycles)
       : inner_(std::move(inner)), stage_(stage), times_(std::move(times)), cycles_(std::move(cycles)) {}
   [[nodiscard]] std::vector<Detection> detect(const FrameView& readback, Size source) const override {
-    const CallTimer timer(stage_, *times_, cycles_.get(), readback.timestamp);
-    return inner_->detect(readback, source);
+    t_cycle_readback = readback.timestamp;
+    t_in_cycle = true;
+    return timed_call(stage_, *times_, cycles_.get(), readback.timestamp,
+                      [&] { return inner_->detect(readback, source); });
   }
 
  private:
@@ -73,8 +80,10 @@ class TimedRecognizer final : public TextRecognizer {
       : inner_(std::move(inner)), times_(std::move(times)), cycles_(std::move(cycles)) {}
   [[nodiscard]] std::vector<Secret> recognize(const FrameView& readback, Size source,
                                               std::span<const Detection> regions) const override {
-    const CallTimer timer(kStageRecognize, *times_, cycles_.get(), readback.timestamp);
-    return inner_->recognize(readback, source, regions);
+    t_cycle_readback = readback.timestamp;
+    t_in_cycle = true;
+    return timed_call(kStageRecognize, *times_, cycles_.get(), readback.timestamp,
+                      [&] { return inner_->recognize(readback, source, regions); });
   }
 
  private:
@@ -92,31 +101,10 @@ class TimedPolicy final : public TextPolicy {
               std::shared_ptr<CycleLog> cycles)
       : inner_(std::move(inner)), times_(std::move(times)), cycles_(std::move(cycles)) {}
   [[nodiscard]] Verdict evaluate(const Secret& text) const override {
-    // Recorded on the way out, so a call that throws (which fails the cycle)
-    // still counts its time and ends its cycle, as for the other stages.
-    const PolicyTimer timer(*times_, cycles_.get());
-    return inner_->evaluate(text);
+    return timed_call(kStagePolicy, *times_, cycles_.get(), std::nullopt, [&] { return inner_->evaluate(text); });
   }
 
  private:
-  class PolicyTimer {
-   public:
-    PolicyTimer(StageTimes& times, CycleLog* cycles) : times_(times), cycles_(cycles), start_(steady::now()) {}
-    PolicyTimer(const PolicyTimer&) = delete;
-    PolicyTimer& operator=(const PolicyTimer&) = delete;
-    ~PolicyTimer() {
-      times_.add(kStagePolicy, elapsed_ms(start_, steady::now()));
-      if (cycles_ != nullptr && t_in_cycle) {
-        cycles_->note(t_cycle_readback, SteadyClock{}.now());
-      }
-    }
-
-   private:
-    StageTimes& times_;
-    CycleLog* cycles_;
-    steady::time_point start_;
-  };
-
   std::shared_ptr<const TextPolicy> inner_;
   std::shared_ptr<StageTimes> times_;
   std::shared_ptr<CycleLog> cycles_;
