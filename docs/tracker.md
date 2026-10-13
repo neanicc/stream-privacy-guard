@@ -58,14 +58,17 @@ including a zero hold and rect caps from 1 to 12), once with follow off and
 once with it on. Monotone growth is checked during each scene, from a frame
 time inside a still-retained detection's hold, so every comparison is between
 non-empty masks (with follow on, only after every detection fed: 39,123
-comparisons). The follow run checks 57,594 released boxes against the Follow
+comparisons). The follow run checks 57,545 released boxes against the Follow
 row, and every other box against Hold. Unit cases cover association,
 prediction, expiry, pruning, validation, resize (including a 2x upscale and two
 chained resizes), a 60 s hold with 600 held detections (followed and not), and
 for Follow: a scrolling line covered where it is on every frame, released at
 the release time the scheduler uses, a stopped line holding every box where it
-was seen, and a velocity estimate pointing the wrong way or lagging an
-ease-out never uncovering the line.
+was seen, a velocity estimate pointing the wrong way or lagging an
+ease-out never uncovering the line, a static line sharing a track with a
+scrolling one (either joining the other's track) staying covered where it was
+seen, a sighting gap at and past the hold never covering less than held where
+seen, and a resize mid-run holding every box from before it.
 
 ## Follow (SPG-12b)
 
@@ -85,7 +88,15 @@ held boxes of a confirmed moving track where the track went instead.
   pairing or a resize ends the run. The speed check is what keeps another
   line out: after missed cycles the line below can take a scrolling line's
   track by IoU with its last box, and it measures far less move than the run
-  predicts.
+  predicts. When a box was seen resting at the checkpoint (100 ms or more
+  after it, without a translation) before the run's first translation, the
+  run starts at that translation instead of at the checkpoint: the boxes
+  before it show text at rest, such as a static line whose track a moving
+  line took over, and hold where they were seen. A single sighting, or two a
+  frame apart, cannot be told from the moving line's own first box.
+- **Gaps.** A forward detection joins a track only within the hold of its
+  last one, so two sightings `a` and `b` of a run are never more than the
+  hold apart; a longer gap starts a new track.
 - **Moved boxes.** On a frame time `t` up to the track's last detection, let
   `a` and `b` be its latest sighting at or before `t` and its earliest at or
   after it, counting only detections that moved the track forward (their
@@ -107,9 +118,9 @@ A gate pairing at the start of a scroll (a first
 move that IoU misses, as on 720p chat lines 16 to 19 px tall) keeps the boxes
 before it in place for their hold, like a new track, and the SPG-16b trail
 for its frames; that is the cost of not following a pairing that may be wrong.
-`TrackMotion::bridged_from` tells the scheduler from which frame time a
-confirmed moving track's own masks cover its path, so it can leave out
-retroactive rects there ([scheduler.md](scheduler.md#masks)).
+Follow changes only the tracker's held masks: the scheduler still adds every
+retroactive rect on every buffered frame ([scheduler.md](scheduler.md#masks)),
+as the retroactive-masking invariant in AGENTS.md states.
 
 At the 60 s hold bound (600 detections), on an Apple M4 that was also running
 another build, `masks()` took about 11 us per call for a followed moving box
@@ -213,14 +224,12 @@ of the track it joined (`TrackMotion`): its velocity (zero for a new track or
 one with no motion measurement yet), when the track was first seen, and
 whether a measurement has translated the box (both edges moved at least a
 pixel the way the velocity points, so a box that grows while typed or fading
-in does not count; once set, it stays set for the track), the track's id, and
-`bridged_from` (see [Follow](#follow-spg-12b)). Since SPG-12 the scheduler
-back-projects retroactive rects with the velocity, since SPG-12c it trails a
-translating box back to the frame edge on frames before the first sighting,
-since SPG-16d it spreads a first sighting (no velocity yet) by the motion
-gate's reach on earlier frames that air before a second sighting can land,
-and since SPG-12b it leaves them out from `bridged_from` on
-([scheduler.md](scheduler.md#masks)).
+in does not count; once set, it stays set for the track), and the track's
+id. Since SPG-12 the scheduler back-projects retroactive rects with the
+velocity, since SPG-12c it trails a translating box back to the frame edge on
+frames before the first sighting, and since SPG-16d it spreads a first
+sighting (no velocity yet) by the motion gate's reach on earlier frames that
+air before a second sighting can land ([scheduler.md](scheduler.md#masks)).
 
 ## Source resize
 
@@ -250,7 +259,7 @@ be in the new coordinates.
 | `velocity_smoothing` | 0.5 | SPG-09 starting point |
 | `max_prediction` | 500 ms | SPG-09 starting point |
 | `max_rects_per_track` | 8 | SPG-09 starting point; capped at the compositor's rect capacity (`kMaskRectCapacity`, 64 per frame, [cli.md](cli.md)), so eight tracks fit a frame unmerged |
-| `follow_moving_tracks` | true | SPG-12b; false holds every box where it was seen and reports no bridged frames. The run's 100 ms baseline, 3 px steadiness tolerance and 250 ms stop window are constants in `tracker.cpp` |
+| `follow_moving_tracks` | true | SPG-12b; false holds every box where it was seen. The run's 100 ms baseline, 3 px steadiness tolerance and 250 ms stop window are constants in `tracker.cpp` |
 
 `TrackerConfig::from_policy()` takes hold, margin and lookahead from the policy.
 SPG-12d (#81) swept the margin between these defaults and the SPG-08b floors

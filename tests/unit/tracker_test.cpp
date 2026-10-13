@@ -234,7 +234,6 @@ TEST_CASE("tracker: update reports the motion of the track each detection joined
   // A new track has no motion measurement yet: zero, first seen now.
   tracker.update(at_ms(0), std::vector<Detection>{face(100.0F, 100.0F, 50.0F, 50.0F)}, &motions);
   REQUIRE(motions.size() == 1);
-  // Not moving steadily, so no frame is bridged (bridged_from at its default).
   CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(0), false, 1});
   // The second confirmation measures 200 px/s right; a far box starts a track.
   tracker.update(at_ms(100),
@@ -1054,6 +1053,207 @@ TEST_CASE("tracker: a wrong motion estimate never uncovers the text", "[tracker]
       CHECK(covered(run.masks[f], region_of(run.truth[f])));
     }
   }
+}
+
+namespace {
+
+// Text boxes fed in frame-time order the way the scheduler feeds them: each
+// result lands 200 ms after its frame, and a frame (every 10 ms from 0 to
+// end_ms) is masked when it leaves the 500 ms lookahead, with what has landed
+// by then.
+struct Replay {
+  std::vector<std::vector<Box>> released;  // per frame, at its release
+  std::vector<spg::TrackMotion> motions;   // per fed box
+};
+
+Replay replay(const TrackerConfig& config, const std::vector<std::pair<std::int64_t, Rect>>& cycles,
+              std::int64_t end_ms) {
+  ManualClock clock;
+  Tracker tracker(clock, config);
+  Replay out;
+  std::size_t next = 0;
+  for (std::int64_t ms = 0; ms <= end_ms; ms += 10) {
+    const std::int64_t release = ms + 500;
+    while (next < cycles.size() && cycles[next].first + 200 <= release) {
+      const auto& [seen, box] = cycles[next++];
+      clock.set(at_ms(seen + 200));
+      std::vector<spg::TrackMotion> motions;
+      tracker.update(at_ms(seen), std::vector<Detection>{text(box.x, box.y, box.width, box.height)}, &motions);
+      out.motions.push_back(motions.at(0));
+    }
+    clock.set(at_ms(release));
+    out.released.push_back(tracker.masks(at_ms(ms)));
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("tracker: a static line paired into a moving run stays covered where it was seen", "[tracker]") {
+  // SPG-12b staff review: a static watch-listed line shares a track with a
+  // line that scrolls. Its boxes must hold where they were seen, or the run
+  // must break, so the static line is covered on every frame of its hold as
+  // with follow off.
+  const TrackerConfig config;
+  TrackerConfig off;
+  off.follow_moving_tracks = false;
+  SECTION("a moving line joins the static line's track") {
+    // S rests at y = 500, found on 0, 100 and 200 ms, then missed (the hold
+    // exists for misses). M scrolls up at 40 px/s; it was over S on 0 ms
+    // and is first found 12 px above it on 300 ms, where IoU (0.43) pairs it
+    // into S's track. Measured from S's first box, M's moves look like one
+    // steady scroll from 0 ms, and the track is confirmed moving on 400 ms.
+    // S rested on 100 and 200 ms, so its boxes are not part of that run.
+    const Rect s{100.0F, 500.0F, 300.0F, 30.0F};
+    const auto m = [](std::int64_t ms) {
+      return Rect{100.0F, 500.0F - 0.04F * static_cast<float>(ms), 300.0F, 30.0F};
+    };
+    std::vector<std::pair<std::int64_t, Rect>> cycles{{0, s}, {100, s}, {200, s}};
+    for (std::int64_t ms = 300; ms <= 1500; ms += 100) {
+      cycles.emplace_back(ms, m(ms));
+    }
+    const Replay followed = replay(config, cycles, 1500);
+    const Replay held = replay(off, cycles, 1500);
+    for (const spg::TrackMotion& motion : followed.motions) {
+      CHECK(motion.track == 1);  // one track: M joined S's
+    }
+    for (std::size_t f = 0; f < followed.released.size(); ++f) {
+      const auto ms = static_cast<std::int64_t>(10 * f);
+      INFO("frame " << ms << " ms");
+      if (ms <= 950) {  // S's last box, seen on 200 ms, holds until 950 ms
+        CHECK(covered(held.released[f], region_of(s)));
+        CHECK(covered(followed.released[f], region_of(s)));
+      }
+      if (ms >= 300) {
+        CHECK(covered(followed.released[f], region_of(m(ms))));
+      }
+    }
+    // M's own run is followed: on 1200 ms its box from 600 ms has moved on
+    // with it, where held it stays.
+    CHECK(covered(held.released[120], required(m(600), config)));
+    CHECK_FALSE(covered(followed.released[120], required(m(600), config)));
+  }
+  SECTION("the static line joins a moving line's track") {
+    // M scrolls up at 40 px/s from y = 600, found every 100 ms until 500 ms,
+    // then missed. S rests at y = 576, where M's run puts it on 600 ms, and
+    // is found from 600 to 1000 ms: it joins M's track and its first box
+    // even counts as a steady move. Each of S's boxes moves only by S's own
+    // measured move (none), and the run ends when S has not moved for
+    // 250 ms.
+    const auto m = [](std::int64_t ms) {
+      return Rect{100.0F, 600.0F - 0.04F * static_cast<float>(ms), 300.0F, 30.0F};
+    };
+    const Rect s{100.0F, 576.0F, 300.0F, 30.0F};
+    std::vector<std::pair<std::int64_t, Rect>> cycles;
+    for (std::int64_t ms = 0; ms <= 500; ms += 100) {
+      cycles.emplace_back(ms, m(ms));
+    }
+    for (std::int64_t ms = 600; ms <= 1000; ms += 100) {
+      cycles.emplace_back(ms, s);
+    }
+    const Replay followed = replay(config, cycles, 1750);
+    for (const spg::TrackMotion& motion : followed.motions) {
+      CHECK(motion.track == 1);  // one track: S joined M's
+    }
+    for (std::size_t f = 60; f < followed.released.size(); ++f) {
+      INFO("frame " << 10 * f << " ms");
+      CHECK(covered(followed.released[f], region_of(s)));
+    }
+  }
+}
+
+TEST_CASE("tracker: a sighting gap past the hold never covers less than held where seen", "[tracker]") {
+  // SPG-12b staff review: a run cannot follow a track across a gap longer
+  // than the hold. A line slides right at 20 px/s, found every 100 ms until
+  // 500 ms, then after a gap, then every 100 ms until 2000 ms. A box found
+  // more than `hold` after the track's last one starts a new track, so a
+  // confirmed run never spans such a gap, and on every frame the followed
+  // tracker covers the line wherever the tracker that holds every box where
+  // it was seen does.
+  const auto line = [](std::int64_t ms) {
+    return Rect{100.0F + 0.02F * static_cast<float>(ms), 500.0F, 300.0F, 30.0F};
+  };
+  TrackerConfig off;
+  off.follow_moving_tracks = false;
+  for (const std::int64_t gap : {750, 760}) {
+    INFO("gap " << gap << " ms");
+    std::vector<std::pair<std::int64_t, Rect>> cycles;
+    for (std::int64_t ms = 0; ms <= 500; ms += 100) {
+      cycles.emplace_back(ms, line(ms));
+    }
+    for (std::int64_t ms = 500 + gap; ms <= 2000; ms += 100) {
+      cycles.emplace_back(ms, line(ms));
+    }
+    const Replay followed = replay(TrackerConfig{}, cycles, 2750);
+    const Replay held = replay(off, cycles, 2750);
+    // Within the hold the run goes on (one track); past it a new track starts.
+    CHECK(followed.motions.at(6).track == (gap <= 750 ? 1U : 2U));
+    int frames_held = 0;
+    for (std::size_t f = 0; f < followed.released.size(); ++f) {
+      const auto ms = static_cast<std::int64_t>(10 * f);
+      INFO("frame " << ms << " ms");
+      if (covered(held.released[f], region_of(line(ms)))) {
+        ++frames_held;
+        CHECK(covered(followed.released[f], region_of(line(ms))));
+      }
+      if (gap <= 750 && ms <= 2000) {
+        // One run bridges the gap: covered on every frame up to the last box.
+        CHECK(covered(followed.released[f], region_of(line(ms))));
+      }
+    }
+    CHECK(frames_held > 150);
+  }
+}
+
+TEST_CASE("tracker: a resize mid-run holds the boxes from before it where they were seen", "[tracker]") {
+  // SPG-12b staff review: a line scrolls up at 60 px/s and its track is
+  // confirmed moving when the source is resized from 1920x1080 to 1280x720.
+  // Every box from before the resize is held where it was seen, as it was
+  // and scaled, for its whole hold; the run starts again from the boxes
+  // found in the new size.
+  TrackerConfig config;
+  config.retain = std::chrono::seconds{10};
+  ManualClock clock;
+  Tracker tracker(clock, config);
+  const auto line = [](std::int64_t ms, double scale) {
+    return Rect{static_cast<float>(100.0 * scale),
+                static_cast<float>((600.0 - 0.06 * static_cast<double>(ms)) * scale),
+                static_cast<float>(300.0 * scale), static_cast<float>(30.0 * scale)};
+  };
+  const auto feed = [&](std::int64_t ms, const Rect& box) {
+    clock.set(at_ms(ms + 200));
+    tracker.update(at_ms(ms), std::vector<Detection>{text(box.x, box.y, box.width, box.height)});
+  };
+  std::vector<std::pair<std::int64_t, Rect>> before;
+  for (std::int64_t ms = 0; ms <= 500; ms += 100) {
+    feed(ms, line(ms, 1.0));
+    before.emplace_back(ms, line(ms, 1.0));
+  }
+  // Confirmed moving: on 450 ms the first box has moved on with the line.
+  CHECK_FALSE(covered(tracker.masks(at_ms(450)), required(line(0, 1.0), config)));
+  clock.set(at_ms(700));
+  tracker.rescale(Size{1920, 1080}, Size{1280, 720});
+  constexpr double kScale = 2.0 / 3.0;
+  for (std::int64_t ms = 600; ms <= 2000; ms += 100) {
+    feed(ms, line(ms, kScale));
+  }
+  REQUIRE(tracker.tracks().size() == 1);
+  for (std::int64_t ms = 0; ms <= 2750; ms += 10) {
+    INFO("frame " << ms << " ms");
+    const std::vector<Box> masks = tracker.masks(at_ms(ms));
+    for (const auto& [seen, box] : before) {
+      if (ms >= seen && ms <= seen + 750) {
+        CHECK(covered(masks, required(box, config)));
+        CHECK(covered(masks, scaled(required(box, config), kScale, kScale)));
+      }
+    }
+    if (ms >= 600 && ms <= 2000) {
+      CHECK(covered(masks, region_of(line(ms, kScale))));
+    }
+  }
+  // The run goes on in the new size: on 1800 ms the box from 1100 ms has
+  // moved on with the line.
+  CHECK_FALSE(covered(tracker.masks(at_ms(1800)), required(line(1100, kScale), config)));
 }
 
 // --- Property tests --------------------------------------------------------

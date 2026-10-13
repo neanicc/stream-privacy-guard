@@ -287,15 +287,8 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
       // has a measurement, so a wrong pairing cannot take away the motion
       // the detections would have had on a track of their own.
       const Motion& m = state.since_gate.has_velocity ? state.since_gate : state.motion;
-      // Bridged only while the track moves steadily: a box found where text
-      // rests can still cover glyphs an earlier box at that place fell short
-      // of, but text that moves one way never was where it is found now.
-      const Timestamp bridged = config_.follow_moving_tracks && state.follow.translations >= 2
-                                    ? std::max(state.bridged_from, state.follow.run_start)
-                                    : Timestamp::max();
-      (*motions)[di] = m.has_velocity
-                           ? TrackMotion{m.velocity, m.first_seen, m.translating, state.track.id, bridged}
-                           : TrackMotion{Velocity{}, m.first_seen, false, state.track.id, bridged};
+      (*motions)[di] = m.has_velocity ? TrackMotion{m.velocity, m.first_seen, m.translating, state.track.id}
+                                      : TrackMotion{Velocity{}, m.first_seen, false, state.track.id};
     }
   };
   for (const Candidate& c : candidates) {
@@ -372,7 +365,6 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     state.track.kind = detection.kind;
     state.motion = Motion{detection.box.rect, frame_time, frame_time, Velocity{}, false, false};
     state.since_gate = state.motion;
-    state.bridged_from = frame_time;
     follow_measure(state.follow, detection.box.rect, frame_time);
     hold(state, make_held(detection.box.rect, frame_time, Velocity{}));
     if (motions != nullptr) {
@@ -455,9 +447,6 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box, 
     if (forward) {
       follow_measure(state.follow, box, frame_time);
     }
-    // The path is bridged again from this detection on: the next sighting
-    // bridges from its box (SPG-16b).
-    state.bridged_from = frame_time;
   } else {
     advance(state.since_gate, frame_time, box);
     if (forward) {
@@ -514,15 +503,20 @@ void Tracker::follow_measure(Follow& follow, const Rect& box, Timestamp frame_ti
         std::abs(moved - expected) <= std::max(expected / 2.0, kSteadyJitterPx)) {
       ++follow.translations;
     } else {
-      // A first translation, a turn or a change of speed: a new run starts.
+      // A first translation, a turn or a change of speed: a new run starts,
+      // from the checkpoint it left. When a box was seen resting at the
+      // checkpoint since, the run starts at this box instead: the boxes
+      // before it show text at rest (a static line whose track a moving line
+      // took over), and hold where they were seen.
       follow.translations = 1;
-      follow.run_start = follow.checkpoint_time;
+      follow.run_start = follow.rested ? frame_time : follow.checkpoint_time;
       follow.along_x = along_x;
       follow.positive = positive;
     }
     follow.speed = moved / dt;
     follow.checkpoint = box;
     follow.checkpoint_time = frame_time;
+    follow.rested = false;
     return;
   }
   // Not a translation: a short gap, jitter, a box that grows, or a stop. A
@@ -535,6 +529,9 @@ void Tracker::follow_measure(Follow& follow, const Rect& box, Timestamp frame_ti
     follow.translations = 0;
     follow.checkpoint = box;
     follow.checkpoint_time = frame_time;
+    follow.rested = false;
+  } else {
+    follow.rested = true;
   }
 }
 
@@ -686,14 +683,19 @@ void Tracker::track_masks(const TrackState& state, Timestamp t, std::int64_t wid
          t <= a->seen + config_.hold;
   }
 
+  // Only boxes of the current run seen before a move with it. Held before a
+  // gate pairing or resize, before the run started (or while the text rested
+  // at its start), or late, they may be another object's and stay where they
+  // were seen.
+  const auto moves_with_run = [&](const Held& held) {
+    return on && held.seen < a->seen && held.seq >= follow.barrier && held.seen >= follow.run_start &&
+           !held.late;
+  };
   for (const Held& held : state.held) {
     if (t < held.seen || t > held.seen + config_.hold) {
       continue;
     }
-    // Only boxes of the current run move: held before a gate pairing or
-    // resize, before the run started, or late, they may be another object's.
-    if (!on || held.seen >= a->seen || held.seq < follow.barrier || held.seen < follow.run_start ||
-        held.late) {
+    if (!moves_with_run(held)) {
       add(held.seen, mask_rect(held, t));
       continue;
     }

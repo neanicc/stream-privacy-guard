@@ -1098,13 +1098,14 @@ TEST_CASE("one worker follows a scrolling line and stops blurring the line below
   CHECK(blurred(followed) == 0);
 }
 
-TEST_CASE("retroactive rects of a followed line leave the line above clear", "[schedule]") {
+TEST_CASE("a followed line keeps every retroactive rect", "[schedule]") {
   // SPG-12b: the same line, scanned every 200 ms with results landing at
   // once, so each one reaches 500 ms of buffered frames. A rect where a later
   // cycle found the line is where the text is going: 375 ms or more back it
-  // covers the line above. Once the track is confirmed moving, its own held
-  // masks cover its path between sightings and those rects are left out; the
-  // line is still covered on every frame.
+  // covers the line above. Following the track only changes the tracker's
+  // held masks; the scheduler adds every retroactive rect as before
+  // (AGENTS.md, retroactive masking), so the line above is blurred on the
+  // same frames followed or held, and the line is covered on every frame.
   const auto line = [](std::int64_t t) {
     return Rect{100.0F, 600.0F - 0.06F * static_cast<float>(t - 1000), 300.0F, 30.0F};
   };
@@ -1146,7 +1147,7 @@ TEST_CASE("retroactive rects of a followed line leave the line above clear", "[s
   };
   INFO("line above blurred on " << above(held) << " frames held, " << above(followed) << " followed");
   CHECK(above(held) > 50);
-  CHECK(above(followed) == 0);
+  CHECK(above(followed) == above(held));
 }
 
 TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {

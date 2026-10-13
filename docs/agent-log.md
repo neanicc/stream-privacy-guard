@@ -2500,16 +2500,26 @@ Template:
   detections, boxes before the run, boxes before a gate pairing or resize,
   and every box after the track's last detection hold where they were seen.
   `follow_moving_tracks` (default true) turns it off. `TrackMotion` gains
-  the track id and `bridged_from`.
-- Change, scheduler (`core/src/schedule/lookahead.cpp`, 7 lines; #89 works
-  in the same file). A detection's retroactive rects are left out on frames
-  at or after its `bridged_from`: only while its track is confirmed moving,
-  from the start of the run, never before its first sighting or latest gate
-  pairing. There the track's own bridges or the hull of `a` and `b` cover
-  the text. This narrows the AGENTS.md retroactive-masking wording ("every
-  buffered frame from t - lookahead onward") to frames the tracker does not
-  already cover; frames before a first sighting keep every rect. It needs a
-  human to confirm the wording (see follow-ups).
+  the track id.
+- Scheduler unchanged (`lookahead.cpp` as on main). The first head also left
+  a detection's retroactive rects out on frames from `TrackMotion::bridged_from`
+  (the start of its confirmed run) on. Staff review and Greptile each found
+  a P1 in it, and it narrowed the AGENTS.md retroactive-masking wording
+  ("every buffered frame from t - lookahead onward"), which only a human
+  can change. Babysit cycle 1 removed it and `bridged_from`; it is a
+  needs-human proposal now (see follow-ups).
+- Babysit cycle 1, tracker. A test of a static line whose track a scrolling
+  line takes over by IoU (the static line seen at rest on 100 and 200 ms,
+  then missed) found a real uncovering: measured from the static line's
+  first box, the moving line's sightings looked like one steady run from
+  0 ms, so the static line's boxes moved with it and the line was uncovered
+  from 400 to 950 ms. A box seen at rest at the checkpoint (100 ms or more
+  after it, not translated) now makes the next run start at its first
+  translation, so the boxes before it hold where they were seen. New tests
+  also cover a static line joining a moving track, a sighting gap at and
+  past the hold (a forward detection joins only within the hold, so no run
+  spans a longer gap) and a resize mid-run. `track_masks` names its
+  eligibility test (`moves_with_run`).
 - Why the rule is this strict. Attempt 1 (#80) gave no gain with a
   containment test. A first version here (every older box moved, any
   translation counted) gave CI 0.3270, local 0.3655 with the same recall,
@@ -2533,7 +2543,7 @@ Template:
   every track (not only moving ones) lost one watch-list frame on the
   address-bar template (seq-012 frame 35, 0.75 covered): a later, longer
   box of typed text had covered glyphs the earlier box fell short of.
-- Eval, branch against main `a474cde`. CI text: watch-list 557/557,
+- Eval, first head against main `a474cde` (with the retro skip). CI text: watch-list 557/557,
   first-frame 15/15, PII 590/590, leak 0/285, clean blur 0, decoy 0.4233 to
   0.3382 (302/893). Local text: watch-list 3996/3999, first-frame 51/53,
   PII 4158/4162, leak 7/1919, clean blur 0.002681 to 0.001753, decoy
@@ -2547,12 +2557,22 @@ Template:
   reaches a thin neighbour line on 720p chat; boxes held after a line's last
   detection (it scrolled out or was missed); tracks not yet confirmed; and
   the SPG-16b trail after a gate pairing at a sequence start.
+- Eval after babysit cycle 1 (retro skip removed, rest rule added), against
+  main `630139a`, same method. CI text: decoy 0.4233 to 0.3718 (332/893);
+  watch-list 557/557, first-frame 15/15, PII 590/590, leak 0/285, clean
+  blur 0, all as on main. Local text: decoy 0.5090 to 0.3754 (1747/4654);
+  watch-list 3996/3999, first-frame 51/53, PII 4158/4162, leak 7/1919 as on
+  main; clean blur 0.002681 to 0.0019. Faces: 2206/2207, leak 1/1080, clean
+  0, as on main. `scripts/ci/run.sh eval` (CI mode, plugin off):
+  `THRESHOLDS: FAIL` from decoy blur only, as on main.
 - Threshold ask (human-owned `eval/thresholds.toml`, needs-human): 0.25 is
   out of reach without assuming how text moves between two sightings. To
-  pass both modes at this head, `decoy_blur_rate_max` must be at least
-  0.3382 (CI; local 0.3210), so 0.34 would pass.
-- Open issues or follow-ups: (1) needs-human: confirm or reword the AGENTS.md
-  retroactive-masking invariant for frames a confirmed moving track's own
-  masks cover. (2) The scrolling-chat leak test (#71) should run on this
+  pass both modes after babysit cycle 1, `decoy_blur_rate_max` must be at
+  least 0.3754 (local; CI 0.3718), so 0.38 would pass. With the retro skip
+  (if a human rewords the invariant) the floor was 0.3382.
+- Open issues or follow-ups: (1) needs-human: the retro skip, with a
+  reworded AGENTS.md retroactive-masking invariant for frames a confirmed
+  moving track's own masks cover. It would need to keep a late detection's
+  rects and frames past a sighting's hold (the two P1s). (2) The scrolling-chat leak test (#71) should run on this
   change. (3) A cycle cadence without the 17 ms paired cycles would halve
   the hull between sightings. Synthetic eval only; live OBS not tested.

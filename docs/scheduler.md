@@ -215,22 +215,6 @@ at rest is not a first sighting. The gate's reach on a wide text line is
 several line widths, so this blurs neighbouring content on those few frames:
 SPG-16d measured it (agent-log). `motion_gate_per_s = 0` turns it off with the
 gate.
-
-None of these rects is added on a frame at or after the box's
-`TrackMotion::bridged_from` (SPG-12b). The tracker reports it only while the
-box's track is confirmed moving (steady translations one way): from the
-start of that run, and never before the track's first sighting or its
-latest motion-gate pairing. On those frames the tracker's own held masks
-already cover the text, through the hull of the two sightings around each
-frame. A rect where a scrolling line was found would only blur where it is
-going: SPG-12d attributed 121 of 376 covered decoys on the CI text suite to
-retroactive rects. Frames before the run, before a new track's first
-sighting (the first-frame case above) and boxes of tracks that are not
-moving steadily keep every rect. Text that grows in place (typed) keeps them
-too: a later, longer box can cover glyphs an earlier one fell short of, which
-a run of this skip on every track showed (one watch-list frame of the
-address-bar template lost coverage). A first sighting is never in a
-confirmed run, so its spread is never left out.
 Per frame, a rect contained in another is dropped, and past `max_retro_rects`
 they merge into one hull (more blur, never less).
 

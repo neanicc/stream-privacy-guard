@@ -60,8 +60,7 @@ struct TrackerConfig {
   // detections of a confirmed moving track bracket (see Tracker), its older
   // held boxes are masked at the track's measured position, each with its own
   // size and margin, instead of where they were seen. false holds every box
-  // where it was seen and reports no bridged frames (TrackMotion), as before
-  // SPG-12b.
+  // where it was seen, as before SPG-12b.
   bool follow_moving_tracks = true;
 
   // Hold, margin and retention (lookahead) from `policy`; the rest default.
@@ -105,15 +104,6 @@ struct TrackMotion {
   bool translating = false;
   // The track the detection joined (Track::id).
   TrackId track = 0;
-  // While the track is confirmed moving (see Tracker, Follow): from this
-  // frame time up to the detection's, the track's own held masks cover the
-  // path between its sightings (the hull of each two in a row), so a
-  // retroactive rect adds nothing there (SPG-12b). It is the start of the
-  // track's current run, and never before its first sighting or its latest
-  // motion-gate pairing (the pairing may be wrong, and the path from before
-  // it another object's). Otherwise (also with follow_moving_tracks off),
-  // and by default, it covers no frame.
-  Timestamp bridged_from = Timestamp::max();
 
   friend bool operator==(const TrackMotion&, const TrackMotion&) = default;
 };
@@ -139,7 +129,8 @@ struct TrackMotion {
 //     move within half, or 3 px, of what the last one's speed predicts); its
 //     run ends when its box stops, turns, changes speed, is paired by the
 //     motion gate or the source is resized. Late detections, boxes held
-//     before the run and boxes held before a gate pairing or resize are
+//     before the run (a run that leaves a box seen at rest starts at its
+//     first translation) and boxes held before a gate pairing or resize are
 //     never moved. On frame times after the track's last detection, every
 //     box is held where it was seen.
 //   * Prediction: on frame times after td the mask also covers b moved at the
@@ -245,7 +236,11 @@ class Tracker {
     bool along_x = true;       // their axis
     bool positive = true;      // and direction along it
     double speed = 0.0;        // of the last one along that axis, px/s
-    Timestamp run_start{};     // checkpoint the run's first translation left
+    Timestamp run_start{};     // boxes seen before it never move
+    // A box seen kMinBaseline or more after the checkpoint did not translate
+    // from it: the text rested there, so a run that starts from this
+    // checkpoint starts at its first translation instead.
+    bool rested = false;
     std::uint64_t barrier = 0;  // boxes held before this seq never move
   };
   // What confirm() measures from a run of detections: the latest box (in
@@ -269,9 +264,6 @@ class Tracker {
     Motion since_gate;
     Follow follow;
     std::uint64_t next_seq = 0;
-    // The track's first sighting or latest gate pairing: its bridges cover
-    // the path from here (see TrackMotion::bridged_from).
-    Timestamp bridged_from{};
   };
 
   [[nodiscard]] Rect predicted(const Track& track, Timestamp t) const noexcept;
