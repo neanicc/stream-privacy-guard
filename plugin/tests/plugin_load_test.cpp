@@ -568,11 +568,13 @@ void check_models(bool present, obs_source_t *early) {
   obs_source_t *second = obs_source_create(plugin::kFilterId, "spg-models-2", nullptr, nullptr);
   if (present) {
     check(type == OBS_TEXT_INFO_NORMAL, "the pinned models load in the module (properties: ready)");
-    // The loader thread rebuilds each filter's scheduler with the models just
-    // after it publishes the status, and a filter created afterwards builds
-    // one with them straight away.
+    // The loader thread asks for each filter's scheduler with the models just
+    // after it publishes the status, and a filter created afterwards asks for
+    // one with them straight away. Each filter's build thread builds it and
+    // logs the line (SPG-14d), so wait for both.
     const auto handed_over = std::chrono::steady_clock::now() + std::chrono::minutes{1};
-    while (captured().find("[obs-spg] 'spg-early': scanning with the detection models") == std::string::npos &&
+    while ((captured().find("[obs-spg] 'spg-early': scanning with the detection models") == std::string::npos ||
+            captured().find("[obs-spg] 'spg-models-2': scanning with the detection models") == std::string::npos) &&
            std::chrono::steady_clock::now() < handed_over) {
       std::this_thread::sleep_for(std::chrono::milliseconds{50});
     }

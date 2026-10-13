@@ -1,0 +1,208 @@
+#include "pipeline/builder.hpp"
+
+#include <stdexcept>
+#include <utility>
+
+namespace spg::plugin {
+
+TaskThread::TaskThread() : thread_(&TaskThread::run, this) {
+  id_ = thread_.get_id();
+}
+
+TaskThread::~TaskThread() {
+  stop();
+}
+
+void TaskThread::post(Task task) {
+  {
+    const std::lock_guard lock(mutex_);
+    if (stop_) {
+      throw std::logic_error("task thread stopped");
+    }
+    tasks_.push_back(std::move(task));
+  }
+  wake_.notify_one();
+}
+
+void TaskThread::stop() noexcept {
+  std::deque<Task> dropped;
+  try {
+    const std::lock_guard lock(mutex_);
+    stop_ = true;
+    dropped.swap(tasks_);
+  } catch (...) {
+    // The mutex failed: the thread cannot be told to stop, so it cannot be
+    // joined either; leave it rather than wait forever.
+    return;
+  }
+  wake_.notify_all();
+  if (thread_.joinable()) {
+    try {
+      thread_.join();
+    } catch (...) {
+    }
+  }
+}
+
+void TaskThread::run() noexcept {
+  while (true) {
+    Task task;
+    try {
+      std::unique_lock lock(mutex_);
+      wake_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+      if (stop_) {
+        return;
+      }
+      task = std::move(tasks_.front());
+      tasks_.pop_front();
+    } catch (...) {
+      return;  // the mutex failed: nothing more can be taken safely
+    }
+    try {
+      task();
+    } catch (...) {
+      // A task must not throw; one that does is dropped.
+    }
+  }
+}
+
+GenerationBuilder::GenerationBuilder(PipelineHost& host, Pipeline::Retire retire, std::mutex& lock, Executor executor)
+    : host_(&host), retire_(std::move(retire)), lock_(&lock), executor_(std::move(executor)) {}
+
+bool GenerationBuilder::request(Kind kind, Build build, Done done) noexcept {
+  ++latest_;
+  latest_kind_ = kind;
+  pending_ = true;
+  if (kind == Kind::Settings) {
+    // Nothing may run the old settings from here on: covered until the
+    // generation for these is offered.
+    failed_ = false;
+    retry_ = false;
+    host_->fail(Cover::SettingsChanged);
+  }
+  // Into the slot; a request waiting there is superseded and its copy of the
+  // settings is freed when `build` and `done` go out of scope (swap does not
+  // throw).
+  next_build_.swap(build);
+  next_done_.swap(done);
+  if (queued_) {
+    return true;  // the task already posted builds the latest request
+  }
+  try {
+    executor_([this] { run(); });
+    queued_ = true;
+    return true;
+  } catch (...) {
+    // Not posted (allocation, executor stopped): fails like a build.
+  }
+  Done failed_done;
+  failed_done.swap(next_done_);
+  drop_next();
+  const Outcome outcome = failure();
+  if (failed_done) {
+    try {
+      failed_done(outcome);
+    } catch (...) {
+    }
+  }
+  return false;
+}
+
+GenerationBuilder::Outcome GenerationBuilder::fail(Kind kind) noexcept {
+  ++latest_;  // whatever is pending is never offered
+  latest_kind_ = kind;
+  drop_next();
+  if (kind == Kind::Settings) {
+    failed_ = false;
+    retry_ = false;
+  }
+  return failure();
+}
+
+GenerationBuilder::Outcome GenerationBuilder::failure() noexcept {
+  const bool first = !(failed_ && retry_);
+  failed_ = true;
+  // A Rebuild is of the current settings, so trying it again never runs
+  // superseded ones; a failed settings change is not retried.
+  retry_ = latest_kind_ == Kind::Rebuild;
+  pending_ = false;
+  host_->fail();
+  if (retry_) {
+    retry_due_.store(true);
+  }
+  return Outcome{false, first};
+}
+
+void GenerationBuilder::drop_next() noexcept {
+  Build build;
+  Done done;
+  next_build_.swap(build);
+  next_done_.swap(done);
+}
+
+void GenerationBuilder::retire(std::unique_ptr<PipelineSpec> spec) noexcept {
+  if (spec != nullptr && spec->scheduler != nullptr) {
+    try {
+      retire_(std::move(spec->scheduler));
+    } catch (...) {
+    }
+  }
+}
+
+void GenerationBuilder::run() noexcept {
+  std::uint64_t ticket = 0;
+  Build build;
+  Done done;
+  try {
+    const std::lock_guard lock(*lock_);
+    queued_ = false;
+    // The slot holds only the latest request: fail() empties it, and a newer
+    // request replaces it.
+    build.swap(next_build_);
+    done.swap(next_done_);
+    ticket = latest_;
+  } catch (...) {
+    return;  // the lock failed: the request stays pending (covered)
+  }
+  if (!build) {
+    return;  // dropped (fail()) before it started: nothing to build
+  }
+  // The expensive part, with no lock held: scheduler threads, stages.
+  std::unique_ptr<PipelineSpec> spec;
+  try {
+    spec = build();
+  } catch (...) {
+    spec.reset();
+  }
+  try {
+    const std::lock_guard lock(*lock_);
+    if (ticket != latest_) {
+      // Superseded while building: never offered.
+      retire(std::move(spec));
+      return;
+    }
+    Outcome outcome;
+    if (spec != nullptr) {
+      host_->offer(std::move(spec));
+      pending_ = false;
+      failed_ = false;
+      retry_ = false;
+      outcome.ok = true;
+    } else {
+      outcome = failure();
+    }
+    if (done) {
+      try {
+        done(outcome);
+      } catch (...) {
+      }
+    }
+  } catch (...) {
+    // The lock failed: nothing can be handed over safely. Cover, and drop
+    // what was built.
+    host_->fail();
+    retire(std::move(spec));
+  }
+}
+
+}  // namespace spg::plugin

@@ -84,14 +84,18 @@ inline constexpr std::uint64_t kRefitRetryNs = 1'000'000'000ULL;
 // When the filter's video tick refits the lookahead (FilterRender::tick):
 // once for each new source size or frame rate, and after a refit that failed
 // (the source is then covered whole) again every kRefitRetryNs until one
-// succeeds, so the cover does not outlast the failure. Video thread only.
+// succeeds, so the cover does not outlast the failure. The video tick runs on
+// OBS's graphics thread; this is used there only.
 class RefitSchedule {
  public:
   // A refit should be tried now. Never for a hidden (0x0) source.
   [[nodiscard]] bool due(Size source, Duration interval, std::uint64_t now_ns) const noexcept;
-  // `source` and `interval` are fitted: not due again until either changes.
+  // `source` and `interval` are fitted (or their rebuild was asked for): not
+  // due again until either changes or failed() is called.
   void done(Size source, Duration interval) noexcept;
-  // The refit failed: due again from now_ns + kRefitRetryNs.
+  // The refit failed, even one marked done() already (its build failed
+  // later on the build thread): due again, for any size, from
+  // now_ns + kRefitRetryNs.
   void failed(std::uint64_t now_ns) noexcept;
 
  private:

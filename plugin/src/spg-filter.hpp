@@ -7,7 +7,7 @@
 // with its masks blurred, or covered whole when it was not fully scanned
 // (render/filter_render.hpp, docs/plugin-render.md). It never draws an
 // unscanned frame uncovered. Detection models (SPG-14b) load once per module
-// off the render and video threads (model_loading.hpp); until they are ready,
+// off the graphics and UI threads (model_loading.hpp); until they are ready,
 // or when they are missing or damaged, every frame gets the fallback.
 //
 // Settings (SPG-15): the properties of plan section 7. Watch-list entries are

@@ -2,7 +2,7 @@
 
 // Where schedulers are destroyed (SPG-14), without OBS. A scheduler's
 // destructor waits for its workers to leave their stage calls, so it must
-// never run on the render thread, the video thread or the UI thread. The
+// never run on the graphics thread (render, video tick) or the UI thread. The
 // reaper destroys retired schedulers on its own thread, in order.
 //
 // Module unload: the plugin's workers run code from the plugin module
