@@ -126,12 +126,13 @@ struct TrackMotion {
 //     larger of their margins, is masked too, so text that moved one way
 //     from a to b is covered at every frame time between them. A track is
 //     confirmed moving after two steady translations the same way (each
-//     move within half, or 3 px, of what the last one's speed predicts); its
-//     run ends when its box stops, turns, changes speed, is paired by the
-//     motion gate or the source is resized. Late detections, boxes held
-//     before the run (a run that leaves a box seen at rest starts at its
-//     first translation) and boxes held before a gate pairing or resize are
-//     never moved. On frame times after the track's last detection, every
+//     move off what the last one's speed predicts by at most half of it and
+//     half the box along it, or 3 px); its run ends when its box stops,
+//     turns, changes speed, is paired by the motion gate or the source is
+//     resized. Late detections, boxes held before the run (a run that leaves
+//     a box seen at rest, or that a change of speed restarts, starts at the
+//     box that restarted it) and boxes held before a gate pairing or resize
+//     are never moved. On frame times after the track's last detection, every
 //     box is held where it was seen.
 //   * Prediction: on frame times after td the mask also covers b moved at the
 //     track's estimated velocity for min(t - td, max_prediction), as the hull

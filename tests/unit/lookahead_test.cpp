@@ -1150,6 +1150,51 @@ TEST_CASE("a followed line keeps every retroactive rect", "[schedule]") {
   CHECK(above(followed) == above(held));
 }
 
+TEST_CASE("a fast line whose track the line below takes over stays covered", "[schedule]") {
+  // SPG-12b staff review: a line scrolls up at 150 to 300 px/s, 34 px above
+  // the next one. It is found until 1600 ms, then missed; after a gap only
+  // the line below is found, and it can win the line's track. On every frame
+  // where holding every box where it was seen covers the line, following
+  // covers it too.
+  int compared = 0;
+  for (const std::size_t workers : {1U, 2U}) {
+    for (const double speed : {150.0, 200.0, 250.0, 300.0}) {
+      for (std::int64_t gap = 200; gap <= 800; gap += 50) {
+        const auto line = [&](std::int64_t t) {
+          return Rect{100.0F, static_cast<float>(800.0 - speed * static_cast<double>(t - 1000) / 1000.0), 300.0F,
+                      30.0F};
+        };
+        const BoxesAt found([&](std::int64_t t) {
+          if (t <= 1600) {
+            return std::vector<Rect>{line(t)};
+          }
+          if (t < 1600 + gap) {
+            return std::vector<Rect>{};
+          }
+          Rect below = line(t);
+          below.y += 34.0F;
+          return std::vector<Rect>{below};
+        });
+        SchedulerConfig config = one_worker_config();
+        const auto followed = with_workers(workers, config, found, 1000, 3000);
+        config.tracker.follow_moving_tracks = false;
+        const auto held = with_workers(workers, config, found, 1000, 3000);
+        REQUIRE(followed.size() == held.size());
+        for (std::size_t i = 0; i < held.size(); ++i) {
+          const std::int64_t t = spg::to_ns(held[i].frame_time) / 1'000'000;
+          if (held[i].action == FallbackAction::None && covered_by(held[i].plan, line(t))) {
+            INFO(workers << " workers, " << speed << " px/s, gap " << gap << " ms, frame " << t);
+            ++compared;
+            CHECK(followed[i].action == FallbackAction::None);
+            CHECK(covered_by(followed[i].plan, line(t)));
+          }
+        }
+      }
+    }
+  }
+  CHECK(compared > 10'000);
+}
+
 TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {
   // A static box whose detections jitter 12 px left and right each cycle: the
   // track's velocity flips sign every 20 ms (an outlier-ridden estimate).

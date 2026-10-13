@@ -2565,11 +2565,38 @@ Template:
   main; clean blur 0.002681 to 0.0019. Faces: 2206/2207, leak 1/1080, clean
   0, as on main. `scripts/ci/run.sh eval` (CI mode, plugin off):
   `THRESHOLDS: FAIL` from decoy blur only, as on main.
+- Babysit cycle 2, tracker. Staff review P2: after missed cycles the line
+  below could take a fast line's track and still pass the steadiness check
+  (34 px short of an 80 px move is within half). A new test (line S at 150
+  to 300 px/s, 34 px above line N, S missed after 600 ms, then only N, 2,400
+  scenes over gap, cadence, jitter and smoothing) found N takes S's track in
+  2,208 scenes. Most go through the motion gate, which already holds S's
+  boxes, but past `max_prediction` the capped prediction lets N win by IoU,
+  and a gap's long move made the shortfall look steady: S's boxes then
+  moved with N, 34 px short of S, on 32,240 checked box-frames. S itself was
+  never left uncovered where held-where-seen covers it (the latest S box's
+  own prediction stops at the same cap), so no leak, but the run was wrong.
+  Fix, no new state: a steady move is also off by at most half the box
+  along the run (a neighbour sits at least a box away), and a run that a
+  change of speed restarts starts at the box that restarted it, so the
+  boxes before it hold where they were seen. A scheduler test checks the
+  same takeover at one and two workers. The follow property test now
+  checks 56,402 releases (57,545 before).
+- Eval after babysit cycle 2, same method, against main `630139a`. CI text
+  decoy 0.3718 (332/893), unchanged from cycle 1. Local text decoy 0.3816
+  (1776/4654; cycle 1 0.3754). Every recall, leak and clean-blur count as
+  after cycle 1 (CI 557/557, 15/15, 590/590, 0/285, 0; local 3996/3999,
+  51/53, 4158/4162, 7/1919, clean 0.0019; faces 2206/2207, 1/1080, 0). With
+  one worker (scratch wrapper passing `--workers 1` to `spg-cli eval`): CI
+  decoy 0.4099 (366/893), local 0.4682 (2179/4654), recall and leak as
+  with two workers or better (faces 2207/2207, leak 0/1080). Main was not
+  measured at one worker.
 - Threshold ask (human-owned `eval/thresholds.toml`, needs-human): 0.25 is
   out of reach without assuming how text moves between two sightings. To
-  pass both modes after babysit cycle 1, `decoy_blur_rate_max` must be at
-  least 0.3754 (local; CI 0.3718), so 0.38 would pass. With the retro skip
-  (if a human rewords the invariant) the floor was 0.3382.
+  pass both modes after babysit cycle 2, `decoy_blur_rate_max` must be at
+  least 0.3816 (local; CI 0.3718) with two workers, so 0.39 would pass.
+  With the retro skip (if a human rewords the invariant) the floor was
+  0.3382 on the first head.
 - Open issues or follow-ups: (1) needs-human: the retro skip, with a
   reworded AGENTS.md retroactive-masking invariant for frames a confirmed
   moving track's own masks cover. It would need to keep a late detection's

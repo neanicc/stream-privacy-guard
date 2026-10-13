@@ -1066,8 +1066,10 @@ struct Replay {
   std::vector<spg::TrackMotion> motions;   // per fed box
 };
 
-Replay replay(const TrackerConfig& config, const std::vector<std::pair<std::int64_t, Rect>>& cycles,
-              std::int64_t end_ms) {
+// Each cycle is a frame time and the boxes found on it.
+Replay replay_lines(const TrackerConfig& config,
+                    const std::vector<std::pair<std::int64_t, std::vector<Rect>>>& cycles,
+                    std::int64_t end_ms) {
   ManualClock clock;
   Tracker tracker(clock, config);
   Replay out;
@@ -1075,16 +1077,30 @@ Replay replay(const TrackerConfig& config, const std::vector<std::pair<std::int6
   for (std::int64_t ms = 0; ms <= end_ms; ms += 10) {
     const std::int64_t release = ms + 500;
     while (next < cycles.size() && cycles[next].first + 200 <= release) {
-      const auto& [seen, box] = cycles[next++];
+      const auto& [seen, boxes] = cycles[next++];
       clock.set(at_ms(seen + 200));
+      std::vector<Detection> detections;
+      for (const Rect& b : boxes) {
+        detections.push_back(text(b.x, b.y, b.width, b.height));
+      }
       std::vector<spg::TrackMotion> motions;
-      tracker.update(at_ms(seen), std::vector<Detection>{text(box.x, box.y, box.width, box.height)}, &motions);
-      out.motions.push_back(motions.at(0));
+      tracker.update(at_ms(seen), detections, &motions);
+      out.motions.insert(out.motions.end(), motions.begin(), motions.end());
     }
     clock.set(at_ms(release));
     out.released.push_back(tracker.masks(at_ms(ms)));
   }
   return out;
+}
+
+// One box per cycle.
+Replay replay(const TrackerConfig& config, const std::vector<std::pair<std::int64_t, Rect>>& cycles,
+              std::int64_t end_ms) {
+  std::vector<std::pair<std::int64_t, std::vector<Rect>>> lines;
+  for (const auto& [seen, box] : cycles) {
+    lines.push_back({seen, {box}});
+  }
+  return replay_lines(config, lines, end_ms);
 }
 
 }  // namespace
@@ -1254,6 +1270,121 @@ TEST_CASE("tracker: a resize mid-run holds the boxes from before it where they w
   // The run goes on in the new size: on 1800 ms the box from 1100 ms has
   // moved on with the line.
   CHECK_FALSE(covered(tracker.masks(at_ms(1800)), required(line(1100, kScale), config)));
+}
+
+TEST_CASE("tracker: a neighbouring line that takes over a fast track leaves the text's boxes held",
+          "[tracker]") {
+  // SPG-12b staff review: line S scrolls up at 150 to 300 px/s, 34 px above
+  // line N. S is found until 600 ms, then missed; after a gap only N is found
+  // (and, in one variant, S again from 200 ms later). Past max_prediction the
+  // track's prediction stops, so N can win S's track by IoU with it, and N's
+  // move, 34 px short of what the run predicts, can still be within half of
+  // a long gap's move. The run must break there: S's boxes hold where they
+  // were seen for their whole hold, and on every frame where holding every
+  // box where it was seen covers S, following covers it too.
+  constexpr std::int64_t kLastS = 600;
+  constexpr std::int64_t kEnd = 2000;
+  int scenes = 0;
+  int takeovers = 0;
+  int compared = 0;
+  int uncovered = 0;
+  int moved = 0;
+  std::string first_failure;
+  for (const float smoothing : {0.5F, 1.0F}) {
+    TrackerConfig on;
+    on.velocity_smoothing = smoothing;
+    TrackerConfig off = on;
+    off.follow_moving_tracks = false;
+    for (const double speed : {150.0, 200.0, 250.0, 300.0}) {
+      const auto s = [&](std::int64_t ms) {
+        return Rect{100.0F, static_cast<float>(900.0 - speed * static_cast<double>(ms) / 1000.0), 300.0F, 30.0F};
+      };
+      // One worker every 100 ms, or two workers' paired cycles every 200 ms.
+      for (const bool paired : {false, true}) {
+        std::vector<std::int64_t> times;
+        for (std::int64_t base = 0; base <= kEnd; base += paired ? 200 : 100) {
+          times.push_back(base);
+          if (paired) {
+            times.push_back(base + 17);
+          }
+        }
+        for (std::int64_t gap = 100; gap <= 700; gap += 25) {
+          for (const bool s_returns : {false, true}) {
+            // No jitter, small_jitter, or every other box read 3 px low.
+            for (const int jitter : {0, 1, 2}) {
+              std::vector<std::pair<std::int64_t, std::vector<Rect>>> cycles;
+              std::vector<std::pair<std::int64_t, Rect>> s_fed;
+              std::int64_t takeover_at = -1;
+              std::size_t takeover_index = 0;  // N's first box among all fed
+              std::size_t fed = 0;
+              for (std::size_t k = 0; k < times.size(); ++k) {
+                const std::int64_t ms = times[k];
+                std::pair<double, double> j{0.0, 0.0};
+                if (jitter == 1) {
+                  j = small_jitter(static_cast<int>(k));
+                } else if (jitter == 2) {
+                  j = {k % 2 == 1 ? 3.0 : 0.0, 0.0};
+                }
+                Rect sr = s(ms);
+                sr.y += static_cast<float>(j.first);
+                sr.height += static_cast<float>(j.second);
+                Rect nr = sr;
+                nr.y += 34.0F;
+                if (ms <= kLastS) {
+                  cycles.push_back({ms, {sr}});
+                  s_fed.emplace_back(ms, sr);
+                  fed += 1;
+                } else if (ms >= kLastS + gap) {
+                  if (takeover_at < 0) {
+                    takeover_at = ms;
+                    takeover_index = fed;
+                  }
+                  cycles.push_back({ms, s_returns && ms >= takeover_at + 200 ? std::vector<Rect>{nr, sr}
+                                                                             : std::vector<Rect>{nr}});
+                  fed += cycles.back().second.size();
+                }
+              }
+              const Replay followed = replay_lines(on, cycles, kEnd + 750);
+              const Replay held = replay_lines(off, cycles, kEnd + 750);
+              ++scenes;
+              takeovers += followed.motions.at(takeover_index).track == 1 ? 1 : 0;
+              for (std::size_t f = 0; f < followed.released.size(); ++f) {
+                const auto ms = static_cast<std::int64_t>(10 * f);
+                const auto fail = [&](int& count, const char* what) {
+                  if (count++ == 0 && first_failure.empty()) {
+                    first_failure = std::string(what) + ": smoothing " + std::to_string(smoothing) + ", " +
+                                    std::to_string(static_cast<int>(speed)) + " px/s, paired " +
+                                    std::to_string(paired) + ", gap " + std::to_string(gap) + " ms, S returns " +
+                                    std::to_string(s_returns) + ", jitter " + std::to_string(jitter) + ", frame " +
+                                    std::to_string(ms) + " ms";
+                  }
+                };
+                if (ms > kLastS) {
+                  for (const auto& [seen, box] : s_fed) {
+                    if (ms <= seen + 750 && !covered(followed.released[f], required(box, on))) {
+                      fail(moved, "S box not held where seen");
+                    }
+                  }
+                }
+                if (covered(held.released[f], region_of(s(ms)))) {
+                  ++compared;
+                  if (!covered(followed.released[f], region_of(s(ms)))) {
+                    fail(uncovered, "S uncovered where held covers it");
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  INFO("scenes " << scenes << ", N took S's track in " << takeovers << ", frames compared " << compared);
+  INFO(first_failure);
+  CHECK(moved == 0);
+  CHECK(uncovered == 0);
+  CHECK(takeovers > scenes / 2);
+  CHECK(compared > 100'000);
 }
 
 // --- Property tests --------------------------------------------------------

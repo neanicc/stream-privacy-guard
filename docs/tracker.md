@@ -58,7 +58,7 @@ including a zero hold and rect caps from 1 to 12), once with follow off and
 once with it on. Monotone growth is checked during each scene, from a frame
 time inside a still-retained detection's hold, so every comparison is between
 non-empty masks (with follow on, only after every detection fed: 39,123
-comparisons). The follow run checks 57,545 released boxes against the Follow
+comparisons). The follow run checks 56,402 released boxes against the Follow
 row, and every other box against Hold. Unit cases cover association,
 prediction, expiry, pruning, validation, resize (including a 2x upscale and two
 chained resizes), a 60 s hold with 600 held detections (followed and not), and
@@ -68,7 +68,11 @@ was seen, a velocity estimate pointing the wrong way or lagging an
 ease-out never uncovering the line, a static line sharing a track with a
 scrolling one (either joining the other's track) staying covered where it was
 seen, a sighting gap at and past the hold never covering less than held where
-seen, and a resize mid-run holding every box from before it.
+seen, a resize mid-run holding every box from before it, and the line below
+taking over a line scrolling at 150 to 300 px/s after missed cycles (2,400
+scenes): the line's boxes hold where they were seen, and it is covered
+wherever holding every box where it was seen covers it (a scheduler test
+checks the same at one and two workers).
 
 ## Follow (SPG-12b)
 
@@ -82,13 +86,18 @@ held boxes of a confirmed moving track where the track went instead.
   at least 100 ms of frame time (two workers' paired cycles land a frame
   apart, where a pixel of jitter is as large as the move). A move of both
   edges at least a pixel one way is a translation; it is steady when it is
-  within half, or 3 px, of what the run's last speed predicts. Two steady
-  translations the same way confirm the track. A move against the run, a
-  turn, a change of speed, no translation for 250 ms (a stop), a motion-gate
-  pairing or a resize ends the run. The speed check is what keeps another
-  line out: after missed cycles the line below can take a scrolling line's
-  track by IoU with its last box, and it measures far less move than the run
-  predicts. When a box was seen resting at the checkpoint (100 ms or more
+  off what the run's last speed predicts by at most half that move and half
+  the box along it (or 3 px). Two steady translations the same way confirm
+  the track. A move against the run, a turn, a change of speed, no
+  translation for 250 ms (a stop), a motion-gate pairing or a resize ends the
+  run. The speed check is what keeps another line out: after missed cycles
+  longer than `max_prediction` the line below can take a fast scrolling
+  line's track by IoU with its capped prediction, and it lands at least a
+  box (one line spacing) from where the run puts the text. Half of a long
+  gap's move can exceed that (34 px short of 120 px), so the box bounds it
+  too. A run that a change of speed restarts starts at the box that
+  restarted it, so the boxes before it, which may be the other line's, hold
+  where they were seen. When a box was seen resting at the checkpoint (100 ms or more
   after it, without a translation) before the run's first translation, the
   run starts at that translation instead of at the checkpoint: the boxes
   before it show text at rest, such as a static line whose track a moving

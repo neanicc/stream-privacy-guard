@@ -496,20 +496,24 @@ void Tracker::follow_measure(Follow& follow, const Rect& box, Timestamp frame_ti
     const bool positive = (along_x ? dx : dy) > 0.0;
     const double dt = seconds(frame_time - follow.checkpoint_time);
     const double expected = follow.speed * dt;
-    // Steady: the same way at about the run's speed. A box that moved much
-    // less or more than that (another line that took the track's place after
-    // missed cycles, an ease-out, a jump) starts a new run instead.
-    if (follow.translations > 0 && along_x == follow.along_x && positive == follow.positive &&
-        std::abs(moved - expected) <= std::max(expected / 2.0, kSteadyJitterPx)) {
+    // Steady: the same way at about the run's speed, off by less than half
+    // the move and less than half the box along it. A neighbouring line that
+    // took the track after missed cycles (IoU with a prediction capped at
+    // max_prediction) sits at least a box from where the run puts the text,
+    // however long the gap made the move.
+    const double extent = along_x ? std::min(box.width, follow.checkpoint.width)
+                                  : std::min(box.height, follow.checkpoint.height);
+    const bool same_way = follow.translations > 0 && along_x == follow.along_x && positive == follow.positive;
+    if (same_way && std::abs(moved - expected) <= std::max(std::min(expected, extent) / 2.0, kSteadyJitterPx)) {
       ++follow.translations;
     } else {
-      // A first translation, a turn or a change of speed: a new run starts,
-      // from the checkpoint it left. When a box was seen resting at the
-      // checkpoint since, the run starts at this box instead: the boxes
-      // before it show text at rest (a static line whose track a moving line
-      // took over), and hold where they were seen.
+      // A first translation or a turn: a new run starts from the checkpoint
+      // it left. A change of speed, or a box seen resting at the checkpoint
+      // since, starts it at this box instead: the boxes before it may be
+      // another line's (one this box's line took the track from, at rest or
+      // moving), and hold where they were seen.
       follow.translations = 1;
-      follow.run_start = follow.rested ? frame_time : follow.checkpoint_time;
+      follow.run_start = (follow.rested || same_way) ? frame_time : follow.checkpoint_time;
       follow.along_x = along_x;
       follow.positive = positive;
     }
