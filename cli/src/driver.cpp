@@ -415,20 +415,23 @@ SequenceResult run_realtime(const FrameSource& source, const PolicyConfig& polic
       }
       previous = t;
       const FrameView view = last.readback.view(t);
+      // The plugin's render callback makes the push and release_due calls:
+      // their time, including any wait while a worker applies a result under
+      // the lock, is what the render thread would spend. Only the calls are
+      // timed, not the CLI's bookkeeping around them.
       const auto pushing = steady::now();
       const FrameId id =
           scheduler.wants_scan(t) ? scheduler.push(t, last.source, &view) : scheduler.push(t, last.source);
-      const auto releasing = steady::now();
+      const auto pushed = steady::now();
       if (k < source.count) {
         collector.expect(id, k);
       }
       released.clear();
+      const auto releasing = steady::now();
       scheduler.release_due(released);
-      // The plugin's render callback makes these calls: their time, including
-      // any wait while a worker applies a result under the lock, is what the
-      // render thread would spend.
-      times.add(kStagePush, elapsed_ms(pushing, releasing));
-      times.add(kStageRelease, elapsed_ms(releasing, steady::now()));
+      const auto released_at = steady::now();
+      times.add(kStagePush, elapsed_ms(pushing, pushed));
+      times.add(kStageRelease, elapsed_ms(releasing, released_at));
       // Fitting waits until the feed ends: it is CLI output work the plugin
       // never does, and on this thread it delayed the next frame's push.
       for (const ReleasedFrame& r : released) {

@@ -81,12 +81,16 @@ std::shared_ptr<ScriptedDetector> face_from(std::int64_t from_ms) {
   });
 }
 
-bool covers(const spg::MaskPlan& plan, const spg::Rect& r) {
-  return plan.fallback || std::any_of(plan.rects.begin(), plan.rects.end(), [&](const spg::MaskRect& m) {
-           const spg::Rect& b = m.box.rect;
-           return b.x <= r.x && b.y <= r.y && b.x + b.width >= r.x + r.width && b.y + b.height >= r.y + r.height;
-         });
+// Whether one of the plan's rects contains `r`, whatever the plan's fallback.
+bool rects_cover(const spg::MaskPlan& plan, const spg::Rect& r) {
+  return std::any_of(plan.rects.begin(), plan.rects.end(), [&](const spg::MaskRect& m) {
+    const spg::Rect& b = m.box.rect;
+    return b.x <= r.x && b.y <= r.y && b.x + b.width >= r.x + r.width && b.y + b.height >= r.y + r.height;
+  });
 }
+
+// Whether the plan hides `r` on air: a fallback plan covers the whole source.
+bool covers(const spg::MaskPlan& plan, const spg::Rect& r) { return plan.fallback || rects_cover(plan, r); }
 
 fs::path scratch(const std::string& name) {
   const fs::path dir = fs::path(SPG_CLI_TEST_DIR) / name;
@@ -495,6 +499,8 @@ TEST_CASE("realtime plans are fitted to the compositor's rect capacity after the
   // rects of every cycle that reached it, and every plan is fitted. Every
   // cycle saw all 150 faces, so a plan with any rect had all 150 before
   // fitting. A plan with no rect was released before any cycle reached it.
+  // The rects are checked directly, fallback or not: a fallback plan's
+  // whole-source blur must not stand in for what fitting kept.
   std::size_t fitted = 0;
   for (const spg::MaskPlan& p : r.plans) {
     REQUIRE(p.rects.size() <= spg::kMaskRectCapacity);
@@ -503,7 +509,7 @@ TEST_CASE("realtime plans are fitted to the compositor's rect capacity after the
     }
     ++fitted;
     for (const spg::Detection& d : many) {
-      REQUIRE(covers(p, d.box.rect));
+      REQUIRE(rects_cover(p, d.box.rect));
     }
   }
   // At least one plan had more raw rects than the capacity and went through

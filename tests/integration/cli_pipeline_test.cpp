@@ -3,6 +3,7 @@
 // real detectors, recognizer, policy, scheduler and compositor. Skips when a
 // model is not in the cache. Nothing here is a photo or real personal data.
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -17,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "commands.hpp"
+#include "driver.hpp"
 #include "image_io.hpp"
 #include "inputs.hpp"
 #include "spg/compose.hpp"
@@ -84,7 +86,14 @@ TEST_CASE("spg-cli run masks a watch-list line, a card number and a face on the 
   // and the card appear on frame 12 and stay; a decoy line is there all along.
   constexpr std::size_t kFrames = 36;
   constexpr std::size_t kAppear = 12;
-  constexpr std::size_t kCycleFrames = 12;  // the default 200 ms simulated cycle at 60 fps
+  constexpr std::uint32_t kFps = 60;
+  // One simulated cycle in frames (the default 200 ms at kFps, so 12): the
+  // window in which the first scan after kAppear completes.
+  const std::size_t kCycleFrames = static_cast<std::size_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(*spg::cli::DriverOptions{}.cycle).count() * kFps / 1000);
+  // The decoy check below still runs on frames past the window.
+  REQUIRE(kCycleFrames > 0);
+  REQUIRE(kAppear + kCycleFrames < kFrames);
   spg::Rect entry_ink;
   spg::Rect card_ink;
   spg::Rect decoy_ink;
@@ -113,7 +122,7 @@ TEST_CASE("spg-cli run masks a watch-list line, a card number and a face on the 
     std::vector<std::string> args = {"run",     "--frames", (dir / "frames").string(), "--policy",
                                      (dir / "policy.json").string(), "--out", (dir / "plans.jsonl").string(),
                                      "--timing", (dir / "timing.json").string(), "--cache", SPG_CACHE_DIR,
-                                     "--cpu"};
+                                     "--cpu",   "--fps", std::to_string(kFps)};
     if (workers == 0) {
       args.insert(args.end(), {"--write-frames", (dir / "composed").string()});
     } else {
@@ -147,8 +156,8 @@ TEST_CASE("spg-cli run masks a watch-list line, a card number and a face on the 
       // SPG-16c) the new lines' first sighting is spread on the frames between
       // the last scan that missed them and that sighting (SPG-16d,
       // docs/scheduler.md "Masks"), which reaches the decoy 80 px above. That
-      // sighting comes from the first scan after kAppear, at most one 200 ms
-      // cycle (12 frames) later, so only frames in that window may blur it;
+      // sighting comes from the first scan after kAppear, at most one
+      // simulated cycle (kCycleFrames) later, so only frames in that window may blur it;
       // the decoy-blur metric measures that cost (#75). Two workers in step
       // spread nothing, so there the decoy is never blurred.
       if (workers != 0 || i < kAppear || i >= kAppear + kCycleFrames) {
