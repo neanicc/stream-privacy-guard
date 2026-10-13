@@ -2266,3 +2266,110 @@ Template:
   dropping margin coverage), or bounding the retro "where found" rect for
   tracks with a measured translation. Either needs the scrolling-chat leak
   test (#71). Synthetic eval only; live OBS not tested.
+
+## 2026-10-13 — SPG-16b Track fast motion between sparse detections, first slice (#84)
+
+- Method. Simulated eval (`spg-cli eval`, fixed 200 ms cycle, seed
+  20261012), CI and local modes, with `--workers 1` and `--workers 2`
+  passed to `spg-cli eval` by a wrapper around `eval/run_eval.py` (it has no
+  workers option) with the realtime suite left out: wall-clock numbers on
+  the shared Mac are noise for this change. Main 827149c and the branch were
+  scored on the same generated suites. Misses were listed per frame from the
+  plans, and tracker updates were traced with a temporary debug print (not
+  committed; boxes only, no text).
+- Cause, confirmed. With one worker, cycles land 200 ms apart. The faces
+  suite's fast face (seq-018, 35 x 48 px at about 510 px/s) moves 98 px,
+  2.8 widths, between them, so IoU 0.3 started a new track every cycle: no
+  velocity, so no prediction, back-projection or trail. A slide-in toast
+  (CI seq-006) first seen clipped at the frame edge and then near rest was
+  covered only by the linear back-projection between the two sightings,
+  which lags an ease-out slide.
+- Change, all in `core/src/track/tracker.cpp`, plus two new
+  `TrackerConfig` fields. (1) Motion gate: after the IoU pass, a detection
+  left over may join a live track of its kind left over when its center is
+  within `motion_gate_per_s * min(gap, max_prediction)` box sizes of the
+  track's last center or of the center its velocity predicts (per axis, the
+  larger extent of the two boxes), and its width and height are each within
+  `motion_size_ratio` (2) of the last box. Greedy, closest first, so every
+  IoU pair is kept. (2) Bridge: when a detection moves its track forward,
+  the hull of the last box and the new box, with the larger margin, is held
+  from the last confirmation, so a monotone move between sightings is
+  covered whatever its speed profile. Holds are untouched: every detection
+  is still held from its own frame whatever track it joins, so a wrong
+  pairing only moves masks along a wrong velocity (more blur), never ends
+  one.
+- Decision: `motion_gate_per_s` 20. Faces suite, one worker: 12 gave no
+  change (the face needs 14.3 widths a second), and 16, 20 and 30 gave the
+  same recall and leak. Local text decoy blur rose with the gate (16:
+  0.5064, 20: 0.5073, 30: 0.5103, main with two workers 0.5082). 20 leaves
+  about 40% headroom over the suite's fastest face for faster real motion,
+  and decoy blur stays below main.
+- Eval, branch against main 827149c with two workers (the default): CI
+  text identical on every recall and leak metric (watch-list 557/557,
+  first-frame 15/15, PII 590/590, leak 0/285, clean blur 0); decoy 0.4211
+  to 0.4076. Local text identical (watch-list 3996/3999, first-frame 51/53,
+  PII 4158/4162, leak 7/1919); clean blur 0.002681 to 0.002682 (+0.0003
+  pp); decoy 0.5082 to 0.5058. Faces identical (2206/2207, leak 1/1080, 0
+  clean). `scripts/ci/run.sh eval` on the branch: `THRESHOLDS: FAIL` from
+  decoy blur only, as on main (#75, #81).
+- Eval with one worker, main 827149c then branch, against two-worker main.
+  Faces leak 0.0435 (47/1080) then 0.0074 (8/1080), against 0.0009, so not
+  within the +0.2 pp gate. Face pair recall 0.9787 then 0.9964. CI text
+  leak 0.0316 (9/285) then 0.0070 (2/285), against 0, not within. CI
+  watch-list pair recall 0.9874 (550/557) then 1.0000, within. CI PII
+  0.9966 both times. Local first-frame 0.9057 (48/53) then 0.9434 (50/53),
+  against 0.9623, not within the -0.5 pp gate. Local text leak 27 then 16
+  of 1919 frames. Decoy, one worker: CI 0.3919 then 0.3841, local 0.5047
+  then 0.5073.
+- What is left, and why the tracker cannot fix it. Every remaining
+  one-worker miss beyond two-worker main is a frame before a track's first
+  sighting that is released before the second sighting lands. Faces seq-016
+  frames 1-3 and seq-018 frames 1-5: the cycle on frame 0 missed the face.
+  CI seq-001 frames 4-5, local seq-016 frames 14-17 (the extra
+  first-frame miss) and seq-026 frames 13-17: toasts first scanned near
+  rest. With a 500 ms lookahead and 200 ms cycles, a first
+  sighting on t1 is confirmed by the result for t1 + 200, which lands at
+  t1 + 400. By then the frames before t1 - 100 have aired, so the
+  back-projection and the SPG-12c trail reach only the last ~100 ms before
+  a first sighting. Two workers get a velocity from the paired cycle 16 ms
+  later, in time for the whole window. The tracker never covers frames
+  before a detection (that is the scheduler's retroactive pass), so this
+  needs a scheduler change. Rejected without building: growing a new
+  track's box on those frames by the gate's reach, which would blur most of
+  the frame for each new chat line.
+- Review follow-up (Greptile on PR #88). A gate pairing can join a new
+  object to an old track, such as a face sliding in from the right edge near
+  where another face was. The new face then inherited the old track's
+  `first_seen` and a velocity pointing the old face's way. The scheduler
+  skipped the trail to the edge that the face's own track gets, so the
+  frames it slid in on aired unblurred. A one-worker scheduler test
+  reproduced it on 23f703d; it passes with the gate off. The fix is in the
+  tracker only. A gate pairing starts a second motion estimate on the track,
+  measured from the gated detection on as the track it would otherwise have
+  started. `TrackMotion` reports that estimate once it has a velocity (the
+  whole track's until then). Held detections predict over both velocities.
+  After a late gate pairing, a later detection also bridges from that
+  estimate's last box. Limit: it does not rebuild every pairing the gate-off
+  tracker would make. Two gate pairings in a row with results out of order
+  can still differ. `docs/tracker.md` now says this instead of "a wrong
+  pairing only adds blur".
+- Staff review P2 (bridge entries). The bridge is now left out when the new
+  box lies inside the last one, whose own hold already covers it, so a box
+  at rest holds one entry per detection again. At the 60 s hold bound (600
+  detections), `masks()` took about 11 us per call for a moving box and 5 us
+  for one at rest (11 us before), Apple M4, Release build.
+- Eval after the follow-up, two workers, same seed. CI text: watch-list
+  557/557, first-frame 15/15, PII 590/590, leak 0/285, clean blur 0 (limit
+  0.03), decoy 0.4233 (main 0.4211, 23f703d 0.4076). Local text: watch-list
+  0.9992, first-frame 0.9623, PII 0.9990, leak 0.0036, clean blur 0.002682
+  (main 0.002681, limit 0.03), decoy 0.5090 (main 0.5082, 23f703d 0.5058).
+  Faces: recall 0.9995, leak 0.0009, clean blur 0. Recall and leak match
+  main on every suite. Decoy blur is 0.2 pp (CI) and 0.1 pp (local) above
+  main, because the second velocity adds blur where a pairing may be wrong.
+  Decoy blur already fails on main (#75, #81). One-worker runs were not
+  repeated.
+- Open issues or follow-ups: #84 stays open (this PR is part of it). A
+  follow-up should cover frames before a new track's first sighting with
+  one worker, or show that #85's cadence makes them coverable; #85 should
+  not switch to one worker before then. Synthetic eval only; live OBS not
+  tested.

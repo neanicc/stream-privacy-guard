@@ -30,6 +30,19 @@ struct TrackerConfig {
   // A detection joins an existing track of the same kind when its IoU with
   // the track's predicted box (or its last confirmed box) is at least this.
   float iou_threshold = 0.3F;
+  // Motion gate (SPG-16b). With one detection cycle every ~200 ms a small
+  // fast box moves more than its own size between cycles, so IoU misses it.
+  // After IoU pairing, a detection left over may join a live track of its
+  // kind left over when its center lies within
+  // motion_gate_per_s * min(gap, max_prediction) box sizes of the track's
+  // last center or of the center its velocity predicts; gap is the frame
+  // time between them, and a box size is the larger of the two boxes'
+  // widths along x and heights along y. Closest pairs first. 0 turns the
+  // gate off.
+  float motion_gate_per_s = 20.0F;
+  // The gate also needs the detection's width and height each within this
+  // factor of the track's last box, in [1, inf).
+  float motion_size_ratio = 2.0F;
   // Weight of the newest motion measurement in the velocity estimate, in
   // (0, 1]. 1 uses the last measurement only.
   float velocity_smoothing = 0.5F;
@@ -51,18 +64,26 @@ struct TrackerConfig {
 
 // Throws ContractError naming the field when a value is out of range: a
 // negative duration, a negative or non-finite margin, an IoU threshold
-// outside (0, 1], a smoothing weight outside (0, 1] or a
+// outside (0, 1], a negative or non-finite motion gate, a motion size ratio
+// below 1 or not finite, a smoothing weight outside (0, 1] or a
 // max_rects_per_track outside [1, 64]. A zero hold or margin
 // is accepted here; whether to impose a floor is #28 (SPG-08b).
 void validate(const TrackerConfig& config);
 
-// What Tracker::update() reports for one detection: the track it joined,
-// after the update.
+// What Tracker::update() reports for one detection: the motion of the track
+// it joined, after the update. When the motion gate paired that track with a
+// detection (SPG-16b), the pairing may be wrong: the detection may be a new
+// object that only came near an old track. Then, once the detections from
+// that gate pairing on have a motion measurement, those detections' motion is
+// reported, as for the new track the gated detection would otherwise have
+// started; until then, the whole track's. Either way the scheduler gets at
+// least the motion it would have had without the gate.
 struct TrackMotion {
   // The track's velocity estimate; zero for a detection that started a track
   // or joined one with no motion measurement yet.
   Velocity velocity;
-  // Frame time of the earliest detection the track has had: when it was
+  // Frame time of the earliest detection the reported motion has had: when
+  // the track (or, as above, the run since its latest gate pairing) was
   // first seen. A late detection that joins can move it earlier.
   Timestamp first_seen{};
   // A motion measurement of the track has moved both edges of its box at
@@ -88,6 +109,15 @@ struct TrackMotion {
 //   * Prediction: on frame times after td the mask also covers b moved at the
 //     track's estimated velocity for min(t - td, max_prediction), as the hull
 //     of b and the moved box, so between detection cycles the mask only grows.
+//   * Between sightings: when a detection on frame time t2 moves its track on
+//     from its last box b1 on t1 < t2, the hull of b1 and the new box, with
+//     the larger margin, is held from t1 like a detection (left out when the
+//     new box lies inside b1, which b1's own hold already covers).
+//   * Motion gate: a detection the gate pairs with a track is also measured
+//     as the track it would otherwise have started. Its held masks predict
+//     over both velocities, the bridges of both are held and TrackMotion
+//     reports that motion once it has one, so a wrong pairing never removes
+//     coverage the detection would have had without the gate.
 //   * Updates only add: masks(t) after update() contains every rect masks(t)
 //     returned before, for any t the retention still covers.
 //   * Resize: after rescale(from, to), masks(t) contains every rect masks(t)
@@ -110,8 +140,9 @@ class Tracker {
   Tracker(const Clock& clock, TrackerConfig config);
 
   // Adds the detections found on the frame with timestamp `frame_time`. Each
-  // joins the best-matching live track of its kind (greedy by IoU) or starts
-  // a new track. Detections may arrive late or out of order; an older
+  // joins the best-matching live track of its kind (greedy by IoU, then the
+  // tracks and detections left over greedy by the motion gate) or starts a
+  // new track. Detections may arrive late or out of order; an older
   // detection still holds but does not move its track (the earliest one can
   // give a track its first velocity; see TrackMotion). Validates every
   // detection first and throws ContractError (changing nothing) when one is
@@ -163,16 +194,36 @@ class Tracker {
     double margin_x = 0.0;
     double margin_y = 0.0;
   };
-  struct TrackState {
-    Track track;
-    std::vector<Held> held;
+  // What confirm() measures from a run of detections: the latest box (in
+  // frame time) and its frame time, the earliest frame time, the velocity
+  // estimate and whether the box translated (see TrackMotion).
+  struct Motion {
+    Rect box;
+    Timestamp last{};
+    Timestamp first_seen{};
+    Velocity velocity;
     bool has_velocity = false;  // a motion measurement has been taken
-    Timestamp first_seen{};     // earliest frame time of a detection it took
     bool translating = false;   // see TrackMotion::translating
+  };
+  struct TrackState {
+    Track track;  // box, velocity and last_confirmed follow `motion`
+    std::vector<Held> held;
+    Motion motion;  // of every detection the track took
+    // Of the detections from the track's latest motion-gate pairing on: the
+    // track that detection would have started without the gate. The same as
+    // `motion` until the gate pairs the track.
+    Motion since_gate;
   };
 
   [[nodiscard]] Rect predicted(const Track& track, Timestamp t) const noexcept;
-  void confirm(TrackState& state, Timestamp frame_time, const Rect& box);
+  // Adds a detection to `motion`; true when it moved the motion forward in
+  // frame time (a newer box), false for a late or same-frame one.
+  bool advance(Motion& motion, Timestamp frame_time, const Rect& box) const noexcept;
+  // `gated`: the motion gate paired the detection with the track.
+  void confirm(TrackState& state, Timestamp frame_time, const Rect& box, bool gated);
+  // Holds the hull of `from` (seen on `since`) and `to` from `since`, unless
+  // `to` lies inside `from`.
+  void bridge(TrackState& state, const Rect& from, Timestamp since, const Rect& to) const;
   [[nodiscard]] Held make_held(const Rect& box, Timestamp seen, Velocity velocity) const noexcept;
   [[nodiscard]] Rect mask_rect(const Held& held, Timestamp t) const noexcept;
 
