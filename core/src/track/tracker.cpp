@@ -81,6 +81,20 @@ Rect moved(const Rect& box, Velocity velocity, double dt) noexcept {
                          static_cast<double>(velocity.dy_per_s) * dt);
 }
 
+// Both edges of the box moved at least one pixel from `from` to `to` the way
+// `velocity` points, along the axis where it is larger (x on a tie).
+bool translated(const Rect& from, const Rect& to, Velocity velocity) noexcept {
+  const bool along_x = std::abs(velocity.dx_per_s) >= std::abs(velocity.dy_per_s);
+  const double v = static_cast<double>(along_x ? velocity.dx_per_s : velocity.dy_per_s);
+  const double from_lo = static_cast<double>(along_x ? from.x : from.y);
+  const double from_hi = from_lo + static_cast<double>(along_x ? from.width : from.height);
+  const double to_lo = static_cast<double>(along_x ? to.x : to.y);
+  const double to_hi = to_lo + static_cast<double>(along_x ? to.width : to.height);
+  const double lo = to_lo - from_lo;
+  const double hi = to_hi - from_hi;
+  return (v > 0.0 && lo >= 1.0 && hi >= 1.0) || (v < 0.0 && lo <= -1.0 && hi <= -1.0);
+}
+
 double center_x(const Rect& r) noexcept {
   return static_cast<double>(r.x) + static_cast<double>(r.width) / 2.0;
 }
@@ -187,12 +201,12 @@ Rect Tracker::predicted(const Track& track, Timestamp t) const noexcept {
 }
 
 void Tracker::update(Timestamp frame_time, std::span<const Detection> detections,
-                     std::vector<Velocity>* velocities) {
+                     std::vector<TrackMotion>* motions) {
   for (const Detection& detection : detections) {
     validate(detection);
   }
-  if (velocities != nullptr) {
-    velocities->assign(detections.size(), Velocity{});
+  if (motions != nullptr) {
+    motions->assign(detections.size(), TrackMotion{Velocity{}, frame_time});
   }
 
   // Candidate (track, detection) pairs of the same kind whose IoU clears the
@@ -235,8 +249,10 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     detection_taken[c.detection] = true;
     TrackState& state = tracks_[c.track];
     confirm(state, frame_time, detections[c.detection].box.rect);
-    if (velocities != nullptr && state.has_velocity) {
-      (*velocities)[c.detection] = state.track.velocity;
+    if (motions != nullptr) {
+      (*motions)[c.detection] = state.has_velocity
+                                    ? TrackMotion{state.track.velocity, state.first_seen, state.translating}
+                                    : TrackMotion{Velocity{}, state.first_seen, false};
     }
   }
 
@@ -251,6 +267,7 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     state.track.last_confirmed = frame_time;
     state.track.hold_until = frame_time + config_.hold;
     state.track.kind = detection.kind;
+    state.first_seen = frame_time;
     state.held.push_back(make_held(detection.box.rect, frame_time, Velocity{}));
     tracks_.push_back(std::move(state));
   }
@@ -260,9 +277,28 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
 
 void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) {
   Track& track = state.track;
+  const bool earliest = frame_time < state.first_seen;
+  state.first_seen = std::min(state.first_seen, frame_time);
   if (frame_time <= track.last_confirmed) {
     // Late or same-frame detection: it holds, predicted at the track's
     // current velocity, but does not move the track.
+    if (earliest) {
+      // Older than every detection the track has taken (cycles that finish
+      // out of order): its move to the latest box is motion no measurement
+      // has seen. The track takes that velocity when it has none, or when
+      // the move translates the box but the velocity it has does not point
+      // that way (measured near rest by results that landed first). The box
+      // does not move.
+      const double dt = seconds(track.last_confirmed - frame_time);
+      const Velocity measured{to_velocity((center_x(track.box.rect) - center_x(box)) / dt),
+                              to_velocity((center_y(track.box.rect) - center_y(box)) / dt)};
+      if (!state.has_velocity || (!translated(box, track.box.rect, track.velocity) &&
+                                  translated(box, track.box.rect, measured))) {
+        track.velocity = measured;
+        state.has_velocity = true;
+      }
+      state.translating = state.translating || translated(box, track.box.rect, track.velocity);
+    }
     state.held.push_back(make_held(box, frame_time, track.velocity));
     return;
   }
@@ -279,6 +315,9 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
     track.velocity = Velocity{to_velocity(measured_x), to_velocity(measured_y)};
     state.has_velocity = true;
   }
+  // Sticky: a later measurement at rest does not clear it, so a result that
+  // lands late is judged the same whatever arrived before it.
+  state.translating = state.translating || translated(track.box.rect, box, track.velocity);
   track.box = Box{box, Space::Source};
   track.last_confirmed = frame_time;
   track.hold_until = frame_time + config_.hold;

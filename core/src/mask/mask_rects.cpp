@@ -47,6 +47,27 @@ Rect moved(const Rect& box, Velocity velocity, double seconds) noexcept {
                     bottom(box) + dy);
 }
 
+Rect trail_to_edge(const Rect& box, Velocity velocity, Size source) noexcept {
+  double x0 = static_cast<double>(box.x);
+  double y0 = static_cast<double>(box.y);
+  double x1 = right(box);
+  double y1 = bottom(box);
+  const double vx = static_cast<double>(velocity.dx_per_s);
+  const double vy = static_cast<double>(velocity.dy_per_s);
+  if (std::abs(vx) >= std::abs(vy)) {
+    if (vx < 0.0) {
+      x1 = std::max(x1, static_cast<double>(source.width));
+    } else if (vx > 0.0) {
+      x0 = std::min(x0, 0.0);
+    }
+  } else if (vy < 0.0) {
+    y1 = std::max(y1, static_cast<double>(source.height));
+  } else if (vy > 0.0) {
+    y0 = std::min(y0, 0.0);
+  }
+  return pixel_rect(x0, y0, x1, y1);
+}
+
 Rect scale_between(const Rect& box, Size from, Size to) noexcept {
   if (from == to || from.width == 0 || from.height == 0 || to.width == 0 || to.height == 0) {
     return pixel_rect(static_cast<double>(box.x), static_cast<double>(box.y), right(box), bottom(box));

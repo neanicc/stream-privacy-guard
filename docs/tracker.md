@@ -65,6 +65,13 @@ chained resizes) and a 60 s hold with 600 held detections.
   `velocity_smoothing`. Box size follows the latest detection.
 - A detection for a frame at or before the track's last confirmation (a late
   or second result for the same frame) is held but does not move the track.
+  When it is older than every detection the track has taken (cycles that
+  finished out of order), its move to the latest box still counts as motion.
+  The track takes that velocity when it has none, or when the move
+  translates the box but the velocity it has (measured near rest by the
+  results that landed first) does not point that way. A move of both edges
+  the way the velocity points marks the track translating. The box stays as
+  it is.
 - An object that moves more than roughly half its size between detection
   cycles fails the IoU gate and starts a new track. Its detections are still
   held; only prediction is lost until the new track has a velocity.
@@ -88,10 +95,15 @@ or assert that the two agree.
 
 `masks(t)` covers detections seen at or before `t`. Applying a detection to
 buffered frames before it (retroactive masking within `retro_ms`) is the
-scheduler's job in SPG-10. `update()` can report, per detection, the velocity
-of the track it joined (zero for a new track or one with no motion
-measurement yet); since SPG-12 the scheduler uses it to back-project
-retroactive rects ([scheduler.md](scheduler.md#masks)).
+scheduler's job in SPG-10. `update()` can report, per detection, the motion
+of the track it joined (`TrackMotion`): its velocity (zero for a new track or
+one with no motion measurement yet), when the track was first seen, and
+whether a measurement has translated the box (both edges moved at least a
+pixel the way the velocity points, so a box that grows while typed or fading
+in does not count; once set, it stays set for the track). Since SPG-12 the scheduler back-projects retroactive rects
+with the velocity, and since SPG-12c it trails a translating box back to the
+frame edge on frames before the first sighting
+([scheduler.md](scheduler.md#masks)).
 
 ## Source resize
 

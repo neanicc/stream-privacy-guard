@@ -218,25 +218,141 @@ TEST_CASE("tracker: IoU association follows a moving box and estimates its veloc
   CHECK(tracks[0].box.rect == Rect{350.0F, 175.0F, 120.0F, 120.0F});
 }
 
-TEST_CASE("tracker: update reports the velocity of the track each detection joined", "[tracker]") {
+TEST_CASE("tracker: update reports the motion of the track each detection joined", "[tracker]") {
   ManualClock clock;
   Tracker tracker(clock, TrackerConfig{});
-  std::vector<spg::Velocity> velocities{{9.0F, 9.0F}};
-  // A new track has no motion measurement yet: zero.
-  tracker.update(at_ms(0), std::vector<Detection>{face(100.0F, 100.0F, 50.0F, 50.0F)}, &velocities);
-  REQUIRE(velocities.size() == 1);
-  CHECK(velocities[0] == spg::Velocity{});
+  std::vector<spg::TrackMotion> motions{{{9.0F, 9.0F}, at_ms(-5)}};
+  // A new track has no motion measurement yet: zero, first seen now.
+  tracker.update(at_ms(0), std::vector<Detection>{face(100.0F, 100.0F, 50.0F, 50.0F)}, &motions);
+  REQUIRE(motions.size() == 1);
+  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(0)});
   // The second confirmation measures 200 px/s right; a far box starts a track.
   tracker.update(at_ms(100),
                  std::vector<Detection>{face(600.0F, 600.0F, 50.0F, 50.0F), face(120.0F, 100.0F, 50.0F, 50.0F)},
-                 &velocities);
-  REQUIRE(velocities.size() == 2);
-  CHECK(velocities[0] == spg::Velocity{});
-  CHECK(std::abs(velocities[1].dx_per_s - 200.0F) < 0.01F);
-  CHECK(velocities[1].dy_per_s == 0.0F);
+                 &motions);
+  REQUIRE(motions.size() == 2);
+  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(100)});
+  CHECK(std::abs(motions[1].velocity.dx_per_s - 200.0F) < 0.01F);
+  CHECK(motions[1].velocity.dy_per_s == 0.0F);
+  CHECK(motions[1].first_seen == at_ms(0));  // the track's first detection
+  CHECK(motions[1].translating);             // both x edges moved right
+  // A late detection of the moving track, from before its first one, moves
+  // first_seen back but not the track.
+  tracker.update(at_ms(-50), std::vector<Detection>{face(110.0F, 100.0F, 50.0F, 50.0F)}, &motions);
+  REQUIRE(motions.size() == 1);
+  CHECK(motions[0].first_seen == at_ms(-50));
+  CHECK(std::abs(motions[0].velocity.dx_per_s - 200.0F) < 0.01F);
   // Without the out parameter nothing changes.
   tracker.update(at_ms(200), std::vector<Detection>{face(140.0F, 100.0F, 50.0F, 50.0F)});
   CHECK(std::abs(tracker.tracks()[0].velocity.dx_per_s - 200.0F) < 0.01F);
+}
+
+TEST_CASE("tracker: an older detection that arrives last measures the motion it saw", "[tracker]") {
+  ManualClock clock;
+  Tracker tracker(clock, TrackerConfig{});
+  std::vector<spg::TrackMotion> motions;
+  // Two cycles finish out of order: the newer one starts the track, then the
+  // older one shows the box came from 6 px to the right 30 ms before.
+  tracker.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  REQUIRE(motions.size() == 1);
+  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(280)});
+  tracker.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  REQUIRE(motions.size() == 1);
+  CHECK(motions[0].first_seen == at_ms(250));
+  CHECK(std::abs(motions[0].velocity.dx_per_s + 200.0F) < 0.01F);
+  CHECK(motions[0].velocity.dy_per_s == 0.0F);
+  CHECK(motions[0].translating);
+  // The track's box stays the newest one.
+  CHECK(tracker.tracks()[0].box.rect == Rect{900.0F, 100.0F, 200.0F, 20.0F});
+  CHECK(tracker.tracks()[0].last_confirmed == at_ms(280));
+
+  // A same-frame second result measures nothing.
+  Tracker same(clock, TrackerConfig{});
+  same.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  same.update(at_ms(280), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(280)});
+
+  // A track that already has a velocity keeps it, but an earliest detection
+  // that shows the box sliding the same way marks it translating.
+  Tracker measured(clock, TrackerConfig{});
+  measured.update(at_ms(280), std::vector<Detection>{face(900.4F, 100.0F, 200.0F, 20.0F)}, &motions);
+  measured.update(at_ms(300), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  REQUIRE(motions[0].velocity.dx_per_s < 0.0F);
+  CHECK_FALSE(motions[0].translating);  // 0.4 px
+  const spg::Velocity before = motions[0].velocity;
+  measured.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].velocity == before);
+  CHECK(motions[0].first_seen == at_ms(250));
+  CHECK(motions[0].translating);
+}
+
+TEST_CASE("tracker: a box that grows or shrinks in place is not translating", "[tracker]") {
+  ManualClock clock;
+  Tracker tracker(clock, TrackerConfig{});
+  std::vector<spg::TrackMotion> motions;
+  // Typing: the left edge stays and the box grows right, so the center moves
+  // right at half the growth rate.
+  tracker.update(at_ms(0), std::vector<Detection>{face(100.0F, 100.0F, 100.0F, 20.0F)}, &motions);
+  tracker.update(at_ms(100), std::vector<Detection>{face(100.0F, 100.0F, 120.0F, 20.0F)}, &motions);
+  REQUIRE(motions.size() == 1);
+  CHECK(motions[0].velocity.dx_per_s > 0.0F);
+  CHECK_FALSE(motions[0].translating);
+  // Fading in: the box grows on both sides.
+  tracker.update(at_ms(200), std::vector<Detection>{face(98.0F, 99.0F, 126.0F, 22.0F)}, &motions);
+  CHECK_FALSE(motions[0].translating);
+  // Then it moves up: both y edges move the way the larger velocity points.
+  tracker.update(at_ms(300), std::vector<Detection>{face(98.0F, 90.0F, 126.0F, 22.0F)}, &motions);
+  CHECK(motions[0].velocity.dy_per_s < 0.0F);
+  CHECK(std::abs(motions[0].velocity.dy_per_s) > std::abs(motions[0].velocity.dx_per_s));
+  CHECK(motions[0].translating);
+  // Once translating, it stays so: coming to rest does not clear it.
+  tracker.update(at_ms(400), std::vector<Detection>{face(98.0F, 90.0F, 126.0F, 22.0F)}, &motions);
+  CHECK(motions[0].translating);
+
+  // A shift of less than a pixel is not a translation.
+  Tracker sub_pixel(clock, TrackerConfig{});
+  sub_pixel.update(at_ms(0), std::vector<Detection>{face(98.0F, 90.0F, 126.0F, 22.0F)}, &motions);
+  sub_pixel.update(at_ms(100), std::vector<Detection>{face(98.0F, 89.5F, 126.0F, 22.0F)}, &motions);
+  CHECK(motions[0].velocity.dy_per_s < 0.0F);
+  CHECK_FALSE(motions[0].translating);
+}
+
+TEST_CASE("tracker: three results landing in reverse order still show the slide", "[tracker]") {
+  ManualClock clock;
+  Tracker tracker(clock, TrackerConfig{});
+  std::vector<spg::TrackMotion> motions;
+  // A slide-in to the left, at rest by 280: the 280 result lands first, then
+  // 270 (the same box: zero velocity), then 250, 6 px to the right.
+  tracker.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  tracker.update(at_ms(270), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  REQUIRE(motions.size() == 1);
+  CHECK(motions[0].velocity == spg::Velocity{});
+  CHECK_FALSE(motions[0].translating);
+  tracker.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].first_seen == at_ms(250));
+  CHECK(std::abs(motions[0].velocity.dx_per_s + 200.0F) < 0.01F);
+  CHECK(motions[0].translating);
+  CHECK(tracker.tracks()[0].box.rect == Rect{900.0F, 100.0F, 200.0F, 20.0F});
+
+  // The same with a velocity that points the other way (jitter at rest).
+  Tracker jitter(clock, TrackerConfig{});
+  jitter.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  jitter.update(at_ms(270), std::vector<Detection>{face(899.6F, 100.0F, 200.0F, 20.0F)}, &motions);
+  REQUIRE(motions[0].velocity.dx_per_s > 0.0F);
+  jitter.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].velocity.dx_per_s < 0.0F);
+  CHECK(motions[0].translating);
+
+  // A late result that is not the earliest, after a scan at rest: the track
+  // is still translating.
+  Tracker sticky(clock, TrackerConfig{});
+  sticky.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  sticky.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].translating);
+  sticky.update(at_ms(300), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  sticky.update(at_ms(260), std::vector<Detection>{face(902.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].first_seen == at_ms(250));
+  CHECK(motions[0].translating);
 }
 
 TEST_CASE("tracker: constant-velocity prediction covers the box ahead, capped", "[tracker]") {

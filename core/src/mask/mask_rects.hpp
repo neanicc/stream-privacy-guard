@@ -27,6 +27,15 @@ namespace spg::mask {
 // may be negative, rounded outward to whole pixels.
 [[nodiscard]] Rect moved(const Rect& box, Velocity velocity, double seconds) noexcept;
 
+// `box` stretched back along its motion to the edge of a `source`-sized frame:
+// along the axis where `velocity` is larger (x on a tie), the edge the box
+// moves away from is extended to the frame edge it came from (the right edge
+// for leftward motion, and so on). Everything `box` covered stays covered.
+// Returns `box` rounded outward when `velocity` is zero. Where a box that is
+// seen moving for the first time was on the frames before: a toast or panel
+// sliding in, which may have moved faster than the velocity measured now.
+[[nodiscard]] Rect trail_to_edge(const Rect& box, Velocity velocity, Size source) noexcept;
+
 // Smallest whole-pixel rect containing both.
 [[nodiscard]] Rect hull(const Rect& a, const Rect& b) noexcept;
 

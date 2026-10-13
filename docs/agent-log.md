@@ -2013,3 +2013,73 @@ Template:
   cadence question for SPG-16 (#17). Decoy blur (#75) needs a policy decision on hold
   semantics for confirmed moving tracks or on the margin. Synthetic eval only;
   live OBS not tested.
+
+## 2026-10-13 — SPG-12c First-frame recall on slide-ins (#76)
+
+- Diagnosis (local text suite, full profile, default seed; main `49b3813`
+  reproduces 50/53): the three first-frame misses are (1) seq-016, a toast
+  whose ease-out slide is first scanned near rest (cycles at frames 23/24,
+  -710 px/s): the static and back-projected rects missed it on frames 14-18;
+  seq-026 has the same shape at -160 px/s and 7 uncovered frames (not a
+  first-frame miss, but leak frames). (2) seq-017, a typed watch-list entry
+  with 1 of 9 characters shown on its first frame, covered 0.851 of its full
+  box against `coverage_tau` 0.90. The uncovered 11 px strip shows nothing
+  yet: pixel diff against the frame before typing is 0 of 132 pixels, and the
+  typed character is inside the mask. A scoring-rule miss (the full-box rule
+  in docs/eval.md), not aired secret pixels. (3) seq-025, a chat line whose
+  top 2-3 pixel rows of glyphs (box 60x2, then 60x3) enter on frames 88-89 of
+  90. Real pixels air (25 and 31 changed pixels), but nothing legible, and no
+  cycle can see more before the sequence ends (padding repeats frame 89).
+  Regenerating that sequence with 130 frames (same seed, same lines) covers
+  the line from its first frame on both main and head. A sequence-end
+  artifact; the scorer was not changed.
+- Decision / change: on frames before a track was first seen, a retroactive
+  box whose track translates is also trailed back to the frame edge it moves
+  away from (`mask::trail_to_edge`, along the faster axis), only on frames
+  after the last frame a complete cycle scanned before the first sighting.
+  `Tracker::update` reports `TrackMotion` (velocity, first_seen, translating)
+  instead of a bare velocity. "Translating" means the last measurement moved
+  both box edges at least 1 px the way the velocity points, so typed text
+  (one edge grows) and fade-in growth do not trail. Only adds blur; static
+  and moved rects are unchanged.
+- Rejected with evidence: an ungated trail (every moving track, every frame
+  before first sighting in retro) gave the same recall but decoy +18 pairs
+  (two fading windows +11, scrolling chat +7). Bounding by the last scanned
+  frame removed the chat's +7 and left the windows' +11; the 1 px
+  translation rule removed one window (+7). Net +3: seq-008 +4 (a fading
+  window whose box shifted 1 px between the paired cycles) and chat -1 (a
+  different hull merge of one frame's rects). A displacement-over-margin
+  gate would have dropped the seq-026 toast (2.6 px between the paired
+  cycles, margin about 12 px).
+- Eval (local text suite, head vs main on the same generated suite):
+  watch-list first-frame 0.9434 -> 0.9623 (50/53 -> 51/53, PASS), watch-list
+  pair 0.9980 -> 0.9992, PII pair 0.9974 -> 0.9990, leak 0.0099 -> 0.0036
+  (19 -> 7 frames), clean blur 0.0027 (=), decoy 0.5086 -> 0.5092 (+3 pairs,
+  still FAIL, #75). CI mode: every text metric identical to main (decoy
+  0.4054 FAIL on both). Faces suite identical (0.9995 / 0.0009 / 0). Realtime
+  (dev Mac under heavy load from other processes): fail-closed 1.000 on both
+  builds in two interleaved pairs, p95 latency 1014/1059 ms main vs
+  1046/1127 ms head, within run-to-run noise; SPG-16 owns it.
+- Review fix (Greptile): with two workers the paired cycles can finish out
+  of order. The newer result started the track with no motion and the older
+  one only moved `first_seen` back, so the next cycle, near rest, measured
+  0.4 px and never marked the track translating: no trail. A late detection
+  older than all of a track's others now counts its move to the latest box:
+  a track with no velocity takes it, and a translation the way the velocity
+  points sets `translating`. The track's box and a measured velocity do not
+  change. Eval is unchanged: the simulated suites use a fixed cycle, so
+  cycles finish in start order (CI-mode text metrics identical).
+- Review fix (staff review, two P2s): when three results land in reverse
+  order, the first two can measure a zero or opposite velocity at rest. The
+  earliest result now takes its own velocity when its move translates the box
+  and the track's does not. `translating` is now sticky for the life of a
+  track, so a scan at rest no longer clears it before a late result for an
+  earlier frame is applied. Local text and faces suites are identical to the
+  previous head (first-frame 51/53, leak 7, decoy 0.5092); CI-mode text is
+  identical too.
+- Open issues or follow-ups: misses (2) and (3) remain and are recorded as
+  scoring artifacts; the metric passes by one instance (51/53 against 0.95).
+  Whether the first-frame metric should use the revealed part of a typed
+  entry, or skip instances with no legible height in a sequence's last
+  frames, is a human scorer decision (docs/eval.md). Synthetic eval only;
+  live OBS not tested.

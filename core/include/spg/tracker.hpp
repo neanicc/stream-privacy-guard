@@ -56,6 +56,28 @@ struct TrackerConfig {
 // is accepted here; whether to impose a floor is #28 (SPG-08b).
 void validate(const TrackerConfig& config);
 
+// What Tracker::update() reports for one detection: the track it joined,
+// after the update.
+struct TrackMotion {
+  // The track's velocity estimate; zero for a detection that started a track
+  // or joined one with no motion measurement yet.
+  Velocity velocity;
+  // Frame time of the earliest detection the track has had: when it was
+  // first seen. A late detection that joins can move it earlier.
+  Timestamp first_seen{};
+  // A motion measurement of the track has moved both edges of its box at
+  // least one pixel the same way along the axis its velocity is larger on (x
+  // on a tie), in the direction of the velocity: the box translated (it slid
+  // or scrolled), not grew or shrank as text does while it fades in or is
+  // typed, nor shifted by less than a mask pixel. Sticky: once set it stays
+  // set for the life of the track, so results that land out of order see the
+  // same answer. False with no measurement yet. A late detection older than
+  // all the track's others also counts its move to the latest box.
+  bool translating = false;
+
+  friend bool operator==(const TrackMotion&, const TrackMotion&) = default;
+};
+
 // Follows detections across frames and answers which Source-space regions
 // must be masked on the frame with a given timestamp.
 //
@@ -90,17 +112,16 @@ class Tracker {
   // Adds the detections found on the frame with timestamp `frame_time`. Each
   // joins the best-matching live track of its kind (greedy by IoU) or starts
   // a new track. Detections may arrive late or out of order; an older
-  // detection still holds but does not move its track. Validates every
+  // detection still holds but does not move its track (the earliest one can
+  // give a track its first velocity; see TrackMotion). Validates every
   // detection first and throws ContractError (changing nothing) when one is
   // invalid or not in Source space. Then drops expired detections.
   //
-  // When `velocities` is not null it is resized to detections.size() and
-  // entry i receives the velocity of the track detection i joined, after the
-  // update: the track's estimate when it has one, zero for a detection that
-  // started a track or joined one with no motion measurement yet. The
-  // scheduler back-projects retroactive masks with it.
+  // When `motions` is not null it is resized to detections.size() and entry
+  // i receives the motion of the track detection i joined, after the update
+  // (see TrackMotion). The scheduler back-projects retroactive masks with it.
   void update(Timestamp frame_time, std::span<const Detection> detections,
-              std::vector<Velocity>* velocities = nullptr);
+              std::vector<TrackMotion>* motions = nullptr);
 
   // Source-space rects to mask on the frame with timestamp `t`: per track, the
   // hull of each time bucket's held masks (see max_rects_per_track). A rect
@@ -146,6 +167,8 @@ class Tracker {
     Track track;
     std::vector<Held> held;
     bool has_velocity = false;  // a motion measurement has been taken
+    Timestamp first_seen{};     // earliest frame time of a detection it took
+    bool translating = false;   // see TrackMotion::translating
   };
 
   [[nodiscard]] Rect predicted(const Track& track, Timestamp t) const noexcept;
