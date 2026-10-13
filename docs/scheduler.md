@@ -173,9 +173,9 @@ was first scanned 100 ms after it appeared, and the static rect covered only
 
 A constant velocity under-projects an ease-out slide: it is first seen near
 rest, much slower than it came in. So on a frame before its track was first
-seen (`TrackMotion::first_seen`), a box whose track is translating (its last
-measurement moved both edges at least a pixel the way the velocity points, so
-it slid or scrolled rather than grew while typed or faded in) is also
+seen (`TrackMotion::first_seen`), a box whose track is translating (a
+measurement has moved both edges at least a pixel the way the velocity points,
+so it slid or scrolled rather than grew while typed or faded in) is also
 **trailed** back to the frame edge it moves away from, along the axis it moves
 most on (`mask::trail_to_edge`), with the margin. Only frames after the last
 frame a complete cycle scanned before that first sighting get the trail: that

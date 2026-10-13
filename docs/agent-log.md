@@ -2069,6 +2069,14 @@ Template:
   points sets `translating`. The track's box and a measured velocity do not
   change. Eval is unchanged: the simulated suites use a fixed cycle, so
   cycles finish in start order (CI-mode text metrics identical).
+- Review fix (staff review, two P2s): when three results land in reverse
+  order, the first two can measure a zero or opposite velocity at rest. The
+  earliest result now takes its own velocity when its move translates the box
+  and the track's does not. `translating` is now sticky for the life of a
+  track, so a scan at rest no longer clears it before a late result for an
+  earlier frame is applied. Local text and faces suites are identical to the
+  previous head (first-frame 51/53, leak 7, decoy 0.5092); CI-mode text is
+  identical too.
 - Open issues or follow-ups: misses (2) and (3) remain and are recorded as
   scoring artifacts; the metric passes by one instance (51/53 against 0.95).
   Whether the first-frame metric should use the revealed part of a typed

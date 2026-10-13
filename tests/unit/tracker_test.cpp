@@ -305,10 +305,54 @@ TEST_CASE("tracker: a box that grows or shrinks in place is not translating", "[
   CHECK(motions[0].velocity.dy_per_s < 0.0F);
   CHECK(std::abs(motions[0].velocity.dy_per_s) > std::abs(motions[0].velocity.dx_per_s));
   CHECK(motions[0].translating);
+  // Once translating, it stays so: coming to rest does not clear it.
+  tracker.update(at_ms(400), std::vector<Detection>{face(98.0F, 90.0F, 126.0F, 22.0F)}, &motions);
+  CHECK(motions[0].translating);
+
   // A shift of less than a pixel is not a translation.
-  tracker.update(at_ms(400), std::vector<Detection>{face(98.0F, 89.5F, 126.0F, 22.0F)}, &motions);
+  Tracker sub_pixel(clock, TrackerConfig{});
+  sub_pixel.update(at_ms(0), std::vector<Detection>{face(98.0F, 90.0F, 126.0F, 22.0F)}, &motions);
+  sub_pixel.update(at_ms(100), std::vector<Detection>{face(98.0F, 89.5F, 126.0F, 22.0F)}, &motions);
   CHECK(motions[0].velocity.dy_per_s < 0.0F);
   CHECK_FALSE(motions[0].translating);
+}
+
+TEST_CASE("tracker: three results landing in reverse order still show the slide", "[tracker]") {
+  ManualClock clock;
+  Tracker tracker(clock, TrackerConfig{});
+  std::vector<spg::TrackMotion> motions;
+  // A slide-in to the left, at rest by 280: the 280 result lands first, then
+  // 270 (the same box: zero velocity), then 250, 6 px to the right.
+  tracker.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  tracker.update(at_ms(270), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  REQUIRE(motions.size() == 1);
+  CHECK(motions[0].velocity == spg::Velocity{});
+  CHECK_FALSE(motions[0].translating);
+  tracker.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].first_seen == at_ms(250));
+  CHECK(std::abs(motions[0].velocity.dx_per_s + 200.0F) < 0.01F);
+  CHECK(motions[0].translating);
+  CHECK(tracker.tracks()[0].box.rect == Rect{900.0F, 100.0F, 200.0F, 20.0F});
+
+  // The same with a velocity that points the other way (jitter at rest).
+  Tracker jitter(clock, TrackerConfig{});
+  jitter.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  jitter.update(at_ms(270), std::vector<Detection>{face(899.6F, 100.0F, 200.0F, 20.0F)}, &motions);
+  REQUIRE(motions[0].velocity.dx_per_s > 0.0F);
+  jitter.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].velocity.dx_per_s < 0.0F);
+  CHECK(motions[0].translating);
+
+  // A late result that is not the earliest, after a scan at rest: the track
+  // is still translating.
+  Tracker sticky(clock, TrackerConfig{});
+  sticky.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  sticky.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].translating);
+  sticky.update(at_ms(300), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  sticky.update(at_ms(260), std::vector<Detection>{face(902.0F, 100.0F, 200.0F, 20.0F)}, &motions);
+  CHECK(motions[0].first_seen == at_ms(250));
+  CHECK(motions[0].translating);
 }
 
 TEST_CASE("tracker: constant-velocity prediction covers the box ahead, capped", "[tracker]") {

@@ -65,13 +65,14 @@ struct TrackMotion {
   // Frame time of the earliest detection the track has had: when it was
   // first seen. A late detection that joins can move it earlier.
   Timestamp first_seen{};
-  // The track's last motion measurement moved both edges of its box at least
-  // one pixel the same way along the axis its velocity is larger on (x on a
-  // tie), in the direction of the velocity: the box translated (it slid or
-  // scrolled), not grew or shrank as text does while it fades in or is
-  // typed, nor shifted by less than a mask pixel. False with no measurement
-  // yet. A late detection older than all the track's others also counts its
-  // move to the latest box (results that finished out of order).
+  // A motion measurement of the track has moved both edges of its box at
+  // least one pixel the same way along the axis its velocity is larger on (x
+  // on a tie), in the direction of the velocity: the box translated (it slid
+  // or scrolled), not grew or shrank as text does while it fades in or is
+  // typed, nor shifted by less than a mask pixel. Sticky: once set it stays
+  // set for the life of the track, so results that land out of order see the
+  // same answer. False with no measurement yet. A late detection older than
+  // all the track's others also counts its move to the latest box.
   bool translating = false;
 
   friend bool operator==(const TrackMotion&, const TrackMotion&) = default;

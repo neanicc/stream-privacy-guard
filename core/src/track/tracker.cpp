@@ -285,13 +285,16 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
     if (earliest) {
       // Older than every detection the track has taken (cycles that finish
       // out of order): its move to the latest box is motion no measurement
-      // has seen. A track without a velocity takes it; either way the move
-      // can show a translation. Neither the box nor a measured velocity
-      // changes.
+      // has seen. The track takes that velocity when it has none, or when
+      // the move translates the box but the velocity it has does not point
+      // that way (measured near rest by results that landed first). The box
+      // does not move.
       const double dt = seconds(track.last_confirmed - frame_time);
-      if (!state.has_velocity) {
-        track.velocity = Velocity{to_velocity((center_x(track.box.rect) - center_x(box)) / dt),
-                                  to_velocity((center_y(track.box.rect) - center_y(box)) / dt)};
+      const Velocity measured{to_velocity((center_x(track.box.rect) - center_x(box)) / dt),
+                              to_velocity((center_y(track.box.rect) - center_y(box)) / dt)};
+      if (!state.has_velocity || (!translated(box, track.box.rect, track.velocity) &&
+                                  translated(box, track.box.rect, measured))) {
+        track.velocity = measured;
         state.has_velocity = true;
       }
       state.translating = state.translating || translated(box, track.box.rect, track.velocity);
@@ -312,7 +315,9 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
     track.velocity = Velocity{to_velocity(measured_x), to_velocity(measured_y)};
     state.has_velocity = true;
   }
-  state.translating = translated(track.box.rect, box, track.velocity);
+  // Sticky: a later measurement at rest does not clear it, so a result that
+  // lands late is judged the same whatever arrived before it.
+  state.translating = state.translating || translated(track.box.rect, box, track.velocity);
   track.box = Box{box, Space::Source};
   track.last_confirmed = frame_time;
   track.hold_until = frame_time + config_.hold;
