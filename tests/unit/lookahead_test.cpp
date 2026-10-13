@@ -1544,6 +1544,12 @@ TEST_CASE("mask rect helpers round outward", "[schedule]") {
   const Rect s = spg::mask::scale_between(Rect{1, 1, 1, 1}, Size{3, 3}, Size{4, 4});
   CHECK(contains(s, Rect{4.0F / 3.0F, 4.0F / 3.0F, 4.0F / 3.0F, 4.0F / 3.0F}));
   CHECK(spg::mask::hull(Rect{0, 0, 1, 1}, Rect{5, 5, 1, 1}) == Rect{0, 0, 6, 6});
+  // moved(): back in time (negative seconds) and rounded outward.
+  CHECK(spg::mask::moved(Rect{100, 50, 20, 10}, spg::Velocity{-1000.0F, 200.0F}, -0.06) ==
+        Rect{160, 38, 20, 10});
+  const Rect m = spg::mask::moved(Rect{100, 50, 20, 10}, spg::Velocity{10.0F, -10.0F}, 0.025);
+  CHECK(m == Rect{100, 49, 21, 11});
+  CHECK(contains(m, Rect{100.25F, 49.75F, 20, 10}));
   // NaN edges cover rather than vanish.
   const Rect nan_rect = spg::mask::pixel_rect(std::nan(""), 0, 5, 5);
   CHECK(nan_rect.width > 1e6F);
