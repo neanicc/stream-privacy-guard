@@ -267,6 +267,110 @@ TEST_CASE("tile_crops examples and errors", "[text][tiles]") {
   CHECK_THROWS_AS(spg::detect::tile_crops({10, 10}, 640, 640), spg::detect::TextDetectorError);
 }
 
+TEST_CASE("tile_crops takes rectangular tiles", "[text][tiles]") {
+  // The default text tile holds a whole 1080p readback.
+  CHECK(spg::detect::tile_crops({1920, 1080}, Size{1920, 1088}, 64) == std::vector<Rect>{{0, 0, 1920, 1080}});
+  CHECK(spg::detect::tile_crops({1280, 720}, Size{1920, 1088}, 64) == std::vector<Rect>{{0, 0, 1280, 720}});
+  CHECK(spg::detect::tile_crops({3840, 2160}, Size{1920, 1088}, 64).size() == 3 * 3);
+  CHECK_THROWS_AS(spg::detect::tile_crops({10, 10}, Size{1920, 64}, 64), spg::detect::TextDetectorError);
+  // Each axis follows its own side, as square tiles of that side would.
+  std::mt19937 rng(1616);
+  std::uniform_int_distribution<std::uint32_t> side(1, 4000);
+  std::uniform_int_distribution<std::uint32_t> tile_steps(2, 60);
+  for (int trial = 0; trial < 500; ++trial) {
+    const Size frame{side(rng), side(rng)};
+    const Size tile{32 * tile_steps(rng), 32 * tile_steps(rng)};
+    const std::uint32_t overlap =
+        std::uniform_int_distribution<std::uint32_t>(0, std::min(tile.width, tile.height) - 1)(rng);
+    const auto crops = spg::detect::tile_crops(frame, tile, overlap);
+    const auto wide = spg::detect::tile_crops(frame, tile.width, overlap);
+    const auto tall = spg::detect::tile_crops(frame, tile.height, overlap);
+    std::vector<float> xs;
+    std::vector<float> ys;
+    for (const Rect& c : crops) {
+      xs.push_back(c.x);
+      ys.push_back(c.y);
+      REQUIRE(c.width == static_cast<float>(std::min(frame.width, tile.width)));
+      REQUIRE(c.height == static_cast<float>(std::min(frame.height, tile.height)));
+    }
+    const auto starts = [](const std::vector<Rect>& rects, bool x) {
+      std::vector<float> out;
+      for (const Rect& r : rects) {
+        out.push_back(x ? r.x : r.y);
+      }
+      std::sort(out.begin(), out.end());
+      out.erase(std::unique(out.begin(), out.end()), out.end());
+      return out;
+    };
+    std::sort(xs.begin(), xs.end());
+    xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+    std::sort(ys.begin(), ys.end());
+    ys.erase(std::unique(ys.begin(), ys.end()), ys.end());
+    REQUIRE(xs == starts(wide, true));
+    REQUIRE(ys == starts(tall, false));
+    REQUIRE(xs.size() * ys.size() == crops.size());
+  }
+}
+
+TEST_CASE("The default text tile: one run up to 1080p, nine at scale 1 for 4K", "[text][tiles]") {
+  const spg::detect::TextDetectorConfig config;
+  const Size tile{config.tile_width, config.tile_height};
+  for (const Size frame : {Size{1920, 1080}, Size{1280, 720}, Size{960, 540}, Size{640, 360}}) {
+    INFO(frame.width << "x" << frame.height);
+    CHECK(spg::detect::tile_crops(frame, tile, config.tile_overlap).size() == 1);
+  }
+  const auto crops = spg::detect::tile_crops({3840, 2160}, tile, config.tile_overlap);
+  REQUIRE(crops.size() == 9);
+  std::vector<float> xs;
+  std::vector<float> ys;
+  for (const Rect& c : crops) {
+    CHECK(c.width == static_cast<float>(config.tile_width));
+    CHECK(c.height == 1088.0F);
+    const auto m = spg::detect::tile_input_mapping(c, tile, config.upscale_side);
+    CHECK(m.scale_x() == 1.0);
+    CHECK(m.scale_y() == 1.0);
+    xs.push_back(c.x);
+    ys.push_back(c.y);
+  }
+  const auto axis = [&](std::vector<float> starts, float span, float length) {
+    std::sort(starts.begin(), starts.end());
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    REQUIRE(starts.size() == 3);
+    CHECK(starts.front() == 0.0F);
+    CHECK(starts.back() + span == length);
+    for (std::size_t i = 1; i < starts.size(); ++i) {
+      CHECK(starts[i - 1] + span - starts[i] >= static_cast<float>(config.tile_overlap));
+    }
+  };
+  axis(xs, 1920.0F, 3840.0F);
+  axis(ys, 1088.0F, 2160.0F);
+}
+
+TEST_CASE("tile_input_mapping scales a crop up only to upscale_side", "[text][tiles]") {
+  using spg::detect::tile_input_mapping;
+  const Size tile{1920, 1088};
+  CHECK(tile_input_mapping({0, 0, 1920, 1080}, tile, 640).scale_x() == 1.0);
+  CHECK(tile_input_mapping({0, 0, 1280, 720}, tile, 640).scale_x() == 1.0);
+  CHECK(tile_input_mapping({0, 0, 960, 540}, tile, 640).scale_x() == 1.0);
+  CHECK(tile_input_mapping({0, 0, 320, 160}, tile, 640).scale_x() == 2.0);
+  // Never past what the tile holds.
+  CHECK(tile_input_mapping({0, 0, 100, 1000}, Size{640, 1088}, 8192).scale_x() == Approx(1.088));
+  // Content stays at the origin; the rest is padding.
+  const auto m = tile_input_mapping({0, 0, 960, 540}, tile, 640);
+  CHECK(m.pad_x() == 0.0);
+  CHECK(m.pad_y() == 0.0);
+  // For a crop no larger than a square tile, the same scale as before SPG-16.
+  std::mt19937 rng(1617);
+  std::uniform_int_distribution<int> side(1, 640);
+  for (int trial = 0; trial < 500; ++trial) {
+    const Rect crop{0.0F, 0.0F, static_cast<float>(side(rng)), static_cast<float>(side(rng))};
+    const auto old = tile_input_mapping(crop, 640U);
+    const auto now = tile_input_mapping(crop, tile, 640);
+    REQUIRE(now.scale_x() == Approx(old.scale_x()).epsilon(1e-12));
+    REQUIRE(now.scale_y() == Approx(old.scale_y()).epsilon(1e-12));
+  }
+}
+
 TEST_CASE("Tile boxes map to Source space through the tile's mapping", "[text][tiles]") {
   const Size source{1920, 1080};
   const Size readback{960, 540};
@@ -504,22 +608,35 @@ TEST_CASE("TextDetectorConfig is validated", "[text][config]") {
   using spg::detect::TextDetectorError;
   CHECK_NOTHROW(spg::detect::validate(TextDetectorConfig{}));
   TextDetectorConfig config;
-  config.tile_size = 100;
+  config.tile_width = 100;
   CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
   config = {};
-  config.tile_size = 0;
+  config.tile_height = 0;
   CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
   config = {};
+  config.tile_height = 1080;  // not a multiple of 32
+  CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
+  config = {};
+  config.tile_width = 8192 + 32;
+  CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
+  // Overlap is capped at half the shorter tile side: 639 of a 640 tile would
+  // mean 1281 x 441 model runs for one 1920x1080 frame.
+  config = {};
+  config.tile_width = 640;
+  config.tile_height = 640;
   config.tile_overlap = 640;
   CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
-  // Overlap is capped at half a tile: 639 of 640 would mean 1281 x 441 model
-  // runs for one 1920x1080 frame.
-  config = {};
   config.tile_overlap = 320;
   CHECK_NOTHROW(spg::detect::validate(config));
   config.tile_overlap = 321;
   CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
   config.tile_overlap = 639;
+  CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
+  // The default 1920 x 1088 tile: half of 1088.
+  config = {};
+  config.tile_overlap = 544;
+  CHECK_NOTHROW(spg::detect::validate(config));
+  config.tile_overlap = 545;
   CHECK_THROWS_AS(spg::detect::validate(config), TextDetectorError);
   config = {};
   config.merge_line_overlap = 0.0F;

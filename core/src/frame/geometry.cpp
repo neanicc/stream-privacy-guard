@@ -150,6 +150,25 @@ ReadbackMapping::ReadbackMapping(Size source, Size readback) : source_(source), 
   }
 }
 
+ModelInputMapping::ModelInputMapping(Rect crop, Size input, Fit fit, double max_scale)
+    : ModelInputMapping(crop, input, fit) {
+  if (fit == Fit::Stretch) {
+    throw ContractError("geometry: a scale cap needs a letterbox fit");
+  }
+  if (!std::isfinite(max_scale) || max_scale <= 0.0) {
+    throw ContractError("geometry: model input scale cap must be positive and finite");
+  }
+  if (scale_x_ <= max_scale) {
+    return;
+  }
+  scale_x_ = max_scale;
+  scale_y_ = max_scale;
+  if (fit == Fit::LetterboxCenter) {
+    pad_x_ = (static_cast<double>(input.width) - static_cast<double>(crop.width) * max_scale) / 2.0;
+    pad_y_ = (static_cast<double>(input.height) - static_cast<double>(crop.height) * max_scale) / 2.0;
+  }
+}
+
 ModelInputMapping::ModelInputMapping(Rect crop, Size input, Fit fit)
     : crop_(crop), input_(input), fit_(fit) {
   if (!is_valid(crop) || crop.width <= 0.0F || crop.height <= 0.0F) {

@@ -39,7 +39,12 @@ struct SchedulerConfig {
   Duration scan_interval{0};
   // Bounded scan queue: when full, the oldest queued job is dropped.
   std::size_t queue_capacity = 1;
-  // Worker threads (Scheduler only).
+  // Worker threads (Scheduler only). Two take frames 16 ms apart and finish
+  // close together, so the second adds little scan coverage and shares the
+  // GPU and CPU with the first. It is kept because the tracker gets its
+  // velocities from such pairs: with one worker on the dev Mac (SPG-16) the
+  // realtime suite came close to its limits, but fast small faces and
+  // slide-in notifications leaked in the eval suites (agent-log SPG-16).
   std::size_t workers = 2;
   // When more frames than this are buffered, the oldest is released early,
   // under the same coverage rule.

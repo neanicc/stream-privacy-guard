@@ -74,7 +74,9 @@ set_tests_properties(cli.rejects-no-arguments PROPERTIES WILL_FAIL TRUE)
 # spg-cli commands and drivers (SPG-11) and scrub (SPG-18), in process. The
 # unit cases use fake stages; the model cases run the pinned models and skip
 # when they are not cached. Frames are written under the build tree.
-add_executable(spg-cli-tests unit/cli_test.cpp unit/scrub_test.cpp)
+# fail_alloc.cpp replaces operator new here too, so a test can fail the
+# allocations that record a stage's time.
+add_executable(spg-cli-tests unit/cli_test.cpp unit/scrub_test.cpp unit/fail_alloc.cpp)
 target_link_libraries(spg-cli-tests PRIVATE spg-cli-lib nlohmann_json::nlohmann_json Catch2::Catch2WithMain)
 target_include_directories(spg-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/unit")
 target_compile_definitions(spg-cli-tests PRIVATE SPG_CLI_TEST_DIR="${CMAKE_CURRENT_BINARY_DIR}/cli-tmp")
@@ -126,6 +128,7 @@ if(SPG_WITH_DEPS)
   set(_spg_runtime_fixture_script "${CMAKE_CURRENT_SOURCE_DIR}/integration/make_runtime_fixtures.py")
   add_custom_command(
     OUTPUT "${_spg_runtime_fixtures}/scale_static.onnx" "${_spg_runtime_fixtures}/scale_dynamic.onnx"
+           "${_spg_runtime_fixtures}/scale_square.onnx" "${_spg_runtime_fixtures}/scale_unnamed.onnx"
            "${_spg_runtime_fixtures}/not_a_model.onnx" "${_spg_runtime_fixtures}/models.txt"
            "${_spg_runtime_fixtures}/text_wrong_shape.onnx" "${_spg_runtime_fixtures}/text_sqrt.onnx"
            "${_spg_runtime_fixtures}/rec_softmax.onnx" "${_spg_runtime_fixtures}/rec_sqrt.onnx"

@@ -34,17 +34,18 @@ bool fits(std::int64_t dim, std::int64_t want) {
   return dim < 0 || dim == want;
 }
 
-void check_model(const runtime::Session& session, std::uint32_t tile) {
-  const auto side = static_cast<std::int64_t>(tile);
+void check_model(const runtime::Session& session, Size tile) {
+  const auto rows = static_cast<std::int64_t>(tile.height);
+  const auto cols = static_cast<std::int64_t>(tile.width);
   const auto& inputs = session.inputs();
   if (inputs.size() != 1 || !inputs[0].float32) {
     throw TextDetectorError("text detector: expected one float32 input, model has " +
                             std::to_string(inputs.size()) + " input(s)");
   }
   const auto& in = inputs[0].shape;
-  if (in.size() != 4 || !fits(in[0], 1) || in[1] != 3 || !fits(in[2], side) || !fits(in[3], side)) {
+  if (in.size() != 4 || !fits(in[0], 1) || in[1] != 3 || !fits(in[2], rows) || !fits(in[3], cols)) {
     throw TextDetectorError("text detector: input '" + inputs[0].name + "' has shape " + shape_text(in) +
-                            ", expected [1, 3, " + std::to_string(tile) + ", " + std::to_string(tile) +
+                            ", expected [1, 3, " + std::to_string(rows) + ", " + std::to_string(cols) +
                             "] or dynamic");
   }
   const auto& outputs = session.outputs();
@@ -53,9 +54,9 @@ void check_model(const runtime::Session& session, std::uint32_t tile) {
                             std::to_string(outputs.size()) + " output(s)");
   }
   const auto& out = outputs[0].shape;
-  if (out.size() != 4 || !fits(out[0], 1) || !fits(out[1], 1) || !fits(out[2], side) || !fits(out[3], side)) {
+  if (out.size() != 4 || !fits(out[0], 1) || !fits(out[1], 1) || !fits(out[2], rows) || !fits(out[3], cols)) {
     throw TextDetectorError("text detector: output '" + outputs[0].name + "' has shape " + shape_text(out) +
-                            ", expected [1, 1, " + std::to_string(tile) + ", " + std::to_string(tile) +
+                            ", expected [1, 1, " + std::to_string(rows) + ", " + std::to_string(cols) +
                             "] or dynamic; is it a DBNet detector?");
   }
 }
@@ -94,11 +95,20 @@ bool same_line(const TileDetection& a, const TileDetection& b, float line_overla
 }  // namespace
 
 void validate(const TextDetectorConfig& config) {
-  if (config.tile_size < kInputDivisor || config.tile_size > kMaxTile || config.tile_size % kInputDivisor != 0) {
-    throw TextDetectorError("text detector: tile_size must be a multiple of 32 in [32, 8192]");
+  const auto side_ok = [](std::uint32_t side) {
+    return side >= kInputDivisor && side <= kMaxTile && side % kInputDivisor == 0;
+  };
+  if (!side_ok(config.tile_width)) {
+    throw TextDetectorError("text detector: tile_width must be a multiple of 32 in [32, 8192]");
   }
-  if (config.tile_overlap > config.tile_size / 2) {
-    throw TextDetectorError("text detector: tile_overlap must be at most tile_size / 2");
+  if (!side_ok(config.tile_height)) {
+    throw TextDetectorError("text detector: tile_height must be a multiple of 32 in [32, 8192]");
+  }
+  if (config.tile_overlap > std::min(config.tile_width, config.tile_height) / 2) {
+    throw TextDetectorError("text detector: tile_overlap must be at most half the shorter tile side");
+  }
+  if (config.upscale_side < 1 || config.upscale_side > kMaxTile) {
+    throw TextDetectorError("text detector: upscale_side must be in [1, 8192]");
   }
   if (!(std::isfinite(config.merge_line_overlap) && config.merge_line_overlap > 0.0F &&
         config.merge_line_overlap <= 1.0F)) {
@@ -112,6 +122,10 @@ void validate(const TextDetectorConfig& config) {
 }
 
 std::vector<Rect> tile_crops(Size readback, std::uint32_t tile, std::uint32_t overlap) {
+  return tile_crops(readback, Size{tile, tile}, overlap);
+}
+
+std::vector<Rect> tile_crops(Size readback, Size tile, std::uint32_t overlap) {
   try {
     return grid_crops(readback, tile, overlap);
   } catch (const std::invalid_argument& error) {
@@ -121,6 +135,12 @@ std::vector<Rect> tile_crops(Size readback, std::uint32_t tile, std::uint32_t ov
 
 ModelInputMapping tile_input_mapping(const Rect& crop, std::uint32_t tile) {
   return ModelInputMapping(crop, Size{tile, tile}, Fit::LetterboxTopLeft);
+}
+
+ModelInputMapping tile_input_mapping(const Rect& crop, Size tile, std::uint32_t upscale_side) {
+  const double longer = std::max(static_cast<double>(crop.width), static_cast<double>(crop.height));
+  const double up = longer > 0.0 ? static_cast<double>(upscale_side) / longer : 1.0;
+  return ModelInputMapping(crop, tile, Fit::LetterboxTopLeft, std::max(1.0, up));
 }
 
 std::vector<float> to_text_input_tensor(const BgrImage& image) {
@@ -208,14 +228,37 @@ std::vector<Detection> merge_across_tiles(std::span<const TileDetection> detecti
 
 namespace {
 
-// Validates `config` before paying for a session and gives a default warmup.
+// Validates `config` before paying for a session, fixes the input to the one
+// tile shape detect() runs, and gives a default warmup. Every run is one
+// tile, so fixing the shape costs nothing, and it is what lets Core ML take
+// the graph: with the PP-OCR model's dynamic input it ran almost wholly on CPU
+// (SPG-16: about 50 ms per 640 x 640 tile on the dev Mac, 18 ms fixed).
 runtime::SessionOptions detector_options(const TextDetectorConfig& config, runtime::SessionOptions options) {
   validate(config);
+  const std::vector<std::int64_t> tile{1, 3, static_cast<std::int64_t>(config.tile_height),
+                                       static_cast<std::int64_t>(config.tile_width)};
+  if (options.fixed_shapes.empty()) {
+    options.fixed_shapes = {tile};
+  }
   if (options.warmup_shapes.empty()) {
-    const auto side = static_cast<std::int64_t>(config.tile_size);
-    options.warmup_shapes = {{1, 3, side, side}};
+    options.warmup_shapes = {tile};
   }
   return options;
+}
+
+// Session::open for the detector: a model whose input cannot take the tile
+// shape (InvalidInput while fixing or warming it up) is not a DBNet detector
+// for this config, which open() reports as TextDetectorError.
+template <class Model>
+runtime::Session open_session(runtime::Environment& env, const Model& model, const runtime::SessionOptions& options) {
+  try {
+    return runtime::Session::open(env, model, options);
+  } catch (const runtime::RuntimeError& error) {
+    if (error.code() == runtime::ErrorCode::InvalidInput) {
+      throw TextDetectorError(std::string("text detector: the model does not take the tile shape: ") + error.what());
+    }
+    throw;
+  }
 }
 
 }  // namespace
@@ -223,33 +266,34 @@ runtime::SessionOptions detector_options(const TextDetectorConfig& config, runti
 TextDetector TextDetector::open(runtime::Environment& env, const std::filesystem::path& model,
                                 const TextDetectorConfig& config, runtime::SessionOptions options) {
   options = detector_options(config, std::move(options));
-  return TextDetector(runtime::Session::open(env, model, options), config);
+  return TextDetector(open_session(env, model, options), config);
 }
 
 TextDetector TextDetector::open(runtime::Environment& env, const runtime::ModelBytes& model,
                                 const TextDetectorConfig& config, runtime::SessionOptions options) {
   options = detector_options(config, std::move(options));
-  return TextDetector(runtime::Session::open(env, model, options), config);
+  return TextDetector(open_session(env, model, options), config);
 }
 
 TextDetector::TextDetector(runtime::Session session, const TextDetectorConfig& config)
     : session_(std::move(session)), config_(config) {
   validate(config_);
-  check_model(session_, config_.tile_size);
+  check_model(session_, Size{config_.tile_width, config_.tile_height});
 }
 
 std::vector<Detection> TextDetector::detect(const FrameView& frame, Size source) const {
   validate(frame);
   const ReadbackMapping readback(source, frame.size());
-  const std::uint32_t tile = config_.tile_size;
-  const auto side = static_cast<std::int64_t>(tile);
-  const std::array<std::int64_t, 4> shape{1, 3, side, side};
-  const std::array<std::int64_t, 4> want{1, 1, side, side};
+  const Size tile{config_.tile_width, config_.tile_height};
+  const auto rows = static_cast<std::int64_t>(tile.height);
+  const auto cols = static_cast<std::int64_t>(tile.width);
+  const std::array<std::int64_t, 4> shape{1, 3, rows, cols};
+  const std::array<std::int64_t, 4> want{1, 1, rows, cols};
 
   std::vector<TileDetection> found;
   const std::vector<Rect> crops = tile_crops(frame.size(), tile, config_.tile_overlap);
   for (std::size_t t = 0; t < crops.size(); ++t) {
-    const SpaceMap map{readback, tile_input_mapping(crops[t], tile)};
+    const SpaceMap map{readback, tile_input_mapping(crops[t], tile, config_.upscale_side)};
     const std::vector<float> tensor = to_text_input_tensor(render_model_input(frame, *map.model_input));
     const std::array<runtime::TensorView, 1> inputs{{{tensor, shape}}};
     const std::vector<runtime::Tensor> outputs = session_.run(inputs);
@@ -259,7 +303,7 @@ std::vector<Detection> TextDetector::detect(const FrameView& frame, Size source)
                             (outputs.empty() ? std::string("(none)") : shape_text(outputs[0].shape)) +
                             ", expected " + shape_text(want));
     }
-    const std::vector<db::Candidate> candidates = db::decode(outputs[0].data, Size{tile, tile}, config_.db);
+    const std::vector<db::Candidate> candidates = db::decode(outputs[0].data, tile, config_.db);
     std::vector<TileDetection> boxes = tile_to_source(candidates, map, t);
     found.insert(found.end(), boxes.begin(), boxes.end());
   }

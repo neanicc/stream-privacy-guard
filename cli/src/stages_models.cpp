@@ -1,4 +1,5 @@
 // open_stages() for builds with ONNX Runtime and OpenCV (SPG_WITH_DEPS=ON).
+#include <algorithm>
 #include <exception>
 #include <memory>
 #include <span>
@@ -78,6 +79,7 @@ OpenedStages open_stages(const ModelPaths& models, const PolicyConfig& policy, c
   if (options.cpu_only) {
     session.providers.clear();
   }
+  session.intra_op_threads = options.intra_op_threads;
   OpenedStages out;
   try {
     auto env = std::make_shared<runtime::Environment>(runtime::Environment::LogLevel::Error);
@@ -90,7 +92,7 @@ OpenedStages open_stages(const ModelPaths& models, const PolicyConfig& policy, c
     if (any_text(policy.categories)) {
       detect::TextDetectorConfig text_config;
       if (options.thorough) {
-        text_config.tile_overlap = text_config.tile_size / 2;
+        text_config.tile_overlap = std::min(text_config.tile_width, text_config.tile_height) / 2;
         text_config.db.box_threshold = text_config.db.bin_threshold;
       }
       auto text = std::make_shared<const detect::TextDetector>(

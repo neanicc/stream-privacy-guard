@@ -12,6 +12,7 @@
 #include <iterator>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -22,6 +23,7 @@
 
 #include "commands.hpp"
 #include "driver.hpp"
+#include "fail_alloc.hpp"
 #include "image_io.hpp"
 #include "inputs.hpp"
 #include "schedule_fakes.hpp"
@@ -385,6 +387,126 @@ TEST_CASE("timed stages end a cycle after its policy calls", "[cli]") {
   CHECK(latencies[0] >= 50.0);
 }
 
+TEST_CASE("a policy call that throws still ends its cycle and counts its time", "[cli]") {
+  auto cycles = std::make_shared<spg::cli::CycleLog>();
+  auto times = std::make_shared<spg::cli::StageTimes>();
+  spg::ScanStages raw;
+  raw.text = std::make_shared<ScriptedDetector>([](Timestamp, spg::Size) {
+    return std::vector<spg::Detection>{spg_test::text_at(4, 4, 20, 8)};
+  });
+  raw.recognizer = std::make_shared<ScriptedRecognizer>([](const spg::Detection&) { return std::string("x"); });
+  raw.policy = std::make_shared<ScriptedPolicy>([] {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    throw std::runtime_error("policy failed");
+  });
+  const spg::ScanStages stages = spg::cli::timed(raw, times, cycles);
+
+  const spg::BgraImage frame = gray_frame(64, 48, 100);
+  const spg::FrameView view = frame.view(spg::SteadyClock{}.now());
+  const std::vector<spg::Detection> regions = stages.text->detect(view, frame.size());
+  const std::vector<spg::Secret> texts = stages.recognizer->recognize(view, frame.size(), regions);
+  REQUIRE(texts.size() == 1);
+  CHECK_THROWS_AS((void)stages.policy->evaluate(texts[0]), std::runtime_error);
+
+  const std::vector<double> latencies = cycles->latencies_ms();
+  REQUIRE(latencies.size() == 1);
+  CHECK(latencies[0] >= 50.0);
+  REQUIRE(times->summary().count("policy") == 1);
+  CHECK(times->summary().at("policy").count == 1);
+  CHECK(times->summary().at("policy").max_ms >= 50.0);
+}
+
+TEST_CASE("a failed allocation while timing a stage reaches the caller as an exception", "[cli]") {
+  // Recording a stage's time allocates (a new stage name, a new cycle). A
+  // failure there, on a call that returns or on one that throws, must reach
+  // the caller, where run_scan() fails the cycle closed; recording from a
+  // destructor would end the process instead.
+  const spg::BgraImage frame = gray_frame(64, 48, 100);
+  for (const bool policy_throws : {false, true}) {
+    const auto stages_for_one_cycle = [policy_throws] {
+      spg::ScanStages raw;
+      raw.text = std::make_shared<ScriptedDetector>([](Timestamp, spg::Size) {
+        return std::vector<spg::Detection>{spg_test::text_at(4, 4, 20, 8)};
+      });
+      raw.recognizer = std::make_shared<ScriptedRecognizer>([](const spg::Detection&) { return std::string("x"); });
+      raw.policy = std::make_shared<ScriptedPolicy>([policy_throws] {
+        if (policy_throws) {
+          throw std::runtime_error("policy failed");
+        }
+      });
+      // Fresh logs each time, so recording into them allocates.
+      return spg::cli::timed(raw, std::make_shared<spg::cli::StageTimes>(), std::make_shared<spg::cli::CycleLog>());
+    };
+    const auto run_cycle = [&](const spg::ScanStages& stages) {
+      const spg::FrameView view = frame.view(spg::SteadyClock{}.now());
+      const std::vector<spg::Detection> regions = stages.text->detect(view, frame.size());
+      for (const spg::Secret& text : stages.recognizer->recognize(view, frame.size(), regions)) {
+        (void)stages.policy->evaluate(text);
+      }
+    };
+    // One unfailed cycle first, so one-time setup (the secure heap behind
+    // Secret) is done and the sweep sees only a cycle's allocations.
+    if (policy_throws) {
+      CHECK_THROWS_AS(run_cycle(stages_for_one_cycle()), std::runtime_error);
+    } else {
+      CHECK_NOTHROW(run_cycle(stages_for_one_cycle()));
+    }
+    for (std::uint64_t n = 0;; ++n) {
+      REQUIRE(n < 10000);
+      const spg::ScanStages stages = stages_for_one_cycle();
+      bool threw = false;
+      bool fired = false;
+      {
+        const spg_test::FailAllocations fail(n);
+        try {
+          run_cycle(stages);
+        } catch (...) {
+          threw = true;
+        }
+        fired = fail.fired();
+      }
+      INFO("policy throws " << policy_throws << ", allocation " << n);
+      if (!fired) {
+        CHECK(threw == policy_throws);
+        CHECK(n > 0);
+        break;
+      }
+      CHECK(threw);
+    }
+  }
+}
+
+TEST_CASE("realtime plans are fitted to the compositor's rect capacity after the feed", "[cli]") {
+  spg::cli::StageTimes times;
+  auto cycles = std::make_shared<spg::cli::CycleLog>();
+  std::vector<spg::Detection> many;
+  for (int i = 0; i < 150; ++i) {
+    many.push_back(spg_test::face_at(static_cast<float>(i % 15) * 40.0F, static_cast<float>(i / 15) * 40.0F, 10, 10));
+  }
+  spg::ScanStages raw;
+  raw.faces = std::make_shared<ScriptedDetector>([many](Timestamp, spg::Size) { return many; });
+  const spg::ScanStages stages = spg::cli::timed(raw, std::make_shared<spg::cli::StageTimes>(), cycles);
+  const auto r = spg::cli::run_realtime(memory_source(30, 60, 640, 400), faces_only(), stages,
+                                        spg::cli::DriverOptions{}, times, *cycles);
+  static_assert(150 > spg::kMaskRectCapacity, "a scanned plan must need fitting");
+  REQUIRE(r.plans.size() == 30);
+  std::size_t fitted = 0;
+  for (const spg::MaskPlan& p : r.plans) {
+    REQUIRE(p.rects.size() <= spg::kMaskRectCapacity);
+    if (p.fallback) {
+      continue;  // a slow runner may fail frames closed; those blur whole
+    }
+    ++fitted;
+    for (const spg::Detection& d : many) {
+      REQUIRE(covers(p, d.box.rect));
+    }
+  }
+  // At least one plan came from a scan of all 150 faces, so it had more raw
+  // rects than the capacity and went through fitting; fallback plans alone
+  // would pass the checks above without any.
+  REQUIRE(fitted > 0);
+}
+
 TEST_CASE("timing summaries use nearest-rank percentiles", "[cli]") {
   std::vector<double> samples;
   for (int i = 1; i <= 100; ++i) {
@@ -521,11 +643,23 @@ TEST_CASE("bench reports stage timing and the fail-closed rate", "[cli]") {
     const nlohmann::json report = nlohmann::json::parse(slurp(suite / "rt.json"));
     CHECK(report["mode"] == "realtime");
     CHECK(report["frames"] == 10);
+    CHECK(report["workers"] == spg::SchedulerConfig{}.workers);
+    CHECK(report["scan_interval_ms"] == 0.0);
     REQUIRE(report["sequences"].size() == 1);
     CHECK(report["sequences"][0]["name"] == "seq-001");
     CHECK(report["latencies_ms"].size() > 0);
     CHECK(lines_of(suite / "rt" / "seq-001" / "mask_plans.jsonl").size() == 10);
     CHECK_FALSE(fs::exists(suite / "rt" / "seq-000"));
+  }
+  SECTION("scheduling knobs reach the report") {
+    const Ran r = cli({"bench", "--realtime", "--suite", suite.string(), "--resolution", "96x54", "--workers", "1",
+                       "--scan-interval-ms", "50", "--threads", "2", "--report", (suite / "knobs.json").string()});
+    INFO(r.err);
+    REQUIRE(r.code == 0);
+    const nlohmann::json report = nlohmann::json::parse(slurp(suite / "knobs.json"));
+    CHECK(report["workers"] == 1);
+    CHECK(report["scan_interval_ms"] == 50.0);
+    CHECK(report["threads"] == 2);
   }
   SECTION("a resolution no sequence has") {
     const Ran r = cli({"bench", "--suite", suite.string(), "--resolution", "1920x1080"});
@@ -546,6 +680,9 @@ TEST_CASE("usage errors exit 2 and failures exit 1", "[cli]") {
   CHECK(cli({"eval", "--suite", suite.string(), "--plans", "x", "--readback-scale", "1.5"}).code == 2);
   CHECK(cli({"eval", "--suite", suite.string(), "--plans", "x", "--suite", "y"}).code == 2);
   CHECK(cli({"bench", "--suite", suite.string(), "--cycle-ms", "10"}).code == 2);
+  CHECK(cli({"bench", "--suite", suite.string(), "--scan-interval-ms", "-1"}).code == 2);
+  CHECK(cli({"bench", "--suite", suite.string(), "--scan-interval-ms", "soon"}).code == 2);
+  CHECK(cli({"bench", "--suite", suite.string(), "--threads", "0"}).code == 2);
   CHECK(cli({"eval", "--suite", (suite / "nope").string(), "--plans", "x"}).code == 1);
   CHECK(cli({"--version"}).out.rfind("spg-cli ", 0) == 0);
   CHECK(cli({"--help"}).out.find("usage: spg-cli") != std::string::npos);

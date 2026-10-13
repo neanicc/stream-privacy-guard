@@ -97,8 +97,18 @@ struct SessionOptions {
   // failed, so a broken accelerator falls back to CPU here, not mid-stream.
   int warmup_runs = 1;
   // One concrete shape per model input, in model input order. May be empty
-  // when every input shape is fully static.
+  // when every input shape is fully static (fixed_shapes counts).
   std::vector<std::vector<std::int64_t>> warmup_shapes;
+  // When set, one shape per model input, in model input order: every dynamic
+  // dimension is fixed to its value here before any provider sees the graph
+  // (ONNX Runtime free dimension overrides), so a provider that needs static
+  // shapes can take nodes it would otherwise leave on CPU. Core ML runs with
+  // RequireStaticInputShapes, so a model with a dynamic input otherwise runs
+  // almost wholly on CPU (SPG-16: the PP-OCR text detector). The session then
+  // reports, and accepts, only these shapes. Each static dimension must equal
+  // the model's, each dynamic one must be named in the model (ONNX dim_param)
+  // and one name cannot take two values; otherwise open() throws InvalidInput.
+  std::vector<std::vector<std::int64_t>> fixed_shapes;
 };
 
 // Float32 tensor description. Dynamic dimensions are -1.
@@ -138,7 +148,7 @@ struct ModelBytes {
 class Session {
  public:
   // Throws RuntimeError: ModelNotFound, ModelLoadFailed, ProviderUnavailable or
-  // InvalidInput (bad warmup shapes, or `env` was moved from).
+  // InvalidInput (bad warmup or fixed shapes, or `env` was moved from).
   [[nodiscard]] static Session open(Environment& env, const std::filesystem::path& model,
                                     const SessionOptions& options = {});
   // The same from memory. Empty or unparsable bytes are ModelLoadFailed.

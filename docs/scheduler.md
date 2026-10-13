@@ -280,9 +280,9 @@ Offline, `spg-cli` (SPG-11) drives `Lookahead` directly: push, take a job,
 | Setting | Default | Source |
 | --- | --- | --- |
 | `lookahead`, `retro`, `hold`, margin, fallback, mask style, `scan.categories` | from `PolicyConfig` | plan section 4 |
-| `workers` | 2 | SPG-10 starting point |
+| `workers` | 2 | SPG-10 starting point; SPG-16 measured 1 against 2 (one worker misses far fewer frames, but the tracker then loses the velocities it gets from the two workers' paired cycles; agent-log SPG-16) |
 | `queue_capacity` | 1 (the newest frame) | plan section 4 ("workers process the newest readback frame") |
-| `scan_interval` | 0 (offer every frame) | SPG-10 starting point; SPG-16 tunes cadence against `bench` |
+| `scan_interval` | 0 (offer every frame) | SPG-10 starting point; SPG-16 tried 120 and 150 ms with two workers: staggering them cut fail-closed frames a little (single runs) but far less than one worker did, and it gives up the paired cycles the tracker's velocities come from |
 | `max_buffered_frames` | 600 (5 s at 120 fps) | `kMaxLookahead` |
 | `max_retro_rects` | 64 per frame | tracker's `max_rects_per_track` limit |
 | `scan.max_text_bytes` | 512 | SPG-10 starting point |

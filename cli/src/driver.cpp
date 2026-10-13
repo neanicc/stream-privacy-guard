@@ -39,6 +39,9 @@ void check(const FrameSource& source, const DriverOptions& options) {
   if (options.cycle && *options.cycle < Duration::zero()) {
     throw CliError("cycle time must not be negative");
   }
+  if (options.scan_interval && *options.scan_interval < Duration::zero()) {
+    throw CliError("scan interval must not be negative");
+  }
 }
 
 // Ticks past the last frame before giving up on releasing every frame: the
@@ -66,8 +69,9 @@ class Collector {
     result_.plans.resize(source.count);
   }
   void expect(FrameId id, std::size_t index) { index_of_.emplace(id, index); }
-  // The real frame index of a released frame, or nothing for padding.
-  [[nodiscard]] std::optional<std::size_t> take(const ReleasedFrame& released) {
+  // The real frame index of a released frame, or nothing for padding. With
+  // `fit` unset the plan keeps the scheduler's rects until fit_all().
+  [[nodiscard]] std::optional<std::size_t> take(const ReleasedFrame& released, bool fit = true) {
     const auto it = index_of_.find(released.id);
     if (it == index_of_.end()) {
       return std::nullopt;
@@ -77,10 +81,16 @@ class Collector {
     MaskPlan& plan = result_.plans[index];
     plan.frame_time = frame_time(index, source_.fps);
     plan.fallback = released.plan.fallback;
-    plan.rects = fit_mask_rects(released.plan.rects);
+    plan.rects = fit ? fit_mask_rects(released.plan.rects) : released.plan.rects;
     result_.fail_closed += plan.fallback ? 1 : 0;
     ++released_;
     return index;
+  }
+  // Fits every plan taken with `fit` unset.
+  void fit_all() {
+    for (MaskPlan& plan : result_.plans) {
+      plan.rects = fit_mask_rects(plan.rects);
+    }
   }
   [[nodiscard]] bool finished() const noexcept { return released_ == source_.count; }
 
@@ -113,7 +123,8 @@ class Composer {
       compose(image, *plan, released.action, options_.compositor);
       times_.add(kStageCompose, elapsed_ms(start, steady::now()));
     }
-    if (released.action == FallbackAction::None) {
+    // Only a frame that aired clean may be shown again (HoldLastScanned).
+    if (released.action == FallbackAction::None && !plan->fallback) {
       last_clean_id_ = released.id;
       last_clean_ = image;
       has_last_clean_ = true;
@@ -146,6 +157,9 @@ struct SimWorker {
 SchedulerConfig driver_config(const PolicyConfig& policy, const DriverOptions& options) {
   SchedulerConfig config = SchedulerConfig::from_policy(policy);
   config.workers = options.workers;
+  if (options.scan_interval) {
+    config.scan_interval = *options.scan_interval;
+  }
   // Every plan is fitted to the compositor's rect capacity; the scheduler's
   // own per-frame and per-track bounds must not exceed it.
   config.max_retro_rects = std::min(config.max_retro_rects, kMaskRectCapacity);
@@ -406,12 +420,15 @@ SequenceResult run_realtime(const FrameSource& source, const PolicyConfig& polic
       }
       released.clear();
       scheduler.release_due(released);
+      // Fitting waits until the feed ends: it is CLI output work the plugin
+      // never does, and on this thread it delayed the next frame's push.
       for (const ReleasedFrame& r : released) {
-        (void)collector.take(r);
+        (void)collector.take(r, false);
       }
     }
     result.stats = scheduler.stats();
   }
+  collector.fit_all();
   result.latencies_ms = cycles.latencies_ms();
   return result;
 }

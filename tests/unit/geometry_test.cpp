@@ -359,6 +359,46 @@ TEST_CASE("geometry: known conversions", "[geometry]") {
   }
 }
 
+TEST_CASE("geometry: a scale cap pads instead of scaling up", "[geometry]") {
+  const ReadbackMapping same({960U, 540U}, {960U, 540U});
+  const Rect crop{0.0F, 0.0F, 960.0F, 540.0F};
+  SECTION("top-left keeps the content at the origin at the capped scale") {
+    const ModelInputMapping m(crop, {1920U, 1088U}, Fit::LetterboxTopLeft, 1.0);
+    CHECK(m.scale_x() == 1.0);
+    CHECK(m.scale_y() == 1.0);
+    CHECK(m.pad_x() == 0.0);
+    CHECK(m.pad_y() == 0.0);
+    const SpaceMap map{same, m};
+    const Box b = spg::convert({{100.0F, 50.0F, 200.0F, 100.0F}, Space::Source}, Space::ModelInput, map);
+    CHECK(near(b.rect, {100.0F, 50.0F, 200.0F, 100.0F}, 1e-3));
+    const Box back = spg::convert(b, Space::Source, map);
+    CHECK(near(back.rect, {100.0F, 50.0F, 200.0F, 100.0F}, 1e-3));
+  }
+  SECTION("a cap above the fitting scale changes nothing") {
+    const ModelInputMapping capped(crop, {1920U, 1088U}, Fit::LetterboxTopLeft, 5.0);
+    const ModelInputMapping plain(crop, {1920U, 1088U}, Fit::LetterboxTopLeft);
+    CHECK(capped.scale_x() == plain.scale_x());
+    CHECK(capped.scale_y() == plain.scale_y());
+    CHECK(capped.pad_x() == plain.pad_x());
+    CHECK(capped.pad_y() == plain.pad_y());
+  }
+  SECTION("centered padding is split evenly") {
+    const ModelInputMapping m(crop, {1920U, 1088U}, Fit::LetterboxCenter, 1.5);
+    CHECK(m.scale_x() == 1.5);
+    CHECK(std::abs(m.pad_x() - (1920.0 - 1440.0) / 2.0) < 1e-9);
+    CHECK(std::abs(m.pad_y() - (1088.0 - 810.0) / 2.0) < 1e-9);
+  }
+  SECTION("bad caps are rejected") {
+    CHECK_THROWS_AS(ModelInputMapping(crop, {1920U, 1088U}, Fit::Stretch, 1.0), spg::ContractError);
+    CHECK_THROWS_AS(ModelInputMapping(crop, {1920U, 1088U}, Fit::LetterboxTopLeft, 0.0), spg::ContractError);
+    CHECK_THROWS_AS(ModelInputMapping(crop, {1920U, 1088U}, Fit::LetterboxTopLeft, std::nan("")),
+                    spg::ContractError);
+    CHECK_THROWS_AS(ModelInputMapping(crop, {1920U, 1088U}, Fit::LetterboxTopLeft,
+                                      std::numeric_limits<double>::infinity()),
+                    spg::ContractError);
+  }
+}
+
 TEST_CASE("geometry: invalid mappings and boxes are rejected", "[geometry]") {
   CHECK_THROWS_AS(ReadbackMapping({0U, 1080U}, {960U, 540U}), spg::ContractError);
   CHECK_THROWS_AS(ReadbackMapping({1920U, 1080U}, {960U, 0U}), spg::ContractError);

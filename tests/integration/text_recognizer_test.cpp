@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -638,6 +639,52 @@ TEST_CASE("Batching does not change what is read", "[ocr][fixture]") {
     CHECK_FALSE(one[i].text.empty());
     CHECK(one[i].text == many[i].text);
   }
+}
+
+TEST_CASE("Side-by-side model runs do not change what is read", "[ocr][fixture][parallel]") {
+  // parallel_runs only changes how many batches are in flight at once.
+  TextRecognizerConfig serial_config = fixture_config();
+  serial_config.parallel_runs = 1;
+  const TextRecognizer serial = open_fixture("rec_softmax.onnx", serial_config);
+  TextRecognizerConfig config = fixture_config();
+  config.parallel_runs = GENERATE(2U, 4U, 16U);
+  config.max_batch = GENERATE(1U, 3U);
+  const TextRecognizer side_by_side = open_fixture("rec_softmax.onnx", config);
+  const Scene scene = panel({900, 420}, {60, 60, 60}, {220, 230, 240}, kTexts, 12.0);
+  const OwnedFrame frame = spg::test::to_frame(scene.canvas, PixelFormat::BGRA);
+  const std::vector<spg::Detection> regions = regions_of(scene, {900, 420});
+  const std::vector<Recognition> one = serial.recognize(frame.view, {900, 420}, regions);
+  const std::vector<Recognition> many = side_by_side.recognize(frame.view, {900, 420}, regions);
+  REQUIRE(one.size() == regions.size());
+  REQUIRE(many.size() == regions.size());
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+    INFO("region " << i << ", parallel_runs " << config.parallel_runs << ", max_batch " << config.max_batch);
+    CHECK_FALSE(one[i].text.empty());
+    CHECK(one[i].text == many[i].text);
+  }
+}
+
+TEST_CASE("Malformed output in one of several side-by-side batches fails the call", "[ocr][fixture][parallel]") {
+  // rec_sqrt gives NaN only where a crop is darker than mid gray. Blank
+  // regions on light paper decode, so in the mixed call the other lanes'
+  // batches succeed while the one with dark ink fails; the error must still
+  // reach the caller, after every lane has returned.
+  const Scene scene = panel({900, 420}, {240, 240, 240}, {30, 30, 30}, {"zorbly"}, 14.0);
+  const OwnedFrame frame = spg::test::to_frame(scene.canvas, PixelFormat::BGRA);
+  std::vector<spg::Detection> blank;
+  for (int i = 0; i < 7; ++i) {
+    blank.push_back(region({20.0F + 120.0F * static_cast<float>(i), 300.0F, 100.0F, 20.0F}, {900, 420}, {900, 420}));
+  }
+  TextRecognizerConfig config = fixture_config();
+  config.parallel_runs = GENERATE(1U, 4U);
+  const TextRecognizer broken = open_fixture("rec_sqrt.onnx", config);
+  INFO("parallel_runs " << config.parallel_runs);
+  REQUIRE_NOTHROW(broken.recognize(frame.view, {900, 420}, blank));
+  const std::size_t at = GENERATE(0U, 3U, 7U);
+  std::vector<spg::Detection> mixed = blank;
+  mixed.insert(mixed.begin() + static_cast<std::ptrdiff_t>(at), regions_of(scene, {900, 420})[0]);
+  INFO("ink region at " << at);
+  CHECK_THROWS_AS(broken.recognize(frame.view, {900, 420}, mixed), ocr::DecodeError);
 }
 
 TEST_CASE("Recognizer temporaries are protected blocks, zeroed when released", "[ocr][fixture][secure]") {

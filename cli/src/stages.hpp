@@ -31,9 +31,11 @@ struct StageOptions {
   // Execution providers: the platform default order with CPU fallback
   // (false), or CPU only (true).
   bool cpu_only = false;
+  // ONNX Runtime intra-op threads per model; 0 keeps its default.
+  int intra_op_threads = 0;
   // Offline settings for `scrub` (SPG-18), which must not miss text the
-  // pipeline would miss only to save time: tiles overlap by half a tile, so
-  // a line up to half a tile tall is never cut by a tile edge, and the text
+  // pipeline would miss only to save time: tiles overlap by half the shorter
+  // tile side, so a line that tall is never cut by a tile edge, and the text
   // detector keeps candidate boxes from a mean probability of 0.3 (the
   // binarization threshold) instead of 0.5. Off for run, eval and bench,
   // which must score what the plugin runs.

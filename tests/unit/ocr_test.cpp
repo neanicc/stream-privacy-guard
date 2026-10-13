@@ -3,14 +3,19 @@
 // rotation, chunks), the input tensor, the region crop, the config, and the
 // per-track cache. Frames are drawn here; no string is real personal data.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -23,6 +28,7 @@
 #include "ocr/crop_plan.hpp"
 #include "ocr/ctc_decode.hpp"
 #include "ocr/recognition_cache.hpp"
+#include "ocr/run_batches.hpp"
 #include "ocr/text_recognizer.hpp"
 #include "spg/error.hpp"
 #include "spg/secure_memory.hpp"
@@ -861,4 +867,99 @@ TEST_CASE("RecognitionCache stays within its bounds under churn", "[ocr][cache]"
     REQUIRE(cache.bytes() <= config.max_bytes);
   }
   CHECK(cache.size() > 0);
+}
+
+// --- run_batches: the recognizer's side-by-side model runs -------------------
+
+TEST_CASE("run_batches calls every batch exactly once on up to `lanes` threads", "[ocr][parallel]") {
+  const std::size_t count = GENERATE(0U, 1U, 2U, 7U, 40U);
+  const std::size_t lanes = GENERATE(1U, 2U, 4U, 16U);
+  CAPTURE(count, lanes);
+  std::vector<std::atomic<int>> calls(count);
+  std::mutex mutex;
+  std::set<std::thread::id> threads;
+  ocr::run_batches(count, lanes, [&](std::size_t b) {
+    calls.at(b).fetch_add(1);
+    const std::lock_guard lock(mutex);
+    threads.insert(std::this_thread::get_id());
+  });
+  for (std::size_t b = 0; b < count; ++b) {
+    CHECK(calls[b].load() == 1);
+  }
+  CHECK(threads.size() <= std::min(count, lanes));
+  if (count <= 1 || lanes == 1) {
+    // No thread is started for a single lane: everything runs on the caller.
+    CHECK(threads.size() == std::min<std::size_t>(count, 1));
+    if (count == 1) {
+      CHECK(threads.count(std::this_thread::get_id()) == 1);
+    }
+  }
+}
+
+TEST_CASE("run_batches runs batches side by side", "[ocr][parallel]") {
+  // Batch 0 returns only once batch 1 has started, which needs a second
+  // lane: a run_batches() that ran one batch at a time would time out here.
+  std::atomic<bool> started_1{false};
+  bool overlapped = false;
+  ocr::run_batches(2, 2, [&](std::size_t b) {
+    if (b == 1) {
+      started_1 = true;
+      return;
+    }
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (!started_1 && std::chrono::steady_clock::now() < give_up) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    overlapped = started_1.load();
+  });
+  CHECK(overlapped);
+}
+
+TEST_CASE("run_batches rethrows a lane's error only after every lane has returned", "[ocr][parallel]") {
+  // Batch 0 throws while batch 1 is still running on another lane. The call
+  // must wait for batch 1 to finish (no thread outlives it), rethrow batch
+  // 0's error, and start no batch after the error.
+  std::atomic<bool> started_1{false};
+  std::atomic<bool> finished_1{false};
+  std::atomic<int> calls{0};
+  const auto run = [&](std::size_t b) {
+    calls.fetch_add(1);
+    if (b == 1) {
+      started_1 = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds{50});
+      finished_1 = true;
+      return;
+    }
+    if (b == 0) {
+      const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+      while (!started_1 && std::chrono::steady_clock::now() < give_up) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      }
+      throw std::runtime_error("batch 0 failed");
+    }
+  };
+  std::string error;
+  try {
+    ocr::run_batches(10, 2, run);
+  } catch (const std::runtime_error& e) {
+    error = e.what();
+  }
+  CHECK(error == "batch 0 failed");
+  CHECK(started_1.load());
+  CHECK(finished_1.load());
+  CHECK(calls.load() == 2);
+}
+
+TEST_CASE("run_batches rethrows when every lane fails", "[ocr][parallel]") {
+  const std::size_t lanes = GENERATE(1U, 4U);
+  std::atomic<int> calls{0};
+  CHECK_THROWS_AS(ocr::run_batches(12, lanes,
+                                   [&](std::size_t) {
+                                     calls.fetch_add(1);
+                                     throw std::runtime_error("failed");
+                                   }),
+                  std::runtime_error);
+  // Each lane stops at its first error.
+  CHECK(calls.load() >= 1);
+  CHECK(calls.load() <= static_cast<int>(lanes));
 }

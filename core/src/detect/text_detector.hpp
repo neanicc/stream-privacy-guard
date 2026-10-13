@@ -7,10 +7,11 @@
 //   input --DBNet--> probability map --db::decode()--> boxes (ModelInput)
 //   --spg::convert()--> Source --clip, merge_across_tiles()--> Detections
 //
-// Every tile is a crop of at most tile_size x tile_size readback pixels,
-// letterboxed top-left into a tile_size x tile_size input, so the model always
-// sees one static shape (scale 1 for every tile of a frame at least one tile
-// wide and tall; a smaller frame is scaled up uniformly to fill the input).
+// Every tile is a crop of at most tile_width x tile_height readback pixels,
+// letterboxed top-left into a tile_width x tile_height input, so the model
+// always sees one static shape. The scale is 1, except that a crop whose
+// longer side is under upscale_side is scaled up until it reaches it (as far
+// as the tile allows); the rest of the input is padding.
 // Neighbouring tiles overlap by at least `tile_overlap` readback pixels, so a
 // line no taller than the overlap lies whole inside some tile row, and a line
 // cut by a vertical tile edge is seen in pieces that overlap and are merged.
@@ -37,16 +38,27 @@
 namespace spg::detect {
 
 struct TextDetectorConfig {
-  // Model input side in pixels; a multiple of 32 (DBNet downsamples by 32).
-  // 640 matches the manifest's warmup shape.
-  std::uint32_t tile_size = 640;
+  // Model input (tile) width and height in pixels; multiples of 32 in
+  // [32, 8192] (DBNet downsamples by 32). The default holds a whole 1080p
+  // readback, the plugin's largest (pipeline.hpp kMaxReadback), in one model
+  // run: on the dev Mac with Core ML one 1920 x 1088 run took about 65 ms
+  // where the eight 640 x 640 tiles it replaced took 8 x 18 ms (SPG-16). A
+  // smaller readback costs the same one run; a larger one is tiled.
+  std::uint32_t tile_width = 1920;
+  std::uint32_t tile_height = 1088;
+  // A crop whose longer side is under this many pixels is scaled up until it
+  // reaches it (or fills the tile); no crop is scaled down. 640 keeps the
+  // scale the 640 x 640 tiles gave before SPG-16: scale 1 for any frame at
+  // least 640 wide or tall. Filling the whole tile instead (2x for 960 x 540)
+  // split lines into word boxes in the integration tests. In [1, 8192].
+  std::uint32_t upscale_side = 640;
   // Minimum overlap between neighbouring tiles, in readback pixels. Lines up
-  // to this tall are never cut by a horizontal tile edge. At most
-  // tile_size / 2, which keeps the pixels scanned per frame under four times
-  // the frame (a larger overlap multiplies model runs without bound).
+  // to this tall are never cut by a horizontal tile edge. At most half the
+  // shorter tile side, which keeps the pixels scanned per frame under four
+  // times the frame (a larger overlap multiplies model runs without bound).
   //
   // Known recall limit: a line taller than the overlap can be cut by a
-  // horizontal tile edge, and one taller than tile_size never fits a tile;
+  // horizontal tile edge, and one taller than the tile never fits a tile;
   // its parts are found only if their strokes still score over
   // db.box_threshold. SPG-12 measures large glyphs on the text suite and
   // decides between a larger overlap and a downscaled whole-frame pass.
@@ -69,14 +81,20 @@ class TextDetectorError : public std::runtime_error {
 void validate(const TextDetectorConfig& config);
 
 // The tile crops (whole Readback pixels) covering a frame of size `readback`:
-// a grid, row-major, each tile at most `tile` pixels on a side, first tile at
-// the origin and last flush with the far edge, neighbours overlapping by at
-// least `overlap` pixels (when there is more than one per axis). Throws
-// ContractError for a zero size and TextDetectorError unless overlap < tile.
+// a grid, row-major, each tile at most tile.width x tile.height pixels, first
+// tile at the origin and last flush with the far edge, neighbours overlapping
+// by at least `overlap` pixels (when there is more than one per axis). Throws
+// ContractError for a zero size and TextDetectorError unless overlap is below
+// both tile sides. The std::uint32_t forms take square tiles.
+[[nodiscard]] std::vector<Rect> tile_crops(Size readback, Size tile, std::uint32_t overlap);
 [[nodiscard]] std::vector<Rect> tile_crops(Size readback, std::uint32_t tile, std::uint32_t overlap);
 
 // The mapping detect() uses for one tile: the crop letterboxed top-left into a
-// `tile` x `tile` input.
+// tile.width x tile.height input at scale max(1, upscale_side / longer crop
+// side), or less when the tile is too small for that.
+[[nodiscard]] ModelInputMapping tile_input_mapping(const Rect& crop, Size tile, std::uint32_t upscale_side);
+// A square tile at the scale that fills it, which for a crop no larger than
+// the tile is the scale above with upscale_side == tile.
 [[nodiscard]] ModelInputMapping tile_input_mapping(const Rect& crop, std::uint32_t tile);
 
 // Planar float tensor [1, 3, H, W] in B, G, R plane order, each value
@@ -114,10 +132,13 @@ struct TileDetection {
 class TextDetector {
  public:
   // Opens `model` with `options` (default providers, CPU fallback, one warmup
-  // run). When options.warmup_shapes is empty it warms up with one tile
-  // [1, 3, tile_size, tile_size]. Throws runtime::RuntimeError when the
-  // session cannot be created and TextDetectorError when the model or config
-  // is not usable.
+  // run). When options.fixed_shapes is empty it fixes the input to one tile
+  // [1, 3, tile_height, tile_width], the only shape detect() runs, so an
+  // accelerator that needs static shapes can run the model; when
+  // options.warmup_shapes is empty it warms up with that tile. Throws
+  // runtime::RuntimeError when the session cannot be created and
+  // TextDetectorError when the model or config is not usable (including a
+  // model input that cannot take the tile shape).
   [[nodiscard]] static TextDetector open(runtime::Environment& env, const std::filesystem::path& model,
                                          const TextDetectorConfig& config = {},
                                          runtime::SessionOptions options = {});
@@ -128,7 +149,7 @@ class TextDetector {
 
   // Takes an open session. Throws TextDetectorError unless it has one float32
   // input [N, 3, H, W] and one float32 output [N, 1, H, W] whose dimensions
-  // are dynamic or fit a tile_size x tile_size batch of one, and the config
+  // are dynamic or fit a tile_height x tile_width batch of one, and the config
   // is in range.
   explicit TextDetector(runtime::Session session, const TextDetectorConfig& config = {});
 
@@ -138,8 +159,8 @@ class TextDetector {
   // detector PpOcrDet) sorted top to bottom, then left to right; an empty
   // vector means no text was found. Safe to call from several threads at once.
   //
-  // Cost: one model run per tile, run one after another (tile_crops(): 2 for
-  // 960x540, 8 for 1920x1080, 28 for 3840x2160 at the defaults), with no
+  // Cost: one model run per tile, run one after another (tile_crops(): 1 for
+  // 960x540 and 1920x1080, 9 for 3840x2160 at the defaults), with no
   // deadline or cancel check inside. Call it on a worker thread only; the
   // caller owns the lookahead deadline and must apply the fail-closed
   // fallback to a frame whose call has not returned in time.

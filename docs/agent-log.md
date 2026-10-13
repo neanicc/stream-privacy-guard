@@ -2084,6 +2084,113 @@ Template:
   frames, is a human scorer decision (docs/eval.md). Synthetic eval only;
   live OBS not tested.
 
+## 2026-10-13 — SPG-16 Performance pass, first slice (#17)
+
+- Method. Dev Mac: Apple M4 (4 performance + 6 efficiency cores, 16 GB),
+  macOS 26.5.2, ONNX Runtime 1.30.0 with Core ML. The realtime suite exactly
+  as `run_eval.py --mode local` runs it (`spg-cli bench --realtime` on the
+  15 1080p sequences of the full text suite, seed 20261012, scored with
+  `eval/thresholds.toml`), driven by a script that waits until no other
+  `spg-cli` runs and the 1-minute load is under 4 before each run, then runs
+  main (974b882) and the branch as interleaved pairs, alternating which goes
+  first. The shared Mac never went idle: `mediaanalysisd` and other agents
+  kept the load near 3.5 even in the quiet windows, and it rose to 5 to 7
+  during most runs. Stage costs were split with `sample` profiles of the
+  realtime process and a standalone ONNX Runtime probe (models alone, 20
+  runs each).
+- Where the time went on main: text detection 285 to 320 ms p50 per cycle
+  (eight 640 x 640 tiles), recognition 107 to 123 ms p50 and 270 to 300 ms
+  p95 (chat frames, about 25 regions), faces 59 ms. The PP-OCR detector's
+  input is dynamic and Core ML runs with `RequireStaticInputShapes`, so
+  Core ML took none of its nodes: every tile ran on CPU at about 50 ms. With
+  the input fixed to the tile shape (ONNX Runtime free dimension overrides)
+  Core ML takes the graph apart from its HardSigmoid and HardSwish nodes: 18
+  ms per 640 x 640 tile, 64.5 ms for one 1920 x 1088 input, 42 ms for 1088 x
+  1088. The recognizer stays on CPU: fixed 48 x 320 was 11 to 12 ms on Core
+  ML against 4.5 ms on CPU. One 48 x 320 crop took 9.4 ms on 1 thread, 4.0 ms
+  on 4 and 5.5 ms on 10 (the default), so crops scale badly over threads.
+- Changes. (1) `SessionOptions::fixed_shapes` fixes named dynamic input
+  dimensions before any provider sees the graph; `TextDetector::open` fixes
+  its input to the tile. (2) The text tile is 1920 x 1088
+  (`tile_width`/`tile_height`), one model run for a 1080p readback (the
+  plugin's largest) instead of eight; a crop is scaled up only to the old
+  640-tile scale (`upscale_side`), because filling the tile (2x for 960 x
+  540) split lines into word boxes in the integration tests. (3) The
+  recognizer runs up to `parallel_runs` (4) crops at once on threads it
+  starts and joins inside `recognize()`; the output does not depend on it.
+  (4) Face tiles still run on every scan (below). (5) `bench --realtime` fits mask plans
+  after the feed instead of on the feed thread (SPG-11 review P2), a
+  throwing policy call still records its time and ends its cycle (P3), the
+  CLI compositor keeps a frame for HoldLastScanned only when its plan has no
+  fallback (P3), and `--scan-interval-ms` and `--threads` expose the
+  scheduler's cadence and ONNX Runtime's thread count to `bench`.
+- Realtime suite, main against branch (fail-closed rate / p95 latency, run
+  order as listed): pair 1 main 0.930 / 694 ms, branch 0.159 / 415 ms; pair
+  2 branch 0.162 / 455 ms, main 0.870 / 652 ms; pair 3 main 0.902 / 665 ms,
+  branch 0.119 / 403 ms; pair 4 branch 0.115 / 404 ms, main 0.899 / 666 ms;
+  pair 5 main 0.900 / 692 ms, branch 0.138 / 433 ms. Paired deltas
+  -0.71 to -0.78 fail-closed and -197 to -279 ms p95. Branch stages: text
+  126 to 134 ms p50, recognition 51 to 57 ms p50 and 185 to 221 ms p95,
+  faces 56 to 61 ms (main: 298 to 320, 107 to 123, 59 to 82). Both
+  limits (0.01, 400 ms) still fail with the default two workers.
+- One worker meets them on the same build: interleaved with the pairs above
+  it gave 0.0044 / 254 ms, 0.0015 / 248 ms and 0.0200 / 265 ms. Two workers
+  take frames 16 ms apart and finish together, so the second adds almost no
+  coverage while both share the GPU and CPU. But the simulated eval with one
+  worker leaks: faces leak 0.0009 to 0.0435 (a 43 px face moving 480 px/s,
+  seq-018, leaks in 73% of its frames), CI text leak 0 to 0.0316 and
+  watch-list pair recall 1.000 to 0.987 (slide-in notifications), local
+  first-frame recall 0.962 to 0.906. With one cycle every 200 ms a fast small
+  box moves more than its own size between detections, so the tracker
+  (IoU 0.3 association) starts a new track each cycle and never gets the
+  velocity that the back-projected retro rects (SPG-12) and the slide-in
+  trail (SPG-12c) need; the two workers' paired cycles 16 ms apart are what
+  give it that velocity today. The default stays at two workers. Switching to
+  one needs motion-tolerant association in the tracker first (proposed
+  follow-up, lane:policy).
+- Face tiling cadence (release-gate item): every scan. A temporary
+  `FaceDetectorConfig::tile_cadence` option ran the scale-1 tiles round robin
+  over calls. With two workers, cadence 2 gave faces recall 0.9995 to 0.9973
+  and leak 0.0009 to 0.0056 in the simulated eval (cadence 3 the same), a
+  leak rise over the 0.2 pp the merge gate allows, for about 20 ms a cycle.
+  The staff review asked for the option to go, because it can only lower
+  recall and nothing set it, so it was removed. Adding it back needs evidence
+  that lookahead and hold cover N cycles. The realtime suite replays the text
+  suite, so faces cost counts there only as cycle time.
+- Rejected with evidence: two workers staggered with `scan_interval` 120 or
+  150 ms (fewer fail-closed frames than lockstep, far more than one worker,
+  and no velocity pairs); ONNX Runtime threads 2, 4 or 6 instead of the
+  default (no change beyond noise); `session.intra_op.allow_spinning` off
+  (no change); Core ML NeuralNetwork format or Neural Engine only for the
+  text detector (88 to 135 ms against 64.5 ms whole frame); the recognizer
+  on Core ML (slower); 1088 x 1088 text tiles (two runs, about 10 ms slower
+  per cycle than one whole-frame run).
+- Eval against main 974b882 (simulated, same generated suites): CI text and
+  local text and faces are unchanged except decoy blur, which rises from
+  0.4054 to 0.4211 in CI (+1.6 pp) and falls from 0.5092 to 0.5082 local;
+  decoy blur already fails its limit on main and is tracked in #75.
+  `scripts/ci/run.sh eval --local` on this head printed `THRESHOLDS: FAIL`
+  (decoy blur, and the realtime suite at 0.987 / 1641 ms during a load spike
+  to 13 from other jobs; the paired runs above are the measurement).
+- Review follow-up. The recognizer's helper threads are plain
+  `std::thread`s, joined by a guard on every way out. Apple's libc++ has no
+  `std::jthread`, and MSVC's version imports MSVCP140_ATOMIC_WAIT.dll, which
+  the Windows package check refuses. That broke the macOS and Windows CI
+  builds. Stage timing in the CLI now records from a function instead of a
+  destructor (`timed_call`), so a failed allocation while recording fails
+  the cycle instead of terminating the process. New tests: `run_batches`
+  (every batch once, side by side, an error rethrown only after every lane
+  returns), a malformed batch among good ones failing the call, the output
+  not depending on `parallel_runs`, a 4K readback through the default tile
+  (nine tiles, lines at the far edges and one across all three columns), and
+  an allocation sweep over the timed stages.
+- Open: #17 closes with this PR, and its unmet done-when item moves on. The
+  realtime limits go to #84 (motion-tolerant tracker association) and #85
+  (one worker, re-measure). The release gate also carries over to #85. A
+  cheaper text pass for sources below 1080p is #86. Live OBS not tested;
+  the plugin uses the same defaults (two workers, fixed-shape text detector,
+  1920 x 1088 tile, four recognizer runs).
+
 ## 2026-10-13 — SPG-12b Decoy blur on scrolling text (#75)
 
 - Decision (owner, issue #75): option 1. For a confirmed moving track that is

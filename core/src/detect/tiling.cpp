@@ -34,16 +34,20 @@ std::vector<std::uint32_t> axis_starts(std::uint32_t length, std::uint32_t tile,
 }  // namespace
 
 std::vector<Rect> grid_crops(Size readback, std::uint32_t tile, std::uint32_t overlap) {
+  return grid_crops(readback, Size{tile, tile}, overlap);
+}
+
+std::vector<Rect> grid_crops(Size readback, Size tile, std::uint32_t overlap) {
   if (readback.width == 0 || readback.height == 0) {
     throw ContractError("tiling: readback size must be non-zero");
   }
-  if (tile == 0 || overlap >= tile) {
+  if (tile.width == 0 || tile.height == 0 || overlap >= tile.width || overlap >= tile.height) {
     throw std::invalid_argument("tile overlap must be less than the tile size");
   }
-  const std::vector<std::uint32_t> xs = axis_starts(readback.width, tile, overlap);
-  const std::vector<std::uint32_t> ys = axis_starts(readback.height, tile, overlap);
-  const float w = static_cast<float>(std::min(readback.width, tile));
-  const float h = static_cast<float>(std::min(readback.height, tile));
+  const std::vector<std::uint32_t> xs = axis_starts(readback.width, tile.width, overlap);
+  const std::vector<std::uint32_t> ys = axis_starts(readback.height, tile.height, overlap);
+  const float w = static_cast<float>(std::min(readback.width, tile.width));
+  const float h = static_cast<float>(std::min(readback.height, tile.height));
   std::vector<Rect> crops;
   crops.reserve(xs.size() * ys.size());
   for (const std::uint32_t y : ys) {
