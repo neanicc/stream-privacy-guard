@@ -68,6 +68,14 @@ Rect trail_to_edge(const Rect& box, Velocity velocity, Size source) noexcept {
   return pixel_rect(x0, y0, x1, y1);
 }
 
+Rect spread(const Rect& rect, double dx, double dy) noexcept {
+  // NaN fails both comparisons and becomes 0, as a negative amount does.
+  const double x = dx > 0.0 ? dx : 0.0;
+  const double y = dy > 0.0 ? dy : 0.0;
+  return pixel_rect(static_cast<double>(rect.x) - x, static_cast<double>(rect.y) - y, right(rect) + x,
+                    bottom(rect) + y);
+}
+
 Rect scale_between(const Rect& box, Size from, Size to) noexcept {
   if (from == to || from.width == 0 || from.height == 0 || to.width == 0 || to.height == 0) {
     return pixel_rect(static_cast<double>(box.x), static_cast<double>(box.y), right(box), bottom(box));

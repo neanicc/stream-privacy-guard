@@ -184,6 +184,28 @@ measured why: on the full text suite two toasts were first scanned near rest,
 at about -710 and -160 px/s, and the static and moved rects missed them on
 5 and 7 frames (on its first frame one was 418 px right of where the cycles
 found it, about 300 px beyond its back-projected rect).
+
+A **first sighting** (a box that is the earliest detection of its track, which
+has no velocity yet) has no direction to project or trail along. Its velocity
+comes from the next result that sees it again, and with one worker that result
+lands a whole cycle later: with 200 ms cycles and 500 ms of lookahead, a box
+first seen on `ts` gets a velocity at `ts + 400`, when only the frames after
+`ts - 100` are still buffered. So on frames before the sighting and after the
+last complete scan before it, the box is also **spread** by the tracker's motion
+gate reach for the time between (`motion_gate_per_s * min(ts - t,
+max_prediction)` of its own widths along x and heights along y, around the
+mask with its margin; `mask::spread`): wherever a detection on that frame
+would have joined its track. Only frames released before the next result that
+could give the track a velocity get the spread. That result is the earliest
+cycle still running on a later frame, expected to land at its start plus the
+longest of the last 8 cycle durations; one that has already run past that does
+not count. With none running, it is a cycle that starts now (plus
+`scan_interval`). With two workers in step the paired cycle lands in time and
+no frame gets the spread; with one worker the frames from the last scan up to
+about `ts - 100` do. A later sighting of a track measured at rest is not a
+first sighting. The gate's reach on a wide text line is several line widths, so
+this blurs neighbouring content on those few frames: SPG-16d measured it
+(agent-log). `motion_gate_per_s = 0` turns it off with the gate.
 Per frame, a rect contained in another is dropped, and past `max_retro_rects`
 they merge into one hull (more blur, never less).
 
@@ -277,7 +299,7 @@ Offline, `spg-cli` (SPG-11) drives `Lookahead` directly: push, take a job,
 | Setting | Default | Source |
 | --- | --- | --- |
 | `lookahead`, `retro`, `hold`, margin, fallback, mask style, `scan.categories` | from `PolicyConfig` | plan section 4 |
-| `workers` | 2 | SPG-10 starting point; SPG-16 measured 1 against 2 (one worker misses far fewer frames, but the tracker then loses the velocities it gets from the two workers' paired cycles; agent-log SPG-16) |
+| `workers` | 2 | SPG-10 starting point; SPG-16 measured 1 against 2 (one worker misses far fewer frames, but the tracker then loses the velocities it gets from the two workers' paired cycles; agent-log SPG-16). Since SPG-16b and SPG-16d one worker matches two on the simulated suites' recall and leak metrics; switching is #85 |
 | `queue_capacity` | 1 (the newest frame) | plan section 4 ("workers process the newest readback frame") |
 | `scan_interval` | 0 (offer every frame) | SPG-10 starting point; SPG-16 tried 120 and 150 ms with two workers: staggering them cut fail-closed frames a little (single runs) but far less than one worker did, and it gives up the paired cycles the tracker's velocities come from |
 | `max_buffered_frames` | 600 (5 s at 120 fps) | `kMaxLookahead` |
