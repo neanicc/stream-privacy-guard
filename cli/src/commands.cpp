@@ -69,8 +69,12 @@ constexpr std::string_view kUsage =
     "  --cache DIR            models cache (default: $SPG_CACHE_DIR or ~/.cache/spg)\n"
     "  --cpu                  run the models on CPU only\n"
     "  --readback-scale S     scan a copy scaled by S in (0, 1] (default 1)\n"
-    "  --workers N            detection workers; scrub: frames scanned at once (default 2)\n"
+    "  --workers N            detection workers (default 2, as the plugin runs); scrub:\n"
+    "                         frames scanned at once (default 2)\n"
     "  --cycle-ms MS          run/eval: simulated time per detection cycle (default 200)\n"
+    "  --scan-interval-ms MS  frame time between scans a worker may take (default: the\n"
+    "                         scheduler's, as the plugin runs)\n"
+    "  --threads N            ONNX Runtime threads per model (default: its own choice)\n"
     "\n"
     "  --version  print the version and exit\n"
     "  --help     print this help and exit\n";
@@ -145,7 +149,8 @@ Size parse_resolution(const std::string& text) {
   return Size{parse_count(text.substr(0, x), "--resolution width"), parse_count(text.substr(x + 1), "--resolution height")};
 }
 
-const std::set<std::string_view> kPipelineValued = {"--cache", "--readback-scale", "--workers", "--cycle-ms"};
+const std::set<std::string_view> kPipelineValued = {"--cache",    "--readback-scale",   "--workers",
+                                                    "--cycle-ms", "--scan-interval-ms", "--threads"};
 
 struct PipelineSetup {
   DriverOptions driver;
@@ -178,6 +183,17 @@ PipelineSetup pipeline_setup(const Options& o, bool simulated_fixed) {
   }
   if (!simulated_fixed) {
     s.driver.cycle.reset();
+  }
+  if (const auto v = o.get("--scan-interval-ms")) {
+    const double ms = parse_number(*v, "--scan-interval-ms");
+    if (ms < 0.0 || ms > 60000.0) {
+      throw UsageError("--scan-interval-ms must be in [0, 60000]");
+    }
+    s.driver.scan_interval =
+        std::chrono::duration_cast<Duration>(std::chrono::duration<double, std::milli>(ms));
+  }
+  if (const auto v = o.get("--threads")) {
+    s.stages.intra_op_threads = static_cast<int>(std::min<std::uint32_t>(parse_count(*v, "--threads"), 256));
   }
   return s;
 }
@@ -288,6 +304,8 @@ json report_json(std::string_view command, std::string_view mode, std::uint32_t 
            {"fps", fps},
            {"workers", setup.driver.workers},
            {"readback_scale", setup.driver.readback_scale},
+           {"scan_interval_ms", to_ms(driver_config(PolicyConfig{}, setup.driver).scan_interval)},
+           {"threads", setup.stages.intra_op_threads},
            {"providers", providers},
            {"frames", totals.frames},
            {"padding_frames", totals.padding},
@@ -505,6 +523,8 @@ int cmd_scrub(std::span<const std::string_view> args, std::ostream& out, std::os
   setup.cache = o.get("--cache") ? fs::path(*o.get("--cache")) : default_cache_dir();
   setup.stages.cpu_only = o.flag("--cpu");
   setup.stages.thorough = true;
+  // Offline: frames scanned at once, not the realtime worker count.
+  setup.driver.workers = ScrubOptions{}.workers;
   if (const auto v = o.get("--workers")) {
     setup.driver.workers = parse_count(*v, "--workers");
   }

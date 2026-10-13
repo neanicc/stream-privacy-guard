@@ -92,16 +92,31 @@ class TimedPolicy final : public TextPolicy {
               std::shared_ptr<CycleLog> cycles)
       : inner_(std::move(inner)), times_(std::move(times)), cycles_(std::move(cycles)) {}
   [[nodiscard]] Verdict evaluate(const Secret& text) const override {
-    const auto start = steady::now();
-    Verdict v = inner_->evaluate(text);
-    times_->add(kStagePolicy, elapsed_ms(start, steady::now()));
-    if (cycles_ != nullptr && t_in_cycle) {
-      cycles_->note(t_cycle_readback, SteadyClock{}.now());
-    }
-    return v;
+    // Recorded on the way out, so a call that throws (which fails the cycle)
+    // still counts its time and ends its cycle, as for the other stages.
+    const PolicyTimer timer(*times_, cycles_.get());
+    return inner_->evaluate(text);
   }
 
  private:
+  class PolicyTimer {
+   public:
+    PolicyTimer(StageTimes& times, CycleLog* cycles) : times_(times), cycles_(cycles), start_(steady::now()) {}
+    PolicyTimer(const PolicyTimer&) = delete;
+    PolicyTimer& operator=(const PolicyTimer&) = delete;
+    ~PolicyTimer() {
+      times_.add(kStagePolicy, elapsed_ms(start_, steady::now()));
+      if (cycles_ != nullptr && t_in_cycle) {
+        cycles_->note(t_cycle_readback, SteadyClock{}.now());
+      }
+    }
+
+   private:
+    StageTimes& times_;
+    CycleLog* cycles_;
+    steady::time_point start_;
+  };
+
   std::shared_ptr<const TextPolicy> inner_;
   std::shared_ptr<StageTimes> times_;
   std::shared_ptr<CycleLog> cycles_;
