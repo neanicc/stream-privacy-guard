@@ -30,6 +30,19 @@ struct TrackerConfig {
   // A detection joins an existing track of the same kind when its IoU with
   // the track's predicted box (or its last confirmed box) is at least this.
   float iou_threshold = 0.3F;
+  // Motion gate (SPG-16b). With one detection cycle every ~200 ms a small
+  // fast box moves more than its own size between cycles, so IoU misses it.
+  // After IoU pairing, a detection left over may join a live track of its
+  // kind left over when its center lies within
+  // motion_gate_per_s * min(gap, max_prediction) box sizes of the track's
+  // last center or of the center its velocity predicts; gap is the frame
+  // time between them, and a box size is the larger of the two boxes'
+  // widths along x and heights along y. Closest pairs first. 0 turns the
+  // gate off.
+  float motion_gate_per_s = 20.0F;
+  // The gate also needs the detection's width and height each within this
+  // factor of the track's last box, in [1, inf).
+  float motion_size_ratio = 2.0F;
   // Weight of the newest motion measurement in the velocity estimate, in
   // (0, 1]. 1 uses the last measurement only.
   float velocity_smoothing = 0.5F;
@@ -51,7 +64,8 @@ struct TrackerConfig {
 
 // Throws ContractError naming the field when a value is out of range: a
 // negative duration, a negative or non-finite margin, an IoU threshold
-// outside (0, 1], a smoothing weight outside (0, 1] or a
+// outside (0, 1], a negative or non-finite motion gate, a motion size ratio
+// below 1 or not finite, a smoothing weight outside (0, 1] or a
 // max_rects_per_track outside [1, 64]. A zero hold or margin
 // is accepted here; whether to impose a floor is #28 (SPG-08b).
 void validate(const TrackerConfig& config);
@@ -88,6 +102,9 @@ struct TrackMotion {
 //   * Prediction: on frame times after td the mask also covers b moved at the
 //     track's estimated velocity for min(t - td, max_prediction), as the hull
 //     of b and the moved box, so between detection cycles the mask only grows.
+//   * Between sightings: when a detection on frame time t2 moves its track on
+//     from its last box b1 on t1 < t2, the hull of b1 and the new box, with
+//     the larger margin, is held from t1 like a detection.
 //   * Updates only add: masks(t) after update() contains every rect masks(t)
 //     returned before, for any t the retention still covers.
 //   * Resize: after rescale(from, to), masks(t) contains every rect masks(t)
@@ -110,8 +127,9 @@ class Tracker {
   Tracker(const Clock& clock, TrackerConfig config);
 
   // Adds the detections found on the frame with timestamp `frame_time`. Each
-  // joins the best-matching live track of its kind (greedy by IoU) or starts
-  // a new track. Detections may arrive late or out of order; an older
+  // joins the best-matching live track of its kind (greedy by IoU, then the
+  // tracks and detections left over greedy by the motion gate) or starts a
+  // new track. Detections may arrive late or out of order; an older
   // detection still holds but does not move its track (the earliest one can
   // give a track its first velocity; see TrackMotion). Validates every
   // detection first and throws ContractError (changing nothing) when one is

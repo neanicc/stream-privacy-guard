@@ -686,6 +686,117 @@ TEST_CASE("a box that grows in place is not trailed back to an edge", "[schedule
   }
 }
 
+namespace {
+
+// One worker whose cycles take 200 ms, as `spg-cli eval --workers 1` runs it
+// (SPG-16b): every 10 ms a finished cycle is applied, then the frame is
+// pushed, a free worker takes it, and the frames due are released. A frame is
+// released on its deadline, so a result that lands later cannot help it.
+// Returns every frame pushed in [from_ms, to_ms], in order.
+std::vector<ReleasedFrame> one_worker(const SchedulerConfig& config, const std::function<Rect(std::int64_t)>& box_at,
+                                      std::int64_t from_ms, std::int64_t to_ms) {
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const Rect b = box_at(spg::to_ns(t) / 1'000'000);
+                                    std::vector<Detection> out;
+                                    if (b.width > 0.0F) {
+                                      out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                    }
+                                    return out;
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  std::optional<std::pair<spg::ScanJob, spg::ScanResult>> busy;
+  std::int64_t done = 0;
+  std::vector<ReleasedFrame> released;
+  const auto keep = [&](std::vector<ReleasedFrame> out) {
+    released.insert(released.end(), out.begin(), out.end());
+  };
+  for (std::int64_t t = from_ms; t <= to_ms + 1000; t += 10) {
+    sim.clock.set(at_ms(t));
+    if (busy.has_value() && done <= t) {
+      sim.la.complete(busy->first, busy->second);
+      busy.reset();
+    }
+    if (t <= to_ms) {
+      const bool scan = !busy.has_value();
+      sim.push(t, scan);
+      if (scan) {
+        busy = sim.run();
+        done = t + 200;
+      }
+    }
+    keep(sim.release_at(t));
+  }
+  REQUIRE(released.size() == static_cast<std::size_t>((to_ms - from_ms) / 10 + 1));
+  return released;
+}
+
+SchedulerConfig one_worker_config() {
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 500ms;
+  config.tracker.hold = 750ms;
+  config.tracker.retain = 500ms;
+  config.tracker.margin_px = 4.0F;
+  config.tracker.margin_ratio = 0.25F;
+  return config;
+}
+
+// Frames in [from_ms, to_ms] whose box (when visible) no mask rect contains,
+// or that fell back.
+std::vector<std::int64_t> uncovered(const std::vector<ReleasedFrame>& frames,
+                                    const std::function<Rect(std::int64_t)>& box_at) {
+  std::vector<std::int64_t> out;
+  for (const ReleasedFrame& r : frames) {
+    const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+    const Rect b = box_at(t);
+    if (r.action != FallbackAction::None || (b.width > 0.0F && !covered_by(r.plan, b))) {
+      out.push_back(t);
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("one worker keeps a small fast face covered between its sparse detections", "[schedule]") {
+  // SPG-16b: a 35 x 48 px face at (490, -140) px/s moves 2.8 widths between
+  // cycles 200 ms apart (faces suite seq-018, which leaked in 73% of its
+  // frames with one worker). The tracker keeps it on one track, so every
+  // frame is covered: between sightings, and ahead of the last one.
+  const auto box_at = [](std::int64_t t) {
+    const auto s = static_cast<float>(t - 1000);
+    return Rect{100.0F + 0.49F * s, 500.0F - 0.14F * s, 35.0F, 48.0F};
+  };
+  SchedulerConfig config = one_worker_config();
+  const auto frames = one_worker(config, box_at, 1000, 2000);
+  CHECK(uncovered(frames, box_at).empty());
+
+  // Without the motion gate (main before SPG-16b) it leaks.
+  config.tracker.motion_gate_per_s = 0.0F;
+  CHECK_FALSE(uncovered(one_worker(config, box_at, 1000, 2000), box_at).empty());
+}
+
+TEST_CASE("one worker covers an ease-out slide-in from its first frame", "[schedule]") {
+  // SPG-16b: a toast slides in from the right edge of a 1280 px frame from
+  // 1180, easing out (cubic) to rest at x = 900 by 1380. Cycles at 1000,
+  // 1200 and 1400 see nothing, then 103 px of it clipped at the edge, then
+  // all of it at rest. The 1400 sighting joins the 1200 track (it moved 1.1
+  // box sizes), which covers the frames between the two sightings and gives
+  // the trail to the edge for the frames before 1200, still buffered when
+  // the 1400 result lands.
+  const auto box_at = [](std::int64_t t) {
+    const double p = std::clamp(static_cast<double>(t - 1180) / 200.0, 0.0, 1.0);
+    const double x = 1280.0 + (900.0 - 1280.0) * (1.0 - std::pow(1.0 - p, 3.0));
+    return Rect{static_cast<float>(x), 100.0F, static_cast<float>(std::min(200.0, 1280.0 - x)), 20.0F};
+  };
+  SchedulerConfig config = one_worker_config();
+  const auto frames = one_worker(config, box_at, 1000, 1800);
+  CHECK(uncovered(frames, box_at).empty());
+
+  config.tracker.motion_gate_per_s = 0.0F;
+  CHECK_FALSE(uncovered(one_worker(config, box_at, 1000, 1800), box_at).empty());
+}
+
 TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {
   // A static box whose detections jitter 12 px left and right each cycle: the
   // track's velocity flips sign every 20 ms (an outlier-ridden estimate).

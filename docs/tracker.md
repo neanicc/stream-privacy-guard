@@ -59,7 +59,31 @@ chained resizes) and a 60 s hold with 600 held detections.
 - A detection joins a live track (one whose hold has not ended at the frame
   time) of the same kind when its IoU with the track's predicted box, or with
   its last confirmed box, is at least `iou_threshold`. Pairs are assigned
-  greedily, best IoU first; an unmatched detection starts a new track.
+  greedily, best IoU first.
+- The tracks and detections IoU left unpaired then go through the motion gate
+  (SPG-16b). With one detection cycle every ~200 ms, a small fast box moves
+  more than its own size between cycles (a 43 px face at 480 px/s moves
+  96 px), so IoU alone started a new track each cycle and the track never
+  had a velocity. A detection may join such a track when its center is
+  within `motion_gate_per_s * min(gap, max_prediction)` box sizes of the
+  track's last center or of the center its velocity predicts at the frame
+  time (forward, or back for an older result), where `gap` is the frame
+  time between them and a box size is, per axis, the larger extent of the
+  two boxes. Its width and height must each be within `motion_size_ratio`
+  of the last box. Pairs are assigned greedily, closest first; ties go by
+  index. Because this pass runs after IoU, every pair IoU makes is kept. An
+  unmatched detection starts a new track.
+- A wrong pairing only changes the motion of the track it joined: every
+  detection is held from its own frame for the whole hold, whatever track it
+  joins, so a pairing never ends a hold early. It can only add blur (a wrong
+  velocity predicts, back-projects or trails in the wrong place).
+- When a detection moves its track forward in time, the hull of the track's
+  last box and the new box, with the larger of their margins, is also held
+  from the last confirmation. An object that moves in one direction between
+  two sightings stays inside that hull, whatever its speed profile. Velocity
+  alone only covers the path constant motion would take: an ease-out slide
+  is further along than the measurement says, and a track seen once has no
+  velocity yet.
 - Velocity is the motion of the box center between confirmations: the first
   measurement is taken as is, later ones are smoothed with weight
   `velocity_smoothing`. Box size follows the latest detection.
@@ -72,9 +96,10 @@ chained resizes) and a 60 s hold with 600 held detections.
   results that landed first) does not point that way. A move of both edges
   the way the velocity points marks the track translating. The box stays as
   it is.
-- An object that moves more than roughly half its size between detection
-  cycles fails the IoU gate and starts a new track. Its detections are still
-  held; only prediction is lost until the new track has a velocity.
+- An object that moves further than the motion gate reaches between
+  detection cycles (20 box sizes a second by default), or changes size by
+  more than `motion_size_ratio`, starts a new track. Its detections are
+  still held; only prediction is lost until the new track has a velocity.
 
 ## Time and the clock
 
@@ -128,6 +153,8 @@ be in the new coordinates.
 | `margin_px`, `margin_ratio` | 4 px, 0.25 | `PolicyConfig` placeholder from SPG-02 |
 | `retain` | 500 ms | `PolicyConfig::lookahead` |
 | `iou_threshold` | 0.3 | SPG-09 starting point |
+| `motion_gate_per_s` | 20 box sizes/s | SPG-16b; 0 turns the gate off. The faces suite's fast face (35 x 48 px at about 510 px/s) moves 14.3 widths a second; 16 to 30 gave the same recall, and decoy blur rose with the gate |
+| `motion_size_ratio` | 2 | SPG-16b; a toast first seen clipped at the frame edge is often about half as wide as at rest |
 | `velocity_smoothing` | 0.5 | SPG-09 starting point |
 | `max_prediction` | 500 ms | SPG-09 starting point |
 | `max_rects_per_track` | 8 | SPG-09 starting point; capped at the compositor's rect capacity (`kMaskRectCapacity`, 64 per frame, [cli.md](cli.md)), so eight tracks fit a frame unmerged |

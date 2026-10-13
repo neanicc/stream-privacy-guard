@@ -145,6 +145,12 @@ TEST_CASE("tracker: config comes from the policy and is validated", "[tracker]")
   rejects([](TrackerConfig& c) { c.margin_ratio = INFINITY; });
   rejects([](TrackerConfig& c) { c.iou_threshold = 0.0F; });
   rejects([](TrackerConfig& c) { c.iou_threshold = 1.5F; });
+  rejects([](TrackerConfig& c) { c.motion_gate_per_s = -1.0F; });
+  rejects([](TrackerConfig& c) { c.motion_gate_per_s = INFINITY; });
+  rejects([](TrackerConfig& c) { c.motion_gate_per_s = std::nanf(""); });
+  rejects([](TrackerConfig& c) { c.motion_size_ratio = 0.99F; });
+  rejects([](TrackerConfig& c) { c.motion_size_ratio = INFINITY; });
+  rejects([](TrackerConfig& c) { c.motion_size_ratio = std::nanf(""); });
   rejects([](TrackerConfig& c) { c.velocity_smoothing = 0.0F; });
   rejects([](TrackerConfig& c) { c.velocity_smoothing = std::nanf(""); });
   rejects([](TrackerConfig& c) { c.max_rects_per_track = 0; });
@@ -155,6 +161,8 @@ TEST_CASE("tracker: config comes from the policy and is validated", "[tracker]")
   zero.hold = Duration::zero();
   zero.margin_px = 0.0F;
   zero.margin_ratio = 0.0F;
+  zero.motion_gate_per_s = 0.0F;  // the motion gate off
+  zero.motion_size_ratio = 1.0F;
   CHECK_NOTHROW(spg::validate(zero));
 }
 
@@ -393,6 +401,200 @@ TEST_CASE("tracker: kinds and distant boxes keep separate tracks", "[tracker]") 
   CHECK(tracks[2].box.rect.x == 505.0F);
 }
 
+TEST_CASE("tracker: a small fast box keeps its track between sparse detections", "[tracker]") {
+  // SPG-16b: a 35 x 48 px face at (490, 140) px/s, one detection cycle every
+  // 200 ms (one worker), as the faces suite's seq-018 face moves. It moves
+  // 98 px, 2.8 widths, between detections, so IoU never pairs them; the
+  // motion gate does.
+  const auto box_at = [](std::int64_t ms) {
+    const auto t = static_cast<float>(ms);
+    return Rect{100.0F + 0.49F * t, 300.0F + 0.14F * t, 35.0F, 48.0F};
+  };
+  const TrackerConfig config;
+  ManualClock clock;
+  Tracker tracker(clock, config);
+  std::vector<spg::TrackMotion> motions;
+  for (std::int64_t ms = 0; ms <= 800; ms += 200) {
+    clock.set(at_ms(ms));
+    const Rect b = box_at(ms);
+    tracker.update(at_ms(ms), std::vector<Detection>{face(b.x, b.y, b.width, b.height)}, &motions);
+    REQUIRE(motions.size() == 1);
+    CHECK(motions[0].first_seen == at_ms(0));
+    if (ms > 0) {
+      CHECK(std::abs(motions[0].velocity.dx_per_s - 490.0F) < 1.0F);
+      CHECK(std::abs(motions[0].velocity.dy_per_s - 140.0F) < 1.0F);
+      CHECK(motions[0].translating);
+    }
+  }
+  const std::vector<spg::Track> tracks = tracker.tracks();
+  REQUIRE(tracks.size() == 1);
+  CHECK(tracks[0].id == 1);
+  // Every 60 fps frame from the first detection on is covered, with margin,
+  // where the face really is: between sightings too.
+  for (std::int64_t ms = 0; ms <= 800; ms += 16) {
+    INFO("frame " << ms);
+    CHECK(covered(tracker.masks(at_ms(ms)), required(box_at(ms), config)));
+  }
+
+  // Without the gate (main before SPG-16b) every cycle starts a track with no
+  // velocity, and the face leaves its mask between cycles.
+  TrackerConfig off = config;
+  off.motion_gate_per_s = 0.0F;
+  ManualClock clock_off;
+  Tracker before(clock_off, off);
+  for (std::int64_t ms = 0; ms <= 800; ms += 200) {
+    clock_off.set(at_ms(ms));
+    const Rect b = box_at(ms);
+    before.update(at_ms(ms), std::vector<Detection>{face(b.x, b.y, b.width, b.height)});
+  }
+  CHECK(before.tracks().size() == 5);
+  CHECK_FALSE(covered(before.masks(at_ms(100)), required(box_at(100), off)));
+}
+
+TEST_CASE("tracker: a slide-in seen at the edge and near rest is covered in between", "[tracker]") {
+  // A toast eases out (cubic) from the right edge of a 1920 px frame to
+  // x = 1400 over 200 ms from 170; cycles 200 ms apart see it clipped at the
+  // edge (95 of 180 px wide),
+  // then near rest (SPG-16b, text suite seq-006 with one worker). The
+  // measured velocity puts it where constant motion would, behind where the
+  // ease-out really has it; the hull of the two sightings covers it.
+  const auto box_at = [](std::int64_t ms) {
+    const double p = std::clamp(static_cast<double>(ms - 170) / 200.0, 0.0, 1.0);
+    const double x = 1920.0 + (1400.0 - 1920.0) * (1.0 - std::pow(1.0 - p, 3.0));
+    return Rect{static_cast<float>(x), 100.0F, static_cast<float>(std::min(180.0, 1920.0 - x)), 28.0F};
+  };
+  const TrackerConfig config;
+  ManualClock clock;
+  Tracker tracker(clock, config);
+  std::vector<spg::TrackMotion> motions;
+  for (const std::int64_t ms : {183, 383}) {
+    clock.set(at_ms(ms));
+    const Rect b = box_at(ms);
+    tracker.update(at_ms(ms), std::vector<Detection>{text(b.x, b.y, b.width, b.height)}, &motions);
+  }
+  REQUIRE(tracker.tracks().size() == 1);
+  REQUIRE(motions.size() == 1);
+  CHECK(motions[0].first_seen == at_ms(183));
+  CHECK(motions[0].velocity.dx_per_s < -1000.0F);
+  CHECK(motions[0].translating);  // the scheduler trails it back to the edge
+  for (std::int64_t ms = 183; ms <= 383; ms += 16) {
+    INFO("frame " << ms);
+    CHECK(covered(tracker.masks(at_ms(ms)), required(box_at(ms), config)));
+  }
+}
+
+TEST_CASE("tracker: the motion gate bounds distance, size and kind", "[tracker]") {
+  // A 40 px face at 1000; with a 12/s gate, 200 ms later it reaches
+  // 12/s * 0.2 s = 2.4 box sizes from its center.
+  TrackerConfig config;
+  config.motion_gate_per_s = 12.0F;
+  config.motion_size_ratio = 2.0F;
+  const auto tracks_after = [&](const Detection& second, Duration gap = milliseconds{200}) {
+    ManualClock clock;
+    Tracker tracker(clock, config);
+    tracker.update(at_ms(0), std::vector<Detection>{face(1000.0F, 500.0F, 40.0F, 40.0F)});
+    clock.set(at_ms(0) + gap);
+    tracker.update(at_ms(0) + gap, std::vector<Detection>{second});
+    return tracker.tracks().size();
+  };
+  CHECK(tracks_after(face(1095.0F, 500.0F, 40.0F, 40.0F)) == 1);   // 2.375 sizes
+  CHECK(tracks_after(face(1097.0F, 500.0F, 40.0F, 40.0F)) == 2);   // 2.425 sizes
+  CHECK(tracks_after(face(1000.0F, 595.0F, 40.0F, 40.0F)) == 1);   // either axis
+  CHECK(tracks_after(face(1060.0F, 560.0F, 40.0F, 40.0F)) == 1);   // 2.12 sizes
+  CHECK(tracks_after(face(1070.0F, 570.0F, 40.0F, 40.0F)) == 2);   // 2.47 sizes
+  // Half the time, half the reach.
+  CHECK(tracks_after(face(1045.0F, 500.0F, 40.0F, 40.0F), milliseconds{100}) == 1);
+  CHECK(tracks_after(face(1050.0F, 500.0F, 40.0F, 40.0F), milliseconds{100}) == 2);
+  // Reach stops growing at max_prediction (500 ms: 6 sizes).
+  CHECK(tracks_after(face(1235.0F, 500.0F, 40.0F, 40.0F), milliseconds{700}) == 1);
+  CHECK(tracks_after(face(1250.0F, 500.0F, 40.0F, 40.0F), milliseconds{700}) == 2);
+  // A box size is the larger extent of the two boxes on each axis.
+  CHECK(tracks_after(face(1150.0F, 500.0F, 80.0F, 40.0F)) == 1);  // 4.25 old widths, 2.125 new
+  // Width and height each within a factor of 2.
+  CHECK(tracks_after(face(1060.0F, 500.0F, 80.0F, 40.0F)) == 1);
+  CHECK(tracks_after(face(1060.0F, 500.0F, 81.0F, 40.0F)) == 2);
+  CHECK(tracks_after(face(1060.0F, 500.0F, 40.0F, 19.0F)) == 2);
+  // Same kind only; the gate is off at 0.
+  CHECK(tracks_after(text(1060.0F, 500.0F, 40.0F, 40.0F)) == 2);
+  TrackerConfig off = config;
+  off.motion_gate_per_s = 0.0F;
+  ManualClock clock;
+  Tracker tracker(clock, off);
+  tracker.update(at_ms(0), std::vector<Detection>{face(1000.0F, 500.0F, 40.0F, 40.0F)});
+  tracker.update(at_ms(200), std::vector<Detection>{face(1060.0F, 500.0F, 40.0F, 40.0F)});
+  CHECK(tracker.tracks().size() == 2);
+}
+
+TEST_CASE("tracker: the motion gate measures from where the track's velocity puts it", "[tracker]") {
+  TrackerConfig config;
+  config.motion_gate_per_s = 12.0F;  // 2.4 box sizes in 200 ms
+  ManualClock clock;
+  Tracker tracker(clock, config);
+  // 450 px/s to the right (2.25 sizes in 200 ms, joined by the gate). 200 ms
+  // later the box is 3.125 sizes from the last one, out of reach, but 0.875
+  // from where the velocity puts it, and too far ahead for IoU.
+  tracker.update(at_ms(0), std::vector<Detection>{face(0.0F, 500.0F, 40.0F, 40.0F)});
+  tracker.update(at_ms(200), std::vector<Detection>{face(90.0F, 500.0F, 40.0F, 40.0F)});
+  REQUIRE(tracker.tracks().size() == 1);
+  tracker.update(at_ms(400), std::vector<Detection>{face(215.0F, 500.0F, 40.0F, 40.0F)});
+  REQUIRE(tracker.tracks().size() == 1);
+  CHECK(tracker.tracks()[0].velocity.dx_per_s == 537.5F);
+  // An older result is measured back along the velocity: 0.4 sizes from
+  // where it puts the box 100 ms earlier, 1.75 from the last box (reach 1.2).
+  tracker.update(at_ms(300), std::vector<Detection>{face(145.0F, 500.0F, 40.0F, 40.0F)});
+  CHECK(tracker.tracks().size() == 1);
+}
+
+TEST_CASE("tracker: IoU pairs come first and the gate pairs the closest", "[tracker]") {
+  TrackerConfig config;
+  config.motion_gate_per_s = 12.0F;  // 2.4 box sizes in 200 ms
+  ManualClock clock;
+  Tracker tracker(clock, config);
+  // Tracks A (id 1) at 1100 and B (id 2) at 1180.
+  tracker.update(at_ms(0), std::vector<Detection>{face(1100.0F, 500.0F, 40.0F, 40.0F),
+                                                  face(1180.0F, 500.0F, 40.0F, 40.0F)});
+  // 200 ms later: 1185 overlaps B (IoU 0.78) and is in A's reach (2.125
+  // sizes); IoU keeps it on B. 1140 is 1 size from A and from B, and 1050
+  // is 1.25 sizes from A: the gate gives A the closer one, and 1050 starts
+  // a track.
+  tracker.update(at_ms(200), std::vector<Detection>{face(1050.0F, 500.0F, 40.0F, 40.0F),
+                                                    face(1185.0F, 500.0F, 40.0F, 40.0F),
+                                                    face(1140.0F, 500.0F, 40.0F, 40.0F)});
+  const std::vector<spg::Track> tracks = tracker.tracks();
+  REQUIRE(tracks.size() == 3);
+  CHECK(tracks[0].box.rect.x == 1140.0F);
+  CHECK(tracks[1].box.rect.x == 1185.0F);
+  CHECK(tracks[2].box.rect.x == 1050.0F);
+  CHECK(tracks[2].id == 3);
+}
+
+TEST_CASE("tracker: a wrong motion pairing keeps every hold", "[tracker]") {
+  // Face A is seen once; face B appears 200 ms later within A's reach and
+  // joins A's track. Each box still holds, with its margin, for the whole
+  // hold after the frame it was seen on: a pairing only moves masks along
+  // the track's motion, it never ends one.
+  const TrackerConfig config;
+  ManualClock clock;
+  Tracker tracker(clock, config);
+  const Rect a{1000.0F, 500.0F, 40.0F, 40.0F};
+  const Rect b{1000.0F, 580.0F, 40.0F, 40.0F};
+  tracker.update(at_ms(0), std::vector<Detection>{face(a.x, a.y, a.width, a.height)});
+  clock.set(at_ms(200));
+  tracker.update(at_ms(200), std::vector<Detection>{face(b.x, b.y, b.width, b.height)});
+  REQUIRE(tracker.tracks().size() == 1);
+  for (std::int64_t ms = 0; ms <= 950; ms += 10) {
+    INFO("frame " << ms);
+    clock.set(at_ms(ms));
+    const std::vector<Box> masks = tracker.masks(at_ms(ms));
+    if (ms <= 750) {
+      CHECK(covered(masks, required(a, config)));
+    }
+    if (ms >= 200) {
+      CHECK(covered(masks, required(b, config)));
+    }
+  }
+}
+
 TEST_CASE("tracker: a track lost past its hold restarts with a new id", "[tracker]") {
   ManualClock clock;
   Tracker tracker(clock, TrackerConfig{});
@@ -602,6 +804,8 @@ class Scene {
     c.velocity_smoothing = static_cast<float>(uniform(0.2, 1.0));
     c.max_prediction = milliseconds{uniform_int(0, 800)};
     c.max_rects_per_track = static_cast<std::size_t>(uniform_int(1, 12));
+    c.motion_gate_per_s = chance(0.2) ? 0.0F : static_cast<float>(uniform(0.0, 40.0));
+    c.motion_size_ratio = static_cast<float>(uniform(1.0, 4.0));
     return c;
   }
 

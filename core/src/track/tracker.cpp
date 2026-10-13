@@ -152,6 +152,22 @@ std::int64_t floor_div(std::int64_t a, std::int64_t b) noexcept {
 
 constexpr std::size_t kMaxRectsPerTrackLimit = 64;
 
+// The larger of two positive lengths over the smaller; infinite when either
+// is not positive, so an empty box never passes a size gate.
+double size_ratio(float a, float b) noexcept {
+  const double lo = std::min(static_cast<double>(a), static_cast<double>(b));
+  const double hi = std::max(static_cast<double>(a), static_cast<double>(b));
+  return lo > 0.0 ? hi / lo : std::numeric_limits<double>::infinity();
+}
+
+// Distance from (cx, cy) to the center of `box` in box sizes: per axis, the
+// offset over the larger of `box`'s and `last`'s extent on that axis.
+double size_distance(const Rect& box, const Rect& last, double cx, double cy) noexcept {
+  const double sx = std::max(static_cast<double>(box.width), static_cast<double>(last.width));
+  const double sy = std::max(static_cast<double>(box.height), static_cast<double>(last.height));
+  return std::hypot((center_x(box) - cx) / sx, (center_y(box) - cy) / sy);
+}
+
 }  // namespace
 
 TrackerConfig TrackerConfig::from_policy(const PolicyConfig& policy) {
@@ -181,6 +197,12 @@ void validate(const TrackerConfig& config) {
   }
   if (!(config.iou_threshold > 0.0F && config.iou_threshold <= 1.0F)) {
     throw ContractError("tracker config: iou_threshold must be in (0, 1]");
+  }
+  if (!std::isfinite(config.motion_gate_per_s) || config.motion_gate_per_s < 0.0F) {
+    throw ContractError("tracker config: motion_gate_per_s must be finite and not negative");
+  }
+  if (!std::isfinite(config.motion_size_ratio) || config.motion_size_ratio < 1.0F) {
+    throw ContractError("tracker config: motion_size_ratio must be finite and at least 1");
   }
   if (!(config.velocity_smoothing > 0.0F && config.velocity_smoothing <= 1.0F)) {
     throw ContractError("tracker config: velocity_smoothing must be in (0, 1]");
@@ -241,18 +263,75 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
   });
   std::vector<bool> track_taken(tracks_.size(), false);
   std::vector<bool> detection_taken(detections.size(), false);
-  for (const Candidate& c : candidates) {
-    if (track_taken[c.track] || detection_taken[c.detection]) {
-      continue;
-    }
-    track_taken[c.track] = true;
-    detection_taken[c.detection] = true;
-    TrackState& state = tracks_[c.track];
-    confirm(state, frame_time, detections[c.detection].box.rect);
+  const auto join = [&](std::size_t ti, std::size_t di) {
+    track_taken[ti] = true;
+    detection_taken[di] = true;
+    TrackState& state = tracks_[ti];
+    confirm(state, frame_time, detections[di].box.rect);
     if (motions != nullptr) {
-      (*motions)[c.detection] = state.has_velocity
-                                    ? TrackMotion{state.track.velocity, state.first_seen, state.translating}
-                                    : TrackMotion{Velocity{}, state.first_seen, false};
+      (*motions)[di] = state.has_velocity
+                           ? TrackMotion{state.track.velocity, state.first_seen, state.translating}
+                           : TrackMotion{Velocity{}, state.first_seen, false};
+    }
+  };
+  for (const Candidate& c : candidates) {
+    if (!track_taken[c.track] && !detection_taken[c.detection]) {
+      join(c.track, c.detection);
+    }
+  }
+
+  // Motion gate (SPG-16b): the tracks and detections IoU left unpaired, when
+  // the detection is where the track could have moved in the frame time
+  // between them (see TrackerConfig::motion_gate_per_s). It runs after IoU so
+  // every pair IoU makes is kept. A detection joining the wrong track only
+  // changes that track's motion: every detection is held from its own frame
+  // whatever track it joins, so no hold is shortened.
+  struct MotionCandidate {
+    double cost;  // box sizes from the nearer of the last and predicted center
+    std::size_t track;
+    std::size_t detection;
+  };
+  std::vector<MotionCandidate> moving;
+  if (config_.motion_gate_per_s > 0.0F) {
+    const double ratio = static_cast<double>(config_.motion_size_ratio);
+    for (std::size_t ti = 0; ti < tracks_.size(); ++ti) {
+      const TrackState& state = tracks_[ti];
+      const Track& track = state.track;
+      if (track_taken[ti] || frame_time > track.hold_until) {
+        continue;
+      }
+      const Duration offset = frame_time - track.last_confirmed;
+      const Duration gap = std::min(offset < Duration::zero() ? -offset : offset, config_.max_prediction);
+      const double reach = static_cast<double>(config_.motion_gate_per_s) * seconds(gap);
+      if (!(reach > 0.0)) {
+        continue;  // same frame time: only IoU pairs it
+      }
+      const Rect& last = track.box.rect;
+      // Where the track's velocity puts it at frame_time, forward or back,
+      // capped as prediction is.
+      const double ahead = seconds(std::clamp(offset, -config_.max_prediction, config_.max_prediction));
+      const double px = center_x(last) + static_cast<double>(track.velocity.dx_per_s) * ahead;
+      const double py = center_y(last) + static_cast<double>(track.velocity.dy_per_s) * ahead;
+      for (std::size_t di = 0; di < detections.size(); ++di) {
+        const Rect& box = detections[di].box.rect;
+        if (detection_taken[di] || detections[di].kind != track.kind ||
+            !(size_ratio(box.width, last.width) <= ratio && size_ratio(box.height, last.height) <= ratio)) {
+          continue;
+        }
+        const double cost = std::min(size_distance(box, last, center_x(last), center_y(last)),
+                                     size_distance(box, last, px, py));
+        if (cost <= reach) {
+          moving.push_back({cost, ti, di});
+        }
+      }
+    }
+  }
+  std::sort(moving.begin(), moving.end(), [](const MotionCandidate& a, const MotionCandidate& b) {
+    return std::tie(a.cost, a.track, a.detection) < std::tie(b.cost, b.track, b.detection);
+  });
+  for (const MotionCandidate& c : moving) {
+    if (!track_taken[c.track] && !detection_taken[c.detection]) {
+      join(c.track, c.detection);
     }
   }
 
@@ -318,6 +397,26 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
   // Sticky: a later measurement at rest does not clear it, so a result that
   // lands late is judged the same whatever arrived before it.
   state.translating = state.translating || translated(track.box.rect, box, track.velocity);
+  // Between two sightings the object went from the last box to this one.
+  // Velocity covers that path only as far as constant motion would: a slide
+  // that eases out is further along than the measurement says, and a track
+  // seen once has no velocity at all. So the hull of both boxes, with the
+  // larger of their margins, is held from the last sighting. With one
+  // detection cycle every ~200 ms this covers the frames between sightings
+  // of a box that moves more than its size (SPG-16b).
+  const Rect& last = track.box.rect;
+  Held bridge = make_held(
+      narrow_rect(std::min(static_cast<double>(last.x), static_cast<double>(box.x)),
+                  std::min(static_cast<double>(last.y), static_cast<double>(box.y)),
+                  std::max(static_cast<double>(last.x) + static_cast<double>(last.width),
+                           static_cast<double>(box.x) + static_cast<double>(box.width)),
+                  std::max(static_cast<double>(last.y) + static_cast<double>(last.height),
+                           static_cast<double>(box.y) + static_cast<double>(box.height))),
+      track.last_confirmed, Velocity{});
+  const Held last_held = make_held(last, track.last_confirmed, Velocity{});
+  const Held this_held = make_held(box, frame_time, Velocity{});
+  bridge.margin_x = bridge.margin_y = std::max(last_held.margin_x, this_held.margin_x);
+  state.held.push_back(bridge);
   track.box = Box{box, Space::Source};
   track.last_confirmed = frame_time;
   track.hold_until = frame_time + config_.hold;
