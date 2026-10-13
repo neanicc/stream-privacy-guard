@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <exception>
 #include <numeric>
+#include <thread>
 #include <utility>
 
 #include "spg/error.hpp"
@@ -17,6 +20,7 @@ constexpr std::uint32_t kMaxInputHeight = 1024;
 constexpr std::uint32_t kMaxStride = 64;
 constexpr std::uint32_t kMaxWidth = 1U << 14;
 constexpr std::size_t kMaxBatch = 64;
+constexpr std::size_t kMaxParallelRuns = 16;
 
 std::string shape_text(std::span<const std::int64_t> shape) {
   std::string text = "[";
@@ -134,6 +138,9 @@ void validate(const TextRecognizerConfig& config) {
   if (config.max_batch < 1 || config.max_batch > kMaxBatch) {
     throw TextRecognizerError("text recognizer: max_batch must be in [1, 64]");
   }
+  if (config.parallel_runs < 1 || config.parallel_runs > kMaxParallelRuns) {
+    throw TextRecognizerError("text recognizer: parallel_runs must be in [1, 16]");
+  }
   try {
     validate(config.lines);
   } catch (const std::invalid_argument& error) {
@@ -177,6 +184,51 @@ std::vector<float> to_recognizer_tensor(std::span<const detect::BgrImage> images
 namespace {
 
 // Validates `config` before paying for a session and gives a default warmup.
+// Calls run(b) once for every b in [0, count), on up to `lanes` threads: the
+// caller and lanes - 1 it starts, each taking the next b until none is left.
+// A lane that cannot start leaves its share to the others. The first
+// exception stops the lanes from taking more and is rethrown once every lane
+// has returned, so no thread outlives the call.
+template <class Run>
+void run_batches(std::size_t count, std::size_t lanes, const Run& run) {
+  lanes = std::min(lanes, count);
+  if (lanes <= 1) {
+    for (std::size_t b = 0; b < count; ++b) {
+      run(b);
+    }
+    return;
+  }
+  std::atomic<std::size_t> next{0};
+  std::vector<std::exception_ptr> errors(lanes);
+  const auto lane = [&](std::size_t i) noexcept {
+    try {
+      for (std::size_t b = next.fetch_add(1); b < count; b = next.fetch_add(1)) {
+        run(b);
+      }
+    } catch (...) {
+      errors[i] = std::current_exception();
+      next.store(count);
+    }
+  };
+  {
+    std::vector<std::jthread> helpers;
+    try {
+      helpers.reserve(lanes - 1);
+      for (std::size_t i = 1; i < lanes; ++i) {
+        helpers.emplace_back(lane, i);
+      }
+    } catch (...) {
+      // Fewer lanes: the caller's takes what the missing ones would have.
+    }
+    lane(0);
+  }  // joins the helpers
+  for (const std::exception_ptr& error : errors) {
+    if (error) {
+      std::rethrow_exception(error);
+    }
+  }
+}
+
 runtime::SessionOptions recognizer_options(const TextRecognizerConfig& config, runtime::SessionOptions options) {
   validate(config);
   if (options.warmup_shapes.empty()) {
@@ -247,7 +299,9 @@ std::vector<Recognition> TextRecognizer::recognize(const FrameView& frame, Size 
   std::vector<SecureText> texts(jobs.size());
   std::vector<CtcStats> stats(jobs.size());
   const std::size_t classes = alphabet_.size();
-  for (std::size_t first = 0; first < order.size(); first += config_.max_batch) {
+  // One model run: the batch of jobs order[first, first + count). Batches
+  // write disjoint entries of texts and stats, so they can run at once.
+  const auto run_batch = [&](std::size_t first) {
     const std::size_t count = std::min(config_.max_batch, order.size() - first);
     std::vector<detect::BgrImage> images;
     images.reserve(count);
@@ -279,7 +333,11 @@ std::vector<Recognition> TextRecognizer::recognize(const FrameView& frame, Size 
       const std::size_t j = order[first + k];
       stats[j] = ctc_greedy_decode(all.subspan(k * steps * classes, steps * classes), steps, alphabet_, texts[j]);
     }
-  }
+  };
+  // Widest batches first, so the lanes finish close together.
+  const std::size_t batches = (order.size() + config_.max_batch - 1) / config_.max_batch;
+  run_batches(batches, config_.parallel_runs,
+              [&](std::size_t b) { run_batch((batches - 1 - b) * config_.max_batch); });
 
   // Join each region's texts: chunks of one view by ' ', views by '\n'.
   std::vector<SecureText> joined(regions.size());

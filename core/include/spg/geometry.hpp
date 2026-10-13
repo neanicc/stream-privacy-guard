@@ -89,6 +89,12 @@ class ModelInputMapping {
   // Throws ContractError when the crop is invalid or empty or the input size
   // has a zero dimension.
   ModelInputMapping(Rect crop, Size input, Fit fit);
+  // A letterbox fit whose uniform scale is at most `max_scale` (positive and
+  // finite): a crop that would be scaled up further keeps that scale and the
+  // input is padded instead (at the origin's far sides for LetterboxTopLeft,
+  // evenly for LetterboxCenter). Throws ContractError as above, for Stretch,
+  // or for a bad `max_scale`.
+  ModelInputMapping(Rect crop, Size input, Fit fit, double max_scale);
   [[nodiscard]] Rect crop() const noexcept { return crop_; }
   [[nodiscard]] Size input() const noexcept { return input_; }
   [[nodiscard]] Fit fit() const noexcept { return fit_; }

@@ -67,6 +67,12 @@ struct TextRecognizerConfig {
   // per crop in batches of 2 to 8 as one at a time (4.5 ms vs 7.5 to 12 ms
   // per 48x320 crop; agent-log SPG-07).
   std::size_t max_batch = 1;
+  // Model runs in flight at once in one recognize() call, in [1, 16]: the
+  // calling thread plus up to parallel_runs - 1 it starts and joins before
+  // returning. A 48x320 crop scales poorly over ONNX Runtime's threads (dev
+  // Mac: 4.0 ms on 4 threads, 9.4 ms on 1), so a frame with many lines reads
+  // faster with crops side by side (SPG-16: chat frames, about 25 regions).
+  std::size_t parallel_runs = 4;
   LineSplitParams lines;
 };
 
@@ -139,8 +145,10 @@ class TextRecognizer {
   //
   // Cost: one model run per max_batch read jobs; a region is at least one job
   // (one more per extra line, two more when tall, and more when a view is
-  // chunked). No deadline or cancel check inside: call it on a worker thread
-  // and fail the frame closed when it misses the lookahead deadline.
+  // chunked), up to parallel_runs of them at once on threads this call starts
+  // and joins. No deadline or cancel check inside: call it on a worker thread
+  // and fail the frame closed when it misses the lookahead deadline. The
+  // result does not depend on parallel_runs.
   //
   // Throws on any failure so the caller can fail the frame closed:
   // ContractError for an invalid frame, source or region box,

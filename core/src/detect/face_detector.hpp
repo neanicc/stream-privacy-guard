@@ -24,8 +24,11 @@
 // except opening the model file.
 
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -51,6 +54,12 @@ struct FaceDetectorConfig {
   std::size_t top_k = 5000;
   // Also run scale-1 tiles when the frame is larger than the model input.
   bool tiles = true;
+  // Tiles run round robin over this many detect() calls that need them: the
+  // n-th such call (from 0) runs tile i when i % tile_cadence equals
+  // n % tile_cadence, so every tile runs once in tile_cadence calls and the
+  // whole-frame pass runs on every call. 1 runs every tile on every call.
+  // In [1, 8].
+  std::uint32_t tile_cadence = 1;
   // Minimum overlap between neighbouring tiles, in readback pixels: a face
   // up to this size is whole in some tile. Below the input's shorter side.
   std::uint32_t tile_overlap = 128;
@@ -115,8 +124,9 @@ class FaceDetector {
   // threshold. Safe to call from several threads at once.
   //
   // Cost: one model run for the whole frame plus, when `tiles` is set and the
-  // frame is larger than the input, one per tile (8 for 1920x1080 at a
-  // 640x640 input and the default overlap), run one after another.
+  // frame is larger than the input, one per tile of this call's share (8
+  // tiles for 1920x1080 at a 640x640 input and the default overlap, split
+  // over tile_cadence calls), run one after another.
   //
   // Throws on any failure so the caller can fail the frame closed:
   // ContractError for an invalid frame or zero-size source,
@@ -133,6 +143,9 @@ class FaceDetector {
   FaceDetectorConfig config_;
   Size input_;
   OutputIndex output_index_{};
+  // detect() calls that ran tiles, for tile_cadence. Behind a pointer so the
+  // detector stays movable.
+  std::unique_ptr<std::atomic<std::uint64_t>> tile_calls_ = std::make_unique<std::atomic<std::uint64_t>>(0);
 };
 
 }  // namespace spg::detect
