@@ -2195,162 +2195,68 @@ Template:
 
 - Decision (owner, issue #75): option 1. For a confirmed moving track that is
   still being updated, the hold follows the track instead of keeping the
-  stale rect. Tracking loss, a resize and anything not confirmed keep the old
-  hold. Parameters below are this PR's choices; nobody was asked.
+  stale rect; tracking loss, a missed cycle, a resize and anything not
+  confirmed keep the old hold. AGENTS.md names following as the one
+  exception to the temporal hold (#82, merged by the owner). Parameters are
+  this PR's choices.
 - Measured first (main `974b882`, text suite, temporary switches in a scratch
-  build that were not committed). Every covered decoy is in the chat template
-  (CI 362 of 362; local 2366 of 2370, the other 4 in a window), so
-  `decoy_blur_rate` is scrolling chat. Covered decoy pairs, local (4654 pairs,
-  2370 covered, 0.5092) and CI (893 pairs, 362, 0.4054):
-
-  | Change (alone unless noted) | Local | CI | Recall / leak |
-  | --- | --- | --- | --- |
-  | Drop every held box of a translating track that a newer detection of the track at or before the frame superseded (upper bound of option 1) | 1666 (0.358) | 264 (0.296) | unchanged |
-  | Same, any track | 1665 (0.358) | 264 | unchanged |
-  | Margin 0 (`margin_px` and `margin_ratio`) | 1813 (0.390) | 200 (0.224) | unchanged |
-  | Drop the newest held box's unmoved part too (moved box only) | not run | 234 (0.262) | CI leak 0 -> 3 frames, watch-list pair 557 -> 554 |
-  | No static retro rect for a moving track | not run | 300 (0.336) | unchanged in CI |
-  | Superseded drop + no static retro | 1089 (0.234) | 202 (0.226) | local first-frame 51 -> 50 (FAIL), leak 7 -> 13, watch-list pair 3996 -> 3990 |
-  | Superseded drop + margin 0 | not run | 24 (0.027) | unchanged in CI |
-
-  So stale held rects of moving tracks are about 30% of covered decoys
-  (704 of 2370 local, 98 of 362 CI), margin about a quarter, and the static
-  retroactive rect of a moving track (placed where the line will be) most of
-  the rest; the newest box's own unmoved part is not safe to drop.
+  build, not committed). Every covered decoy is scrolling chat (CI 362 of
+  362; local 2366 of 2370). Upper bounds, covered decoy pairs local / CI
+  (main 2370 / 362): dropping every superseded held box of a translating
+  track 1666 / 264 with recall unchanged; margin 0 1813 / 200; dropping the
+  newest box's unmoved part too: CI 234 but CI leak 0 -> 3 frames (unsafe);
+  dropping the static retro rect of a moving track plus the superseded drop
+  1089 / 202 but local first-frame recall 51 -> 50 (FAIL) and leak 7 -> 13.
 - Change: `Tracker` follows confirmed moving tracks (docs/tracker.md,
-  "Following"; docs/policy.md, "Temporal hold"). In-order confirmations are
-  measured against the last measured box once the center moved at least
-  `follow_min_move` (4 px); a measurement is consistent when both edges
-  translated at least 1 px along the larger velocity axis and, after the
-  first, the axis and direction match and the speed is within
-  `follow_speed_ratio` (2) of the previous one; a size change over a quarter
-  ends the run. Two measurements in a run (`follow_after` 2, three
-  detections) confirm the track. A held box of the run is then left out on a
-  frame once a newer detection of the run is at or before that frame and the
-  track was confirmed at or after it. Late detections, boxes from before a
-  resize, unconfirmed tracks and frames after the last confirmation keep the
-  old hold. Retroactive rects and the SPG-12c trail are unchanged.
-  `TrackMotion` also reports the track id.
-- Review fixes (Greptile P1, staff-review P2s on `43f30bd`): a cycle that
-  does not find a track (a missed scan) ends its run and makes every box it
-  held then unfollowable, so a later confirmation can no longer follow boxes
-  across the miss (before, an empty cycle at 500 ms followed by a find at
-  600 ms released the 0 and 200 ms boxes on the 500 ms frame). A track whose
-  confirmations have not moved `follow_min_move` for longer than the hold
-  ends its run, and the next run starts from that confirmation, so a stopped
-  track cannot carry a stale run into a takeover. The following-on property
-  test now derives misses and the confirmation count from what it delivered,
-  not from tracker state; removing the confirmation guard or the miss reset
-  each makes it fail. A unit case pins a static secret line with a
-  same-size decoy line scrolling through it, the secret missed on up to four
-  overlapping cycles: every secret box keeps its hold. It holds by
-  association (the secret's own box always wins its track), so it also
-  passes with the follow guards removed. The property test also checks the
-  scene's ground truth: following never uncovers an object's newest
-  detection, whichever track took it. Disabling the size, translation and
-  speed checks of the run fails it on seed 1062; without that condition the
-  property test passed the same mutation. AGENTS.md wording: #82
-  (`needs-human`).
-- Babysit cycle 2 (staff review on `ba8e8e0`, coordinator safety check):
-  - A newer detection that found only part of a scrolling line (clipped on
-    one side within the quarter size tolerance, so the run went on) released
-    the older full boxes: with default margins a 30 px clip of a 200 x 40
-    line left the line's far edge uncovered from the clipped detection to the
-    next one. An older box is now followed only if the newest box of the run
-    at or before `t`, grown by its margin, contains it moved to the newest
-    one's frame time at every velocity between the run's lowest and highest
-    measurement. A check with the latest measurement alone was not enough: a
-    20 px left clip shifts the center, so the measurement taken to the
-    clipped box carried the older box along with it. New unit case: clips
-    of 0 to 25% on each side, on cycles 2 to 4, cover the line's full extent
-    on every frame; it fails with the check removed or with the latest
-    measurement alone.
-  - A run that replaces a broken one (another axis, direction or speed) now
-    starts with the box measured to, not from. Before, a same-size line that
-    took over a missed line's track moving the other way released that
-    line's last box after two measurements. Starting every run with the box
-    measured to (also the track's first run) was measured too and removed
-    all of the CI gain (decoy back to 0.4054), so only the broken-run case
-    changed.
-  - The accepted risk is pinned in a unit case: a same-size line that
-    continues a missed line's run (same axis, direction and speed) takes its
-    hold; a taller line, a reversed one and following off keep it.
-    `docs/tracker.md` gains a state diagram of `measure_run` and a
-    "Remaining risk" section.
-  - Staff review on `5e7b393` (uneven scroll speed): a unit case scrolls a
-    line accelerating, decelerating, easing in and out, and stopping and
-    starting, with one or two workers; its whole extent stays covered on
-    every frame while the track is followed. It also passes with the
-    containment check removed (the newest box's prediction hull covers it),
-    so it is evidence for the scenario, not a guard. `measure_run` gets a
-    state-machine comment.
-  - Eval, pre-merge (base `974b882`, same seed): CI text decoy 0.3404 (304,
-    unchanged), every other CI metric identical. Local text decoy 0.3954
-    (1840 of 4654; 52 more pairs held than `ba8e8e0`, main 0.5092); watch-list
-    pair 3996/3999, first-frame 51/53, PII pair 4158/4162, leak 7/1919, clean
-    0.0019: identical. Local faces identical (pair 2206/2207, leak 1/1080,
-    clean 0). Realtime (loaded machine, unreliable): fail-closed 0.9956,
-    p95 857 ms, both FAIL as on main.
-- Babysit cycle 3 (staff review on `9c64230`, score 80):
-  - The containment math in `masks()` moved out of an inline lambda into
-    `core/src/track/follow.{hpp,cpp}` (`follow::active`,
-    `follow::contains_moved`) behind `Tracker::follow_target()` and
-    `Tracker::followed()`, with direct unit tests (contained, clipped on
-    each side, the low and high ends of the velocity range, following off).
-    Behavior unchanged: the tracker suite runs the same 18916864 assertions
-    in 33 test cases (29 before plus the 4 new ones).
-  - The following tests share a `Session` fixture (clock and tracker), so
-    no tracker outlives its clock; every scenario and assertion is kept. The
-    oracle `may_follow`, the tracker rule and `docs/tracker.md` carry a
-    keep-in-sync note.
-  - Eval on the merged head (local, dev Mac, `SPG_BUILD_PLUGIN=0`) against
-    main `827149c` built the same way, default seed. Local text: decoy
-    0.5082 (2365/4654) on main, 0.3889 (1810/4654) here; watch-list pair
-    3996/3999, first-frame 51/53, PII pair 4158/4162, leak 7/1919
-    identical; clean blur 0.0027 -> 0.0019. Local faces identical (pair
-    2206/2207, leak 1/1080, clean 0). Hosted CI eval job, head `9c64230`
-    merged into `827149c` vs main `827149c`: decoy 0.4211 (376/893) ->
-    0.3583 (320/893); watch-list pair 557/557, first-frame 15/15, PII pair
-    590/590, leak 0/285, clean 0: identical. Realtime numbers from the
-    shared dev Mac are not reliable and are not used.
-  - The same-size takeover risk is a tracked item on #71 (live leak test).
+  "Following", the one statement of the rule; docs/policy.md, "Temporal
+  hold"). In-order confirmations are measured once the center moved
+  `follow_min_move` (4 px); two consistent measurements (one axis and
+  direction, speed within `follow_speed_ratio` 2, size within a quarter)
+  confirm the track. An older box of the run is left out on frame `t` only
+  if a newer run detection is at or before `t`, the track was confirmed at or
+  after `t`, no cycle missed the track since the box was taken, and the
+  newest run box at or before `t`, grown by its margin, contains the older
+  box grown by its own margin and moved at every velocity of the run's
+  measured range (`core/src/track/follow.{hpp,cpp}`). Retroactive rects and
+  the SPG-12c trail are unchanged. `TrackMotion` reports the track id.
+- Review fixes, in order (each with a unit case that fails without it):
+  a missed cycle ends the run and makes the boxes held then unfollowable
+  (Greptile P1); a track still for longer than the hold ends its run; a
+  clipped re-detection never releases the full older box (containment over
+  the whole velocity range; the latest measurement alone was not enough); a
+  run that replaces a broken one starts at the box measured to; cycle 4
+  (staff review on `2acee8b`, P2): the older box is grown by its own margin
+  before the containment check, so following moves the older mask's margin
+  into the newest mask instead of dropping it. The property test's oracle
+  restates the rule from what it delivered (order, resize, misses, run
+  length, ground-truth re-detection, and the margin-grown size condition);
+  reverting the margin change fails it and four other cases.
+- Accepted risk, pinned in a unit case and tracked on #71 (live leak test):
+  a same-size line that continues a missed line's run takes its hold.
+- Eval, cycle 4 head vs main `827149c`, both Release with
+  `SPG_BUILD_PLUGIN=0`, default seed:
+
+  | Suite | Metric | main | head before cycle 4 | head |
+  | --- | --- | --- | --- | --- |
+  | CI text | decoy | 0.4211 (376/893) | 0.3583 (320) | 0.4211 (376) |
+  | CI text | watch-list pair, first-frame, PII pair, leak, clean | 557/557, 15/15, 590/590, 0/285, 0 | identical | identical |
+  | Local text | decoy | 0.5082 (2365/4654) | 0.3889 (1810) | 0.5077 (2363) |
+  | Local text | watch-list pair, first-frame, PII pair, leak | 3996/3999, 51/53, 4158/4162, 7/1919 | identical | identical |
+  | Local text | clean blur | 0.0027 | 0.0019 | 0.0027 |
+  | Local faces | pair, leak, clean | 2206/2207, 1/1080, 0 | identical | identical |
+
+  The margin fix removes the decoy gain: detector boxes jitter by a pixel or
+  two and measured speeds vary, while equal boxes have equal margins, so an
+  older box grown by its margin rarely fits in the newest mask. Realtime
+  numbers from the shared dev Mac are unreliable and not used (SPG-16).
 - Rejected with evidence: measuring each confirmation against the previous
-  one. The eval's two workers confirm frames 17 ms apart, where a chat line
-  moves under 2 px and the box jitters 1-2 px, so almost every pair broke the
-  run: CI decoy stayed at 362 (no change). The minimum move fixed it.
-  Dropping the static retroactive rect of a moving track reaches 0.234 locally
-  but loses recall (table), and it is a retroactive mask, outside the
-  decision. Margin is a policy default, also outside it.
-- Eval, head vs main on the same generated suites (default seed). Main is
-  `974b882` logic (the scratch build with the switches unset; text numbers
-  match the SPG-12c entry exactly).
-  - CI text: decoy 0.4054 -> 0.3404 (362 -> 304 pairs, still FAIL);
-    watch-list pair 1.0000, first-frame 15/15, PII pair 1.0000, leak 0/285,
-    clean blur 0: all identical.
-  - Local text: decoy 0.5092 -> 0.3797 (2370 -> 1767, still FAIL);
-    watch-list pair 0.9992 (3996/3999), first-frame 51/53, PII pair 0.9990
-    (4158/4162), leak 7/1919: identical, and the same (frame, instance)
-    pairs are covered; clean blur 0.0027 -> 0.0019. With the review fixes:
-    decoy 0.3842 (1788; 21 more pairs held across misses), everything else
-    identical; CI text unchanged at 0.3404 (304).
-  - Local faces: identical (pair 0.9995, leak 1/1080, clean 0).
-  - Realtime (dev Mac under heavy load from other processes, not reliable):
-    fail-closed 0.9978 main vs 1.0000 head in the `run_eval` pair, then
-    0.9948 / 0.9933 and 0.9993 / 1.0000 (main / head) in two interleaved
-    pairs; p95 latency 802-981 ms on both. Both FAIL as on main; SPG-16 owns
-    it. Following runs in `masks()` on the scheduler thread and adds no
-    stage time.
-- Floor and what a threshold change would need: with this change and
-  today's margin and retroactive rects, decoy is 0.3797 locally and 0.3404 in
-  CI (0.3842 locally with the review fixes). The rest is the newest box's
-  own unmoved part and margin, and the static retroactive rect of a moving
-  line, which covers the line above where the secret will be. Passing on
-  this head needs `decoy_blur_rate_max` of at least 0.39 (local) and 0.35
-  (CI), a human
-  change to `eval/thresholds.toml` (option 2 on #75). Lower decoy without a
-  threshold change needs a decision on the margin (policy default) or on
-  retroactive rects for confirmed moving tracks; both measured above.
-- Open issues or follow-ups: AGENTS.md's "Temporal hold" bullet now names
-  following as its one exception (#82, merged by the owner).
-  `decoy_blur_rate` continues in SPG-12d #81. Synthetic eval only; live OBS
-  not tested.
+  one (17 ms worker pairs move under 2 px and broke every run; CI decoy
+  unchanged); starting every run at the box measured to (removed all of the
+  CI gain before cycle 4); dropping the static retro rect of a moving track
+  and margin 0 (recall loss or a policy default, outside the decision).
+- Open: `decoy_blur_rate` (limit 0.25) still fails and continues in SPG-12d
+  (#81); passing on today's mechanisms needs either a human threshold change
+  (option 2 on #75) or a decision on margin or retroactive rects for moving
+  tracks. A candidate there: on a followed frame, keep the older box's
+  margin-grown mask but move it along the run instead of dropping it.
+  Synthetic eval only; live OBS and the scrolling-chat leak test not done.
