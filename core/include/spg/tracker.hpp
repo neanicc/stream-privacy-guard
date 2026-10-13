@@ -258,6 +258,13 @@ class Tracker {
   // with `box` on `frame_time` (see "Following" above).
   void measure_run(TrackState& state, Timestamp frame_time, const Rect& box) const noexcept;
   [[nodiscard]] Rect mask_rect(const Held& held, Timestamp t) const noexcept;
+  // Following (rule 5 above): the detection of `state` that older run
+  // detections are followed into on frame time `t`, or null when none is
+  // followed there; and whether `held` is followed into that `newest`. The
+  // geometry lives in core/src/track/follow.hpp.
+  [[nodiscard]] const Held* follow_target(const TrackState& state, Timestamp t) const noexcept;
+  [[nodiscard]] static bool followed(const TrackState& state, const Held* newest,
+                                     const Held& held) noexcept;
 
   const Clock* clock_;
   TrackerConfig config_;

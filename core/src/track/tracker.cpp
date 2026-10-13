@@ -10,6 +10,7 @@
 #include <tuple>
 #include <utility>
 
+#include "follow.hpp"
 #include "spg/error.hpp"
 
 namespace spg {
@@ -457,6 +458,41 @@ Rect Tracker::mask_rect(const Held& held, Timestamp t) const noexcept {
   return pixel_rect(x0, y0, x1, y1);
 }
 
+// Following, rule 5 of tracker.hpp's "Following" and docs/tracker.md
+// ("Followed"). The property test's oracle `may_follow`
+// (tests/unit/tracker_test.cpp) restates the same rule independently; change
+// the three together (see track/follow.hpp).
+const Tracker::Held* Tracker::follow_target(const TrackState& state, Timestamp t) const noexcept {
+  if (!follow::active(config_.follow_after, state.run, t, state.track.last_confirmed)) {
+    return nullptr;
+  }
+  const Held* newest = nullptr;
+  for (const Held& held : state.held) {
+    if (held.followable && held.seen >= state.run_from && held.seen <= t &&
+        (newest == nullptr || held.seen > newest->seen)) {
+      newest = &held;
+    }
+  }
+  return newest;
+}
+
+// An older run detection is covered by `newest`'s mask instead of its own
+// only if `newest`'s box grown by its margin contains it moved to `newest`'s
+// frame time at every velocity between the run's lowest and highest
+// measurement. A newer detection that found only part of the text (clipped
+// within the size tolerance) so never releases a box that covered all of it:
+// the part it missed lies outside it, and the measurement it biased only
+// widens the range.
+bool Tracker::followed(const TrackState& state, const Held* newest, const Held& held) noexcept {
+  if (newest == nullptr || !held.followable || held.seen < state.run_from ||
+      held.seen >= newest->seen) {
+    return false;
+  }
+  return follow::contains_moved(
+      follow::Target{newest->box, newest->seen, newest->margin_x, newest->margin_y}, held.box,
+      held.seen, state.run_low, state.run_high);
+}
+
 std::vector<Box> Tracker::masks(Timestamp t) const {
   std::vector<Box> out;
   masks(t, out);
@@ -480,51 +516,16 @@ void Tracker::masks(Timestamp t, std::vector<Box>& out) const {
       slots > 1 ? floor_div((t - config_.hold).time_since_epoch().count(), width) : 0;
 
   for (const TrackState& state : tracks_) {
-    // Following: on a frame time the track has been confirmed at or after,
-    // a confirmed moving track's run detections older than the newest one
-    // seen at or before t are covered by that one's mask instead, each only
-    // if the newest box grown by its margin contains it moved to the newest
-    // one's frame time at every velocity between the run's lowest and
-    // highest measurement. A newer detection that found only part of the
-    // text (clipped within the size tolerance) so never releases a box that
-    // covered all of it: the part it missed lies outside it, and the
-    // measurement it biased only widens the range.
-    const Held* newest = nullptr;
-    if (config_.follow_after > 0 && state.run >= config_.follow_after &&
-        t <= state.track.last_confirmed) {
-      for (const Held& held : state.held) {
-        if (held.followable && held.seen >= state.run_from && held.seen <= t &&
-            (newest == nullptr || held.seen > newest->seen)) {
-          newest = &held;
-        }
-      }
-    }
-    const auto followed = [&](const Held& held) {
-      if (newest == nullptr || !held.followable || held.seen < state.run_from ||
-          held.seen >= newest->seen) {
-        return false;
-      }
-      const double dt = seconds(newest->seen - held.seen);
-      const Rect& n = newest->box;
-      const Rect& b = held.box;
-      const double x0 = static_cast<double>(b.x) + static_cast<double>(state.run_low.dx_per_s) * dt;
-      const double y0 = static_cast<double>(b.y) + static_cast<double>(state.run_low.dy_per_s) * dt;
-      const double x1 = static_cast<double>(b.x) + static_cast<double>(b.width) +
-                        static_cast<double>(state.run_high.dx_per_s) * dt;
-      const double y1 = static_cast<double>(b.y) + static_cast<double>(b.height) +
-                        static_cast<double>(state.run_high.dy_per_s) * dt;
-      return static_cast<double>(n.x) - newest->margin_x <= x0 &&
-             static_cast<double>(n.y) - newest->margin_y <= y0 &&
-             x1 <= static_cast<double>(n.x) + static_cast<double>(n.width) + newest->margin_x &&
-             y1 <= static_cast<double>(n.y) + static_cast<double>(n.height) + newest->margin_y;
-    };
+    // Following (docs/tracker.md): a followed detection adds no rect on t;
+    // the newest detection of the run at or before t covers it.
+    const Held* newest = follow_target(state, t);
     const std::size_t start = out.size();
     out.resize(start + slots, Box{kNoRect, Space::Source});
     for (const Held& held : state.held) {
       if (t < held.seen || t > held.seen + config_.hold) {
         continue;
       }
-      if (followed(held)) {
+      if (followed(state, newest, held)) {
         continue;
       }
       const std::int64_t bucket =

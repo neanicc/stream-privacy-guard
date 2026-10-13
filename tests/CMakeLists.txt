@@ -29,8 +29,9 @@ spg_target_defaults(spg-unit-tests)
 # a render-facing scheduler call waiting on a stalled stage) into a failure.
 catch_discover_tests(spg-unit-tests TEST_PREFIX "unit." DISCOVERY_MODE PRE_TEST
   PROPERTIES TIMEOUT 300)
-# Tracker and temporal hold (SPG-09).
-target_sources(spg-unit-tests PRIVATE unit/tracker_test.cpp)
+# Tracker and temporal hold (SPG-09); following's checks (SPG-12b), which
+# follow_test.cpp includes from core/src/track/ directly.
+target_sources(spg-unit-tests PRIVATE unit/follow_test.cpp unit/tracker_test.cpp)
 # Scheduler, lookahead and fail-closed release (SPG-10). The mask helper tests
 # include core/src/mask/ directly. fail_alloc.cpp replaces operator new for
 # this binary so a test can fail one allocation on purpose.
