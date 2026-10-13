@@ -36,6 +36,11 @@ namespace spg::mask {
 // sliding in, which may have moved faster than the velocity measured now.
 [[nodiscard]] Rect trail_to_edge(const Rect& box, Velocity velocity, Size source) noexcept;
 
+// `rect` grown by `dx` on its left and right edges and `dy` on its top and
+// bottom, rounded outward to whole pixels. A negative or NaN amount grows by
+// zero (a mask never shrinks here).
+[[nodiscard]] Rect spread(const Rect& rect, double dx, double dy) noexcept;
+
 // Smallest whole-pixel rect containing both.
 [[nodiscard]] Rect hull(const Rect& a, const Rect& b) noexcept;
 

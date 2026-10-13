@@ -170,7 +170,7 @@ std::optional<ScanJob> Lookahead::take_job() noexcept {
     return std::nullopt;
   }
   try {
-    in_flight_.push_back(queue_.back().seq);
+    in_flight_.push_back(InFlight{queue_.back().seq, queue_.back().frame_time, clock_->now()});
   } catch (...) {
     queue_.pop_back();
     ++stats_.scans_dropped;
@@ -183,10 +183,13 @@ std::optional<ScanJob> Lookahead::take_job() noexcept {
 }
 
 void Lookahead::complete(const ScanJob& job, const ScanResult& result) {
-  const auto it = std::find(in_flight_.begin(), in_flight_.end(), job.seq);
+  const auto it =
+      std::find_if(in_flight_.begin(), in_flight_.end(), [&job](const InFlight& f) { return f.seq == job.seq; });
   if (it == in_flight_.end()) {
     throw ContractError("lookahead: complete() for a job that is not in flight");
   }
+  cycles_[cycles_seen_ % kCycleHistory] = std::max(Duration::zero(), clock_->now() - it->started);
+  ++cycles_seen_;
   in_flight_.erase(it);
   if (result.detections_lost) {
     // The cycle found boxes it could not return: nothing can hold or
@@ -245,6 +248,43 @@ void Lookahead::fail_closed(const ScanJob& job) noexcept {
   ++stats_.scans_failed;
 }
 
+Duration Lookahead::longest_cycle() const noexcept {
+  Duration longest = Duration::zero();
+  for (std::size_t i = 0; i < std::min(cycles_seen_, kCycleHistory); ++i) {
+    longest = std::max(longest, cycles_[i]);
+  }
+  return longest;
+}
+
+Timestamp Lookahead::next_result(const ScanJob& job) const noexcept {
+  const Timestamp now = clock_->now();
+  const Duration cycle = longest_cycle();
+  // A cycle already running on a later frame can see the box again, and give
+  // its track a velocity, by when it lands. One that has overrun every
+  // recent cycle might never land in time: it does not count. `cycle` is
+  // never 0 here: complete() records the cycle that returned this result
+  // before it applies it.
+  std::optional<Timestamp> earliest;
+  for (const InFlight& f : in_flight_) {
+    const Timestamp lands = f.started + cycle;
+    if (f.frame_time > job.frame_time && lands > now && (!earliest.has_value() || lands < *earliest)) {
+      earliest = lands;
+    }
+  }
+  if (earliest.has_value()) {
+    return *earliest;
+  }
+  // A job already queued on a later frame starts now: the worker that
+  // returned this result is free, and a newer frame that replaces the job
+  // before then is later still.
+  if (!queue_.empty() && queue_.back().frame_time > job.frame_time && in_flight_.size() < config_.workers) {
+    return now + cycle;
+  }
+  // Otherwise the next cycle starts now at the earliest, on the newest frame
+  // the cadence offers.
+  return now + config_.scan_interval + cycle;
+}
+
 void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
   const float margin_px = config_.tracker.margin_px;
   const float margin_ratio = config_.tracker.margin_ratio;
@@ -281,8 +321,27 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
   // it moves away from, but only after the last frame a complete cycle
   // scanned before then: that cycle would most likely have found it (a box it
   // missed gets the static and moved rects, as before).
+  //
+  // A first sighting (the earliest detection of its track, which has no
+  // velocity yet) gives no direction to trail or project along. On frames
+  // before it and after the last complete scan before it, the box is also
+  // spread by the reach of the tracker's motion gate for the time between:
+  // as many widths and heights of the largest box the gate would pair with
+  // it (motion_size_ratio times its size) as the gate lets a track move in
+  // that time, so wherever a detection there would have joined this track.
+  // Only frames released before a result that could give the track a
+  // velocity can land (next_result) get the spread; later frames get the
+  // moved rects and the trail from that result. With two workers in step
+  // that is no frame. With one worker on 200 ms cycles and 500 ms of
+  // lookahead, the next result reaches only the last ~100 ms before the
+  // sighting, and the frames before those get the spread (SPG-16d). A track
+  // measured at rest (zero velocity on a later sighting) is not a first
+  // sighting, so it gets nothing more.
   const Timestamp from = job.frame_time - config_.retro;
   const bool same_size = job.size_epoch == current;
+  const Timestamp unconfirmed_until = next_result(job);
+  const double gate_per_s = static_cast<double>(config_.tracker.motion_gate_per_s);
+  const double size_ratio = static_cast<double>(config_.tracker.motion_size_ratio);
   // Every frame released so far is older than every buffered one, so only
   // buffered frames can bound a trail. Scanned frames are few, so they are
   // gathered once, newest first, rather than walking the buffer per box.
@@ -321,10 +380,31 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
         }
         add_retro(frame, r);
         const Velocity v = motions[i].velocity;
+        const bool after_last_scan = !last_scan[i].has_value() || frame.t > *last_scan[i];
+        // A frame of another size than ts (a resize between them) is skipped
+        // here, as it is for the moved and trailed rects below: it keeps the
+        // static and scaled rects. That is intentional; the reach is measured
+        // in this size's box.
+        if (same_size && frame.source == job.source && motions[i].first_seen == job.frame_time &&
+            v.dx_per_s == 0.0F && v.dy_per_s == 0.0F && gate_per_s > 0.0 && after_last_scan &&
+            frame.due <= unconfirmed_until) {
+          // The gate's reach for min(ts - t, max_prediction), in box sizes. A
+          // box size there is the larger of the two boxes', and the box on
+          // this frame may be up to motion_size_ratio times this one, so the
+          // reach is taken in that largest box's sizes, around that box with
+          // its margin (an 80 px face that shrank to 40 px by ts may be
+          // 2 * reach * 40 px from it).
+          const double sizes = gate_per_s * -back;
+          const double w = static_cast<double>(d.box.rect.width);
+          const double h = static_cast<double>(d.box.rect.height);
+          const double grow = (size_ratio - 1.0) / 2.0;
+          const Rect largest =
+              mask::grow_by_margin(mask::spread(d.box.rect, grow * w, grow * h), margin_px, margin_ratio);
+          add_retro(frame, mask::spread(largest, sizes * size_ratio * w, sizes * size_ratio * h));
+        }
         if (same_size && frame.source == job.source && (v.dx_per_s != 0.0F || v.dy_per_s != 0.0F)) {
           add_retro(frame, mask::grow_by_margin(mask::moved(d.box.rect, v, back), margin_px, margin_ratio));
-          if (motions[i].translating && frame.t < motions[i].first_seen &&
-              (!last_scan[i].has_value() || frame.t > *last_scan[i])) {
+          if (motions[i].translating && frame.t < motions[i].first_seen && after_last_scan) {
             add_retro(frame, mask::grow_by_margin(mask::trail_to_edge(d.box.rect, v, job.source), margin_px,
                                                   margin_ratio));
           }

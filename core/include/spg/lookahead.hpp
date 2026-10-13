@@ -5,6 +5,7 @@
 // tests and offline tools drive it directly with a ManualClock. Rules and
 // rationale: docs/scheduler.md.
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +46,8 @@ struct SchedulerConfig {
   // velocities from such pairs: with one worker on the dev Mac (SPG-16) the
   // realtime suite came close to its limits, but fast small faces and
   // slide-in notifications leaked in the eval suites (agent-log SPG-16).
+  // SPG-16b and SPG-16d closed that gap on the simulated suites; whether to
+  // switch to one is #85.
   std::size_t workers = 2;
   // When more frames than this are buffered, the oldest is released early,
   // under the same coverage rule.
@@ -131,6 +134,9 @@ struct SchedulerStats {
 //   * Retroactive masking: a complete cycle on frame time ts adds its boxes,
 //     grown by the margin, to every buffered frame with time in
 //     [ts - retro, ts) (scaled across a resize, hulled with the unscaled box).
+//     A box on a track with no velocity yet is also spread by the tracker's
+//     motion-gate reach on earlier frames that no running cycle can confirm
+//     it for before they are released (docs/scheduler.md, "Masks").
 //   * Hold: plan rects include Tracker::masks(t), so a detection stays masked
 //     for the hold; a resize or a late cycle only adds coverage, and a box
 //     from before a resize keeps its scaled margin.
@@ -217,7 +223,20 @@ class Lookahead {
     std::vector<Rect> retro;
   };
 
+  struct InFlight {
+    std::uint64_t seq = 0;
+    Timestamp frame_time{};
+    Timestamp started{};  // clock time take_job() handed it out
+  };
+
   [[nodiscard]] const FrameRecord* find_frame(Timestamp t) const noexcept;
+  // The longest of the recent cycle durations (0 before any completes).
+  [[nodiscard]] Duration longest_cycle() const noexcept;
+  // When the next result that could see a box `job` found again can land at
+  // the latest a recent cycle took: a cycle still running on a later frame
+  // (the earliest of them), else a job queued on a later frame, which starts
+  // now, else one that has not been queued yet.
+  [[nodiscard]] Timestamp next_result(const ScanJob& job) const noexcept;
   void apply(const ScanJob& job, const ScanResult& result);
   // A result that cannot be applied (complete, or partial with detections)
   // or that lost detections: fails closed every frame it could have masked
@@ -237,7 +256,12 @@ class Lookahead {
   Tracker tracker_;
   std::deque<FrameRecord> frames_;
   std::deque<ScanJob> queue_;
-  std::vector<std::uint64_t> in_flight_;
+  std::vector<InFlight> in_flight_;
+  // Durations (clock time from take_job() to complete()) of the last
+  // kCycleHistory cycles, as a ring; cycles_seen_ counts every one.
+  static constexpr std::size_t kCycleHistory = 8;
+  std::array<Duration, kCycleHistory> cycles_{};
+  std::size_t cycles_seen_ = 0;
   // Source sizes by epoch, oldest first; first_epoch_ names sizes_.front().
   std::deque<Size> sizes_;
   std::uint64_t first_epoch_ = 0;

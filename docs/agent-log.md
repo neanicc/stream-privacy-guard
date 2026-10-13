@@ -2373,3 +2373,108 @@ Template:
   one worker, or show that #85's cadence makes them coverable; #85 should
   not switch to one worker before then. Synthetic eval only; live OBS not
   tested.
+
+## 2026-10-13 — SPG-16d Cover frames before a new track's first sighting with one worker (#89)
+
+- Method. Simulated eval (`spg-cli eval`, fixed 200 ms cycle, seed
+  20261012) on the CI text (`ci`), local text and local faces (`full`)
+  suites, with `--workers 1` and `--workers 2` passed to `spg-cli eval` by a
+  scratch wrapper around the `eval/run_eval.py` steps (no `--workers` option
+  yet, #90), scored with `eval/spg_eval/scoring.py`, realtime suite left
+  out. Main a474cde and the branch on the same generated suites. Leaked
+  frames listed per frame from the plans; a temporary debug print (frame
+  times only, not committed) traced which results spread which frames.
+- Cause, confirmed on a474cde. Every remaining one-worker miss is a frame
+  after the last complete scan that missed the object and before its first
+  sighting. A first sighting on `ts` lands at `ts + 200`; the next result,
+  which gives the track a velocity, lands at `ts + 400`, when only frames
+  after `ts - 100` are still buffered. No cadence or ordering of one 200 ms
+  worker changes that: any second result lands at least 200 ms after the
+  first, so a velocity can never reach a frame before `ts - 100`. The first
+  sighting's own result has to cover them. Faces seq-018 (43 px face fading
+  in at about 510 px/s): the cycle on frame 0 saw nothing, first sighting on
+  frame 11, frames 1-5 got only the static box, 48-80 px from the face.
+  Local text seq-016 / seq-026: toasts first scanned near rest, 200-400 px
+  left of where they were on frames 13-17.
+- Change, in `core/src/schedule/lookahead.cpp` only (tracker untouched).
+  For a first sighting (the detection is the earliest of its track,
+  `TrackMotion::first_seen == ts`, and the track has no velocity), the
+  retroactive pass also adds the box, with its margin, spread by the motion
+  gate's reach (`motion_gate_per_s * min(ts - t, max_prediction)` of its own
+  width along x and height along y; new `mask::spread`) on frames after the
+  last complete scan before it. Only frames released before the next result
+  that could give the track a velocity get it: the earliest cycle still
+  running on a later frame, expected at its start plus the longest of the
+  last 8 cycle durations (an overrun one does not count), else a cycle
+  starting now plus `scan_interval`. `Lookahead` now records when each job
+  was taken. With two workers in step the paired cycle lands in time, so no
+  frame is spread.
+- Decisions. (1) The reach is the tracker's own gate (default 20 box sizes a
+  second), so the spread covers wherever a detection on that frame would have
+  joined the track; `motion_gate_per_s = 0` turns both off. No new setting.
+  (2) "Earliest of its track" rather than "velocity is zero": a static face's
+  second sighting measured exactly zero velocity and spread frames before
+  its first sighting with two workers (seen in the first build, fixed before
+  measuring). (3) `--workers` stays out of `run_eval.py`, left to #90 to keep
+  this PR to one ticket.
+- Rejected without building: growing every new track on every earlier frame
+  (SPG-16b rejected it; the gating above confines it to the frames that need
+  it), and a one-worker cadence change (impossible, above).
+- Eval, one worker, a474cde then branch, against two-worker main a474cde
+  (gate: leak +0.2 pp, recall -0.5 pp):
+
+  | Metric | 1 worker main | 1 worker branch | 2 workers main |
+  | --- | --- | --- | --- |
+  | Faces leak | 0.0074 (8/1080) | 0 (0/1080) | 0.0009 (1/1080) |
+  | Face pair recall | 0.9964 | 1.0000 | 0.9995 |
+  | CI text leak | 0.0070 (2/285) | 0 | 0 |
+  | CI watch-list pair recall | 1.0000 | 1.0000 | 1.0000 |
+  | CI PII pair recall | 0.9966 | 1.0000 | 1.0000 |
+  | Local watch-list pair recall | 0.9982 | 0.9992 | 0.9992 |
+  | Local first-frame recall | 0.9434 (50/53) | 0.9623 (51/53) | 0.9623 |
+  | Local PII pair recall | 0.9978 | 0.9990 | 0.9990 |
+  | Local text leak | 0.0083 (16/1919) | 0.0036 (7/1919) | 0.0036 |
+  | Clean-frame blur, local text | 0.0025 | 0.0025 | 0.0027 |
+  | Clean-frame blur, CI text / faces | 0 / 0 | 0 / 0 | 0 / 0 |
+  | Decoy blur, CI | 0.4143 | 0.4188 | 0.4233 |
+  | Decoy blur, local | 0.5193 | 0.5226 | 0.5090 |
+
+  The one-worker leaks left on the branch are the same frames two-worker
+  main leaks (local seq-002 14-17, seq-017 29, seq-025 88-89), except faces
+  seq-018 frame 1, which one worker now covers and two workers do not.
+- Eval, two workers: every mask plan in all three suites is byte-identical
+  to main a474cde, so every metric is unchanged. `scripts/ci/run.sh eval`
+  (CI mode) on the branch: `THRESHOLDS: FAIL` from decoy blur only (0.4233,
+  as on main, #75); every recall and leak limit passes.
+- Cost. With one worker the spread blurs neighbouring content on the frames
+  it covers: local decoy blur 0.5193 to 0.5226 (+0.3 pp over one-worker
+  main, +1.4 pp over two-worker main), CI decoy below two-worker main. Decoy
+  blur already fails its limit on main (#75, #81) and is not a merge-gate
+  metric. Clean-frame blur does not change.
+- Tests (`tests/unit/lookahead_test.cpp`): the one-worker harness now runs
+  N workers. New cases: a fast face whose first sighting lands late in the
+  lookahead is covered on every frame, with the spread on exactly the frames
+  due before the next result and none after (fails with the spread
+  disabled); two workers in step get no spread; a new box at rest is spread
+  only before its first sighting and within the gate's reach; `mask::spread`
+  rounding and its no-shrink rule.
+- Not run: the realtime suite (wall clock is noise while another agent
+  builds on this Mac), so nothing here is a timing or realtime claim. Live
+  OBS not tested. The plugin still defaults to two workers; #85 decides
+  whether to switch.
+- Review fixes. (1) The spread now uses the gate's size rule: the gate
+  measures in the larger box's sizes and pairs boxes up to
+  `motion_size_ratio` (2) apart, so a face that shrank from 80 to 40 px while
+  moving could sit outside a spread of the 40 px box's sizes. The spread is
+  now the reach in sizes of a box `motion_size_ratio` times this one, around
+  that box with its margin (test: a shrinking, moving face; it leaks with
+  ratio 1). (2) With a job already queued on a later frame, the next result
+  is expected at now plus a cycle, not a further `scan_interval` later
+  (test with a 100 ms cadence). (3) The landing estimate's cycle history is
+  never empty when it is used: the cycle that returned the sighting is
+  recorded first (test: a first sighting on the first cycle that completes).
+  Same suites and seed, one worker: faces leak 0, CI text leak 0, local
+  first-frame recall 0.9623, local watch-list pair recall 0.9992, local text
+  leak 0.0036, clean-frame blur unchanged; decoy blur CI 0.4188 to 0.4255,
+  local 0.5226 to 0.5284 (the wider spread). Two workers: every mask plan in
+  all three suites is still byte-identical to main a474cde.

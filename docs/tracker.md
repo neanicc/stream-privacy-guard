@@ -153,7 +153,9 @@ pixel the way the velocity points, so a box that grows while typed or fading
 in does not count; once set, it stays set for the track). Since SPG-12 the scheduler back-projects retroactive rects
 with the velocity, and since SPG-12c it trails a translating box back to the
 frame edge on frames before the first sighting
-([scheduler.md](scheduler.md#masks)).
+([scheduler.md](scheduler.md#masks)). Since SPG-16d it spreads a first
+sighting (no velocity yet) by the motion gate's reach on earlier frames that
+air before a second sighting can land.
 
 ## Source resize
 
