@@ -11,7 +11,7 @@ which only Ali edits.
 | --- | --- | --- |
 | `text` | Generated UI-like frames: chat panels, notifications, browser address bars, desktop windows, HUD-style panels. Watch-list strings, PII (emails, phones, Luhn-valid cards, IPs, street addresses, token-shaped strings), and decoys (near-miss strings that must not match). Motion: static, scroll, slide-in, fade, partial reveal. 1080p and 720p. Includes clean frames with no sensitive content. Seeded and deterministic. | CI (reduced size) and locally |
 | `faces` | Face crops from a public benchmark composited onto generated backgrounds at varied scale and position. The dataset is fetched to `$SPG_CACHE_DIR` with its license recorded and is never committed or uploaded as a CI artifact. | Locally |
-| `realtime` | `spg-cli bench --realtime` replays a suite as a 60 fps feed against the wall clock with the default config, so slow detection shows up as fail-closed frames. | Locally on the dev Mac |
+| `realtime` | `spg-cli bench --realtime` replays the text suite's sequences at the `[suite.realtime]` resolution as a feed at its fps against the wall clock with the default config, so slow detection shows up as fail-closed frames. Scored on that suite's ground truth with the cycles' latencies. | Locally on the dev Mac |
 
 ## Metrics
 
@@ -65,7 +65,7 @@ These settle what the metric definitions leave open. The scorer is
   fully blurred frame against the clean-frame budget. Only the realtime suite
   limits `fail_closed_frame_rate`, so in the text and faces suites the
   clean-frame budget is the only brake on a pipeline that falls back often.
-  The realtime suite must run in local mode once SPG-11/16 land.
+  The realtime suite runs in local mode, where thresholds.toml requires it.
 - Every key in a `[suite.*]` table other than `required_in`, `resolution` and
   `fps` must be `<metric>_min` or `<metric>_max` for a metric the scorer
   computes; anything else is an error, so a typo cannot silently drop a limit.
@@ -142,9 +142,20 @@ python3 eval/score.py --mode ci --suite text=eval-out/text       # plans in the 
 python3 eval/score.py --mode ci --suite text=eval-out/text --reference noop
 ```
 
-`run.sh eval` calls `eval/run_eval.py`, which generates the suites for the
-mode, runs the sanity checks, then runs the pipeline and scores it. Until
-SPG-11 provides `spg-cli run`, `run_pipeline()` in that file raises and the
-driver prints `THRESHOLDS: NOT RUN`, which passes in CI mode and fails in local
-mode. SPG-11 plugs the pipeline in there; SPG-16 supplies the realtime suite's
-latencies.
+`run.sh eval` builds the tree, then calls `eval/run_eval.py`, which
+generates the suites for the mode, runs the sanity checks, runs
+`build/cli/spg-cli eval` on each suite (simulated time, fixed 200 ms cycles,
+2 workers; [cli.md](cli.md)) and scores the plans. In local mode it also runs
+`spg-cli bench --realtime` on the text suite's 1920x1080 sequences for the
+realtime suite. A missing or failing `spg-cli` prints `THRESHOLDS: FAIL` in
+every mode; there is no "not run" outcome. The report lines include each
+suite's frame and fail-closed counts and stage medians. SPG-16 tunes the
+realtime numbers.
+
+The CI eval is plan-logic evidence only. Its suites run in simulated time
+with a fixed cycle, so it cannot show timing margin or fail-closed behavior
+on a slow machine ([cli.md](cli.md#what-each-driver-is-evidence-for)).
+Timing evidence is `spg-cli bench --realtime` and the local realtime suite,
+owned by SPG-16 (#17). The realtime report also prints an
+`unscored: realtime late_frames N` line: no limit scores late frames until
+a human adds one to `thresholds.toml`, tracked in #68 (SPG-31).

@@ -12,11 +12,13 @@ blurring the whole source. Some things will still get through; the eval in this
 repo measures how often.
 
 > Status: pre-alpha. The build foundation exists (`spg-core`, `spg-cli`, tests
-> and pinned dependencies), and the OBS filter loads the pinned detection models
-> (`scripts/fetch_models.py` puts them in `~/.cache/spg/models`) to blur detected
-> faces and sensitive text; without them it covers the whole source (fails
-> closed). It has not been checked in a live OBS session yet, and its recall on
-> real content is not measured: do not rely on it for a stream.
+> and pinned dependencies). The detection pipeline runs offline in `spg-cli` on
+> PNG sequences, and the synthetic eval scores it. The OBS filter loads the
+> pinned detection models (`scripts/fetch_models.py` puts them in
+> `~/.cache/spg/models`) to blur detected faces and sensitive text; without them
+> it covers the whole source (fails closed). It has not been checked in a live
+> OBS session yet, and its recall on real content is not measured: do not rely
+> on it for a stream.
 
 ## Install
 
@@ -164,13 +166,18 @@ bash scripts/ci/run.sh build   # configure and build into build/ (Release, warni
 bash scripts/ci/run.sh test    # run all tests with ctest
 build/cli/spg-cli --version                 # Linux and macOS
 build/cli/Release/spg-cli.exe --version     # Windows (Visual Studio puts binaries under Release/)
+bash scripts/ci/run.sh eval    # generate the CI text suite, run spg-cli on it, score it
 ```
+
+`spg-cli run`, `eval` and `bench` drive the pipeline on PNG frames
+([docs/cli.md](docs/cli.md)).
 
 `setup` downloads the archives listed in [deps/manifest.json](deps/manifest.json)
 once into `$SPG_CACHE_DIR` (default `~/.cache/spg`) and refuses any whose hash
 does not match. An unpacked dependency is trusted once its `.spg-fetch.json`
 marker matches the manifest; delete `$SPG_CACHE_DIR/deps/<name>/` to force a
-fresh unpack. Catch2 is fetched by CMake, also pinned by hash. ccache from the
+fresh unpack. Catch2, nlohmann/json and stb_image (PNG decoding for
+`spg-cli`) are fetched by CMake, also pinned by hash. ccache from the
 manifest is used automatically and keeps its cache in `$SPG_CACHE_DIR/ccache`.
 The ONNX models in [models/manifest.json](models/manifest.json) (YuNet, PP-OCR
 detection and recognition) go to `$SPG_CACHE_DIR/models/` the same way, through

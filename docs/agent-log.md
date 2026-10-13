@@ -1737,3 +1737,63 @@ Template:
   when the new settings can scan less. Measure the cover time in the live
   check first. Live check (OBS on a real source) of the solid frames during
   a settings change: not done.
+
+## 2026-10-12 — SPG-11 CPU compositor and spg-cli (#49)
+
+- Decision / change: `spg::compose()` and `fit_mask_rects()` in
+  `core/include/spg/compose.hpp` and `core/src/compose/compositor.cpp`, and
+  `spg-cli run`, `eval` and `bench` in `cli/src/`; rules in [cli.md](cli.md).
+  `eval/run_eval.py` now runs `spg-cli eval` on the generated suites, and the
+  `THRESHOLDS: NOT RUN` path is gone from it and from `scripts/ci/run.sh`: a
+  missing or failing `spg-cli` is `THRESHOLDS: FAIL` in every mode.
+  Choices: (1) `run` and `eval` drive `spg::Lookahead` on a `ManualClock`
+  with simulated time: a fixed 200 ms cycle and 2 simulated workers, so plans
+  do not depend on runner speed. Real timing is `bench --realtime` on
+  `spg::Scheduler` and the wall clock (the local realtime suite, SPG-16).
+  (2) After the last real frame both drivers keep feeding padding frames (the
+  last frame repeated, never composed or written) until every real frame is
+  released, as a live source would. (3) Readback scale defaults to 1 (full
+  frame); SPG-14 decides the plugin's readback size and the CLI default must
+  follow. (4) `kMaskRectCapacity` = 64 rects per frame for the GPU effect's
+  fixed array; `fit_mask_rects()` drops contained rects, then merges the pair
+  whose hull adds the least area (stronger style wins), so coverage only
+  grows. `driver_config()` caps `max_retro_rects` and the tracker's
+  `max_rects_per_track` at the capacity. (5) Scoring stays in the Python
+  scorer; the CLI writes plans only. (6) PNG I/O uses stb_image
+  2.30 and stb_image_write 1.16, pinned by commit `31c1ad37` and per-header
+  SHA-256 in `cli/CMakeLists.txt`. (7) The per-track recognition cache is not
+  used, because `run_scan()` has no track ids: every region is read every
+  cycle (time, not recall).
+- Review fixes: (1) Ubuntu CI (GCC 13, `-O3 -Werror`) failed on a false
+  `-Wmaybe-uninitialized` in `std::optional<std::pair<FrameId,
+  BgraImage>>::emplace` in `cli/src/driver.cpp`; the eval job shares the
+  compile step and failed there too, before any suite ran. The last clean
+  frame is now held in plain members. (2) Staff review P2: a blur or
+  pixelate rect under 2 px on a side was drawn unchanged (a 1x1 box blur or
+  block is the pixel itself); such rects are now filled, with a unit case for
+  1x1, 1xN and Nx1 rects in both styles. P3 (prefetch thread and
+  `StageTimes`) declined: `StageTimes::add` takes its mutex. (3) Greptile,
+  after merging main (SPG-10b/10c/14/14b/14c, #65): the compositor left alpha
+  untouched, so black text on a transparent background stayed readable
+  through its alpha after any mask or fallback; blur and pixelate now mix
+  alpha too and a fill is opaque, as the GPU effect already does
+  ([plugin-render.md](plugin-render.md)). `fit_mask_rects()` counted the
+  overlap of two rects twice and could merge an overlapping pair over a
+  pair whose hull adds nothing; the cost is now the hull minus their union.
+  The realtime feed stamped a frame when decoding let it in, so a stalled
+  decoder slowed the feed instead of showing as latency; frames now keep
+  their due time. Policy calls now end the realtime cycle in the latency
+  log, and `run_eval.py` passes its `--cache` to `spg-cli` and prints the
+  realtime late-frame count. Each has a unit or driver test.
+- Open issues or follow-ups: live OBS not tested; the plugin (SPG-14) draws
+  with its GPU effect, not this compositor, and GPU parity with this
+  reference is SPG-14's; whether the blur defeats OCR is SPG-18's. The `NOT RUN` mention
+  in the human-owned autopilot skill is left for a human. Realtime
+  `late_frames` is reported (an `unscored:` line in the eval report) but not
+  scored: a limit needs the human-owned `eval/thresholds.toml`, tracked in
+  #68 (SPG-31, needs-human). The CI eval runs in simulated time with a fixed
+  200 ms cycle, so it is plan-logic evidence only; timing margin and failing
+  closed under load are scored by `bench --realtime` and the local realtime
+  suite, which SPG-16 (#17) must bring to its limits. `fit_mask_rects()` is
+  O(n^3) worst case; fine offline in `spg-cli`, to revisit before any per-frame
+  use in the plugin.
