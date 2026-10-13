@@ -167,7 +167,7 @@ solid fill when there is nothing trustworthy to blur) and is unit-tested:
 | Case | Rule |
 | --- | --- |
 | Settings change racing with render | The build thread hands over a complete generation under a lock held only for a pointer swap; the render thread takes it at the start of a frame (`PipelineHost`). From the request until then every frame is solid (`SettingsChanged`). A failed build (`fail()`) covers every frame with a solid fill until the next successful hand-over; the old scheduler is never left running in its place |
-| A newer request while a build runs | Only the latest request is offered: an older one not started is never built, one finished late is retired unseen (`GenerationBuilder`), so a slow build can never put superseded settings on air |
+| A newer request while a build runs | Only the latest request is offered: requests wait in one slot with at most one task posted for it, so an older one not started is replaced (its copy of the settings freed) and never built, and one finished late is retired unseen (`GenerationBuilder`). A slow build can never put superseded settings on air |
 | Adoption fails (allocation) | `Pipeline::adopt` has the strong guarantee; the frame is solid, a second render of the same frame time is solid too, and the next frame retries the same generation |
 | Policy becomes empty (storage error, no categories, rejected settings) | The next frame covers the live frame whole; the old scheduler's frames are never shown again |
 | A release that does not match the frame buffered under its id (time, size, unknown id, clean action with a fallback flag or reason) | Solid, `Inconsistent` |
@@ -203,8 +203,10 @@ manual executor and with a real build thread:
 - A rebuild of the same settings (refit, models ready) leaves the running
   generation in place until the new one is offered.
 - Only the latest request is offered; superseded ones are never built or
-  are retired to the reaper. At most two generations stay live, as before
-  (`Pipeline::kMaxGenerations`).
+  are retired to the reaper. Requests wait in one slot, and at most one
+  build task is queued behind the one running, so repeated settings changes
+  during a slow build do not pile up copies of the settings. At most two
+  generations stay live, as before (`Pipeline::kMaxGenerations`).
 - A failed build covers every frame (solid, `NoDetection`). A failed
   rebuild of settings that were built once is asked for again every
   `kRefitRetryNs`; a settings change that never produced a generation is
@@ -309,9 +311,12 @@ refuses (with HoldLastScanned re-emits), a lower budget that keeps buffered
 frames, and a resize followed by a refitted generation; the `[build]` cases
 (SPG-14d): a settings change covered until its generation is built, a
 rebuild that keeps the running generation, superseded requests never
-offered, failed builds covered and retried only as a rebuild, a build that
-cannot be posted or prepared, the build thread's order and stop, a build
-that runs on the build thread and never on the caller, and builds racing
+offered, waiting requests replaced rather than queued, failed builds covered
+and retried only as a rebuild, a build that cannot be posted or prepared,
+the build thread's order and stop, a build that runs on the build thread and
+never on the caller (frames solid while it is held), a `ThreadedScheduler`
+and its stage constructed on the build thread and swapped in by the render
+side, and builds racing
 with frames that never air an unscanned frame or leave more than two
 generations live. The GPU code and the effect need a graphics
 context, which headless libobs in CI does not have: they are checked live

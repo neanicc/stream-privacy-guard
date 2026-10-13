@@ -123,7 +123,7 @@ void FilterRender::publish(const std::optional<PolicyConfig>& policy, FallbackMo
     try {
       // New settings: covered until their generation is built, and a failure
       // is not retried with the old ones.
-      static_cast<void>(request_locked(Kind::Settings, policy, fallback, budget));
+      request_locked(Kind::Settings, policy, fallback, budget);
     } catch (...) {
       request_failed_locked(Kind::Settings);
     }
@@ -144,7 +144,7 @@ void FilterRender::models_changed() noexcept {
       try {
         // A copy: request_locked() assigns requested_.
         std::optional<PolicyConfig> policy = requested_;
-        static_cast<void>(request_locked(Kind::Rebuild, std::move(policy), requested_fallback_, requested_budget_));
+        request_locked(Kind::Rebuild, std::move(policy), requested_fallback_, requested_budget_);
       } catch (...) {
         request_failed_locked(Kind::Rebuild);
       }
@@ -161,7 +161,7 @@ void FilterRender::models_changed() noexcept {
   obs_source_update_properties(filter_);
 }
 
-bool FilterRender::request_locked(Kind kind, std::optional<PolicyConfig> policy, FallbackMode fallback,
+void FilterRender::request_locked(Kind kind, std::optional<PolicyConfig> policy, FallbackMode fallback,
                                   std::uint64_t budget_bytes) {
   Size source = source_size();
   if (source.width == 0 || source.height == 0) {
@@ -184,7 +184,7 @@ bool FilterRender::request_locked(Kind kind, std::optional<PolicyConfig> policy,
     if (!builds_.pending()) {
       static_cast<void>(budget_notice_.update(fit));
     }
-    return true;
+    return;
   }
   const bool with_models = policy.has_value() && models.models != nullptr;
   // Everything the build needs, by value: it runs on the build thread
@@ -223,7 +223,9 @@ bool FilterRender::request_locked(Kind kind, std::optional<PolicyConfig> policy,
   requested_lookahead_ = fit.lookahead;
   requested_models_ = models.generation;
   have_requested_ = true;
-  return builds_.request(kind, std::move(build), std::move(done));
+  // False if it could not be posted: then it has failed (covered) and
+  // built_locked() has logged it.
+  static_cast<void>(builds_.request(kind, std::move(build), std::move(done)));
 }
 
 void FilterRender::request_failed_locked(Kind kind) noexcept {
@@ -266,7 +268,7 @@ void FilterRender::tick() noexcept {
   const Duration interval = video_frame_interval();
   const std::uint64_t now = os_gettime_ns();
   if (builds_.take_retry()) {
-    refits_.failed(now);  // a rebuild failed on the build thread: ask again in kRefitRetryNs
+    refits_.failed(now);  // a rebuild failed (on any thread): ask again in kRefitRetryNs
   }
   if (!refits_.due(source, interval, now)) {
     return;
@@ -277,24 +279,21 @@ void FilterRender::tick() noexcept {
   if (!lock.owns_lock()) {
     return;
   }
-  bool asked = true;
   // After a failed settings change there is nothing to refit (the old
   // settings must not run again); a failed rebuild is retried.
   if (have_requested_ && builds_.may_rebuild()) {
     try {
       // A copy: request_locked() assigns requested_.
       std::optional<PolicyConfig> policy = requested_;
-      asked = request_locked(Kind::Rebuild, std::move(policy), requested_fallback_, requested_budget_);
+      request_locked(Kind::Rebuild, std::move(policy), requested_fallback_, requested_budget_);
     } catch (...) {
       request_failed_locked(Kind::Rebuild);
-      asked = false;
     }
   }
-  if (asked) {
-    refits_.done(source, interval);
-  } else {
-    refits_.failed(now);  // covered meanwhile; asked again in kRefitRetryNs
-  }
+  // Asked for. A rebuild that fails, here or later on the build thread, is
+  // reported by builds_.take_retry() above on the next tick, which alone
+  // times the retry.
+  refits_.done(source, interval);
 }
 
 RenderStatus FilterRender::status() const noexcept {

@@ -1710,6 +1710,19 @@ Template:
   on `main` at `79dd38b`; the `[build]` cases passed 8 repeated runs.
 - Eval delta: not affected. The core pipeline is unchanged (plugin-only);
   `scripts/ci/run.sh eval` was not run.
+- Review follow-up (staff review and Greptile on the first push): requests
+  now wait in one slot in `GenerationBuilder` and at most one build task is
+  queued behind the running one, so repeated settings changes during a slow
+  build free the superseded copies of the settings at once instead of
+  queuing them (new case: 51 requests leave one task and free the first
+  request's copy; removing the one-task rule failed it). `tick` no longer
+  records a failed rebuild itself; `take_retry()` alone times the retry. The
+  off-thread case now holds the build behind a gate while it checks frames
+  (it could see a hand-over between its check and the frame), and a new case
+  constructs a `ThreadedScheduler` and a stage inside the build on a real
+  `TaskThread` with `SteadyClock` and checks both were made on the build
+  thread. `main` at `33203c0` merged (agent-log conflict only); `build`
+  and `test` passed, 337/337, and the 10 `[build]` cases passed 10 runs.
 - Open issues or follow-ups: a source resized while a settings change is
   still building supersedes it with a rebuild of the new settings; if that
   build fails it is not retried (no generation of those settings existed

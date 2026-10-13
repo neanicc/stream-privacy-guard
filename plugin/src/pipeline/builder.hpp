@@ -19,7 +19,9 @@
 //     one is offered: it runs the same policy, and Pipeline covers whatever
 //     it cannot buffer.
 //   * Only the latest request is ever offered. One superseded before it
-//     starts is never built; one superseded while building is retired.
+//     starts is never built, and its copy of the settings is dropped at
+//     once (requests wait in one slot, and at most one task is posted for
+//     it); one superseded while building is retired.
 //   * A failed build covers every frame (solid, Cover::NoDetection) until a
 //     later request is offered. A rebuild that fails is worth retrying
 //     (take_retry()) only when the current settings were built once; a
@@ -104,8 +106,10 @@ class GenerationBuilder {
   GenerationBuilder(const GenerationBuilder&) = delete;
   GenerationBuilder& operator=(const GenerationBuilder&) = delete;
 
-  // Lock held. Supersedes every earlier request and posts `build`. False if
-  // it could not be posted: then it failed (covered) and `done` has run.
+  // Lock held. Supersedes every earlier request (one not started yet is
+  // dropped here) and queues `build`, posting a task to the executor unless
+  // one is already queued. False if it could not be posted: then it failed
+  // (covered) and `done` has run.
   bool request(Kind kind, Build build, Done done) noexcept;
   // Lock held. The caller could not even prepare a request of `kind`:
   // supersedes every earlier one and fails as a build would.
@@ -123,9 +127,12 @@ class GenerationBuilder {
   [[nodiscard]] bool take_retry() noexcept { return retry_due_.exchange(false); }
 
  private:
-  void run(std::uint64_t ticket, const Build& build, const Done& done) noexcept;
+  // The executor's thread: builds the request waiting in the slot, if any.
+  void run() noexcept;
   // Lock held: covers, records the failure.
   Outcome failure() noexcept;
+  // Lock held: empties the slot (the request in it is never built).
+  void drop_next() noexcept;
   void retire(std::unique_ptr<PipelineSpec> spec) noexcept;
 
   PipelineHost* host_;
@@ -134,6 +141,10 @@ class GenerationBuilder {
   Executor executor_;
 
   // Guarded by *lock_.
+  // The latest request not started yet; queued_ while a task is posted for it.
+  Build next_build_;
+  Done next_done_;
+  bool queued_ = false;
   std::uint64_t latest_ = 0;
   bool pending_ = false;
   bool failed_ = false;

@@ -70,7 +70,7 @@ GenerationBuilder::GenerationBuilder(PipelineHost& host, Pipeline::Retire retire
     : host_(&host), retire_(std::move(retire)), lock_(&lock), executor_(std::move(executor)) {}
 
 bool GenerationBuilder::request(Kind kind, Build build, Done done) noexcept {
-  const std::uint64_t ticket = ++latest_;
+  ++latest_;
   pending_ = true;
   if (kind == Kind::Settings) {
     // Nothing may run the old settings from here on: covered until the
@@ -80,17 +80,28 @@ bool GenerationBuilder::request(Kind kind, Build build, Done done) noexcept {
     retry_ = false;
     host_->fail(Cover::SettingsChanged);
   }
+  // Into the slot; a request waiting there is superseded and its copy of the
+  // settings is freed when `build` and `done` go out of scope (swap does not
+  // throw).
+  next_build_.swap(build);
+  next_done_.swap(done);
+  if (queued_) {
+    return true;  // the task already posted builds the latest request
+  }
   try {
-    // `done` is copied, not moved, so it is still here if posting throws.
-    executor_([this, ticket, job = std::move(build), done]() { run(ticket, job, done); });
+    executor_([this] { run(); });
+    queued_ = true;
     return true;
   } catch (...) {
     // Not posted (allocation, executor stopped): fails like a build.
   }
+  Done failed_done;
+  failed_done.swap(next_done_);
+  drop_next();
   const Outcome outcome = failure();
-  if (done) {
+  if (failed_done) {
     try {
-      done(outcome);
+      failed_done(outcome);
     } catch (...) {
     }
   }
@@ -99,6 +110,7 @@ bool GenerationBuilder::request(Kind kind, Build build, Done done) noexcept {
 
 GenerationBuilder::Outcome GenerationBuilder::fail(Kind kind) noexcept {
   ++latest_;  // whatever is pending is never offered
+  drop_next();
   if (kind == Kind::Settings) {
     settings_built_ = false;
     failed_ = false;
@@ -119,6 +131,13 @@ GenerationBuilder::Outcome GenerationBuilder::failure() noexcept {
   return Outcome{false, first};
 }
 
+void GenerationBuilder::drop_next() noexcept {
+  Build build;
+  Done done;
+  next_build_.swap(build);
+  next_done_.swap(done);
+}
+
 void GenerationBuilder::retire(std::unique_ptr<PipelineSpec> spec) noexcept {
   if (spec != nullptr && spec->scheduler != nullptr) {
     try {
@@ -128,14 +147,23 @@ void GenerationBuilder::retire(std::unique_ptr<PipelineSpec> spec) noexcept {
   }
 }
 
-void GenerationBuilder::run(std::uint64_t ticket, const Build& build, const Done& done) noexcept {
+void GenerationBuilder::run() noexcept {
+  std::uint64_t ticket = 0;
+  Build build;
+  Done done;
   try {
     const std::lock_guard lock(*lock_);
-    if (ticket != latest_) {
-      return;  // superseded before it started: nothing to build
-    }
+    queued_ = false;
+    // The slot holds only the latest request: fail() empties it, and a newer
+    // request replaces it.
+    build.swap(next_build_);
+    done.swap(next_done_);
+    ticket = latest_;
   } catch (...) {
-    // Cannot tell: build it; the hand-over below checks again.
+    return;  // the lock failed: the request stays pending (covered)
+  }
+  if (!build) {
+    return;  // dropped (fail()) before it started: nothing to build
   }
   // The expensive part, with no lock held: scheduler threads, stages.
   std::unique_ptr<PipelineSpec> spec;

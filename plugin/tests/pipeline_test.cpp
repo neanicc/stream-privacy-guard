@@ -1434,6 +1434,45 @@ TEST_CASE("only the latest request is ever handed over", "[plugin][pipeline][bui
   CHECK(count_masked(rig, 1010, 1400) > 10);
 }
 
+TEST_CASE("requests waiting for the build thread are replaced, not queued", "[plugin][pipeline][build]") {
+  BuildRig rig;
+  std::weak_ptr<int> first_alive;
+  {
+    // Stands for the first request's copy of the settings (the watch-list).
+    const auto settings = std::make_shared<int>(1);
+    first_alive = settings;
+    rig.request(Kind::Settings, [&rig, settings] { return rig.spec(face_between(kFace, 0, 10'000)); });
+  }
+  CHECK_FALSE(first_alive.expired());  // waiting for the build thread
+  CHECK(rig.tasks.size() == 1);
+  for (int i = 0; i < 50; ++i) {
+    rig.request(i % 2 == 0 ? Kind::Settings : Kind::Rebuild, rig.faces(face_between(kFace, 0, 10'000)));
+  }
+  CHECK(first_alive.expired());  // superseded: freed at once, never built
+  CHECK(rig.tasks.size() == 1);  // one task, for the latest request
+  rig.run_builds();
+  CHECK(rig.builds == 1);
+  REQUIRE(rig.outcomes.size() == 1);
+  CHECK(rig.outcomes[0].ok);
+
+  // Requests made while a build runs post one more task between them.
+  rig.request(Kind::Settings, [&rig] {
+    for (int i = 0; i < 20; ++i) {
+      rig.request(Kind::Settings, rig.faces(face_between(kFace, 0, 10'000)));
+    }
+    return rig.spec(face_between(kFace, 0, 10'000));
+  });
+  rig.run_builds();
+  CHECK(rig.tasks.size() == 1);
+  CHECK(rig.outcomes.size() == 1);  // the running build was superseded: retired, not offered
+  rig.run_builds();
+  CHECK(rig.builds == 3);
+  CHECK(rig.outcomes.size() == 2);
+  CHECK(rig.outcomes.back().ok);
+  CHECK(count_masked(rig, 1000, 1400) > 10);
+  CHECK(rig.host.pipeline().generations() <= Pipeline::kMaxGenerations);
+}
+
 TEST_CASE("a failed build covers, and only a rebuild of settings built once is retried", "[plugin][pipeline][build]") {
   BuildRig rig;
   const auto throwing = [] () -> SpecPtr { throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again)); };
@@ -1594,7 +1633,12 @@ TEST_CASE("generations are built on the build thread, never on the caller", "[pl
   HostRig rig;
   std::mutex lock;
   // Built here, handed out by the build: the rig's clock is not thread-safe.
+  // The next case constructs a real scheduler inside the build.
   auto ready = std::make_shared<SpecPtr>(rig.spec(face_between(kFace, 0, 10'000)));
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool gate = false;
+  std::atomic<bool> started{false};
   std::atomic<bool> finished{false};
   std::thread::id built_on;
   bool ok = false;
@@ -1609,8 +1653,12 @@ TEST_CASE("generations are built on the build thread, never on the caller", "[pl
     const std::lock_guard guard(lock);
     REQUIRE(builder.request(
         Kind::Settings,
-        [&built_on, ready] {
+        [&, ready] {
           built_on = std::this_thread::get_id();
+          started.store(true);
+          // Held until the test has rendered frames while the build runs.
+          std::unique_lock held(gate_mutex);
+          gate_cv.wait_for(held, 10s, [&] { return gate; });
           return std::move(*ready);
         },
         [&](GenerationBuilder::Outcome outcome) {
@@ -1618,11 +1666,26 @@ TEST_CASE("generations are built on the build thread, never on the caller", "[pl
           finished.store(true);
         }));
   }
+  const auto start_by = std::chrono::steady_clock::now() + 5s;
+  while (!started.load() && std::chrono::steady_clock::now() < start_by) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(started.load());
+  // The build is running and cannot finish: every frame is covered.
   std::int64_t t = 1000;
-  // Covered until the build thread has handed the generation over.
-  while (!finished.load() && t < 60'000) {
-    CHECK(rig.frame(t).kind == DrawKind::Solid);
-    t += 10;
+  for (; t < 1300; t += 10) {
+    const DrawPlan& plan = rig.frame(t);
+    CHECK(plan.kind == DrawKind::Solid);
+    CHECK(plan.cover == Cover::SettingsChanged);
+  }
+  CHECK_FALSE(finished.load());
+  {
+    const std::lock_guard guard(gate_mutex);
+    gate = true;
+  }
+  gate_cv.notify_all();
+  const auto done_by = std::chrono::steady_clock::now() + 5s;
+  while (!finished.load() && std::chrono::steady_clock::now() < done_by) {
     std::this_thread::sleep_for(1ms);
   }
   REQUIRE(finished.load());
@@ -1637,6 +1700,78 @@ TEST_CASE("generations are built on the build thread, never on the caller", "[pl
     masked += rig.frame(t).kind == DrawKind::Masked ? 1 : 0;
   }
   CHECK(masked > 10);
+  thread.stop();
+}
+
+namespace {
+
+// A stage that records the thread that constructed it.
+class ThreadTaggedDetector final : public spg::Detector {
+ public:
+  ThreadTaggedDetector() : made_on(std::this_thread::get_id()) {}
+  [[nodiscard]] std::vector<Detection> detect(const spg::FrameView& /*readback*/, Size /*source*/) const override {
+    return {};
+  }
+  const std::thread::id made_on;
+};
+
+}  // namespace
+
+TEST_CASE("the scheduler and its stages are constructed on the build thread", "[plugin][pipeline][build]") {
+  static const spg::SteadyClock clock;  // thread-safe, unlike the rig's; outlives the scheduler
+  HostRig rig;
+  std::mutex lock;
+  std::atomic<bool> finished{false};
+  bool ok = false;
+  std::shared_ptr<const ThreadTaggedDetector> stage;
+  std::thread::id scheduler_made_on;
+  spg::plugin::TaskThread thread;
+  GenerationBuilder builder(
+      rig.host, [&rig](std::unique_ptr<spg::plugin::FrameScheduler> s) {
+        const std::lock_guard guard(rig.mutex);
+        rig.retired.push_back(std::move(s));
+      },
+      lock, [&thread](GenerationBuilder::Task task) { thread.post(std::move(task)); });
+  {
+    const std::lock_guard guard(lock);
+    // As FilterRender's build does: the stages and the ThreadedScheduler
+    // (worker threads) are made inside the build.
+    REQUIRE(builder.request(
+        Kind::Settings,
+        [&] {
+          auto detector = std::make_shared<const ThreadTaggedDetector>();
+          auto spec = std::make_unique<spg::plugin::PipelineSpec>();
+          const spg::SchedulerConfig config = face_config();
+          spec->fallback = FallbackMode::BlurSource;
+          spec->hold = config.tracker.hold;
+          spec->scheduler = std::make_unique<spg::plugin::ThreadedScheduler>(
+              clock, config, spg::ScanStages{detector, nullptr, nullptr, nullptr});
+          scheduler_made_on = std::this_thread::get_id();
+          stage = std::move(detector);
+          return spec;
+        },
+        [&](GenerationBuilder::Outcome outcome) {
+          ok = outcome.ok;
+          finished.store(true);
+        }));
+  }
+  const auto done_by = std::chrono::steady_clock::now() + 10s;
+  while (!finished.load() && std::chrono::steady_clock::now() < done_by) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(finished.load());
+  {
+    const std::lock_guard guard(lock);
+    CHECK(ok);
+    REQUIRE(stage != nullptr);
+    CHECK(stage->made_on == thread.id());
+    CHECK(stage->made_on != std::this_thread::get_id());
+    CHECK(scheduler_made_on == thread.id());
+  }
+  // The render side only swaps the ready generation in.
+  CHECK_FALSE(rig.host.status().scanning);
+  static_cast<void>(rig.frame(1000));
+  CHECK(rig.host.status().scanning);
   thread.stop();
 }
 

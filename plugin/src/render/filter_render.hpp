@@ -83,8 +83,8 @@ class FilterRender {
   // settings unless the one running or being built already matches. `policy`
   // is the caller's copy (never a reference to requested_). Throws if the
   // request cannot be prepared; a request that cannot be posted has failed
-  // (covered) and logged by the time this returns false.
-  bool request_locked(Kind kind, std::optional<PolicyConfig> policy, FallbackMode fallback,
+  // (covered) and logged by the time this returns.
+  void request_locked(Kind kind, std::optional<PolicyConfig> policy, FallbackMode fallback,
                       std::uint64_t budget_bytes);
   // Caller holds publish_mutex_. A request of `kind` could not be prepared.
   void request_failed_locked(Kind kind) noexcept;
