@@ -212,7 +212,9 @@ SequenceResult run_simulated(const FrameSource& source, const PolicyConfig& poli
       if (clock.now() < next->done) {
         clock.set(next->done);
       }
+      const auto applying = steady::now();
       lookahead.complete(next->job, next->result);
+      times.add(kStageComplete, elapsed_ms(applying, steady::now()));
       result.latencies_ms.push_back(to_ms(next->done - next->job.frame_time));
       next->busy = false;
       next->job = ScanJob{};
@@ -413,13 +415,20 @@ SequenceResult run_realtime(const FrameSource& source, const PolicyConfig& polic
       }
       previous = t;
       const FrameView view = last.readback.view(t);
+      const auto pushing = steady::now();
       const FrameId id =
           scheduler.wants_scan(t) ? scheduler.push(t, last.source, &view) : scheduler.push(t, last.source);
+      const auto releasing = steady::now();
       if (k < source.count) {
         collector.expect(id, k);
       }
       released.clear();
       scheduler.release_due(released);
+      // The plugin's render callback makes these calls: their time, including
+      // any wait while a worker applies a result under the lock, is what the
+      // render thread would spend.
+      times.add(kStagePush, elapsed_ms(pushing, releasing));
+      times.add(kStageRelease, elapsed_ms(releasing, steady::now()));
       // Fitting waits until the feed ends: it is CLI output work the plugin
       // never does, and on this thread it delayed the next frame's push.
       for (const ReleasedFrame& r : released) {

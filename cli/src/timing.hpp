@@ -42,6 +42,12 @@ inline constexpr std::string_view kStageRecognize = "recognize";
 inline constexpr std::string_view kStagePolicy = "policy";
 inline constexpr std::string_view kStageCycle = "cycle";
 inline constexpr std::string_view kStageCompose = "compose";
+// Lookahead::complete(), which Scheduler runs under its lock (simulated drivers).
+inline constexpr std::string_view kStageComplete = "complete";
+// The realtime feed's render-facing calls: wants_scan() with push(), and
+// release_due(), each including any wait for the scheduler's lock.
+inline constexpr std::string_view kStagePush = "push";
+inline constexpr std::string_view kStageRelease = "release";
 
 class StageTimes {
  public:

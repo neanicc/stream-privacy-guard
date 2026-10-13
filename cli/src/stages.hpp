@@ -4,6 +4,7 @@
 // $SPG_CACHE_DIR, and wrappers that time every stage call. Recognized text
 // stays inside the stages; nothing here logs or stores it.
 
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -33,6 +34,10 @@ struct StageOptions {
   bool cpu_only = false;
   // ONNX Runtime intra-op threads per model; 0 keeps its default.
   int intra_op_threads = 0;
+  // TextRecognizerConfig::parallel_runs: recognizer model runs side by side
+  // in one recognize() call, in [1, 16]. The recognizer's default (checked
+  // in stages_models.cpp), as the plugin runs with one worker.
+  std::size_t recognizer_runs = 4;
   // Offline settings for `scrub` (SPG-18), which must not miss text the
   // pipeline would miss only to save time: tiles overlap by half the shorter
   // tile side, so a line that tall is never cut by a tile edge, and the text

@@ -18,13 +18,16 @@ tracker, scheduler) on PNG frame sequences, with no OBS. SPG-18 adds
 Pipeline options: `--cache DIR` (models; default `$SPG_CACHE_DIR`, else
 `~/.cache/spg`), `--cpu` (CPU execution provider only; default is the
 platform order with CPU fallback, CoreML on macOS), `--readback-scale S`
-(default 1; not `scrub`), `--workers N` (default 2, the scheduler's, as the
-plugin runs; for `scrub` the frames scanned at once), `--cycle-ms MS` (`run`
+(default 1; not `scrub`), `--workers N` (default 1, the scheduler's, as the
+plugin runs; for `scrub` the frames scanned at once, default 2), `--cycle-ms MS` (`run`
 and `eval` only, default 200), `--scan-interval-ms MS` (the scheduler's
-`scan_interval`; default its own, 0) and `--threads N` (ONNX Runtime
-intra-op threads per model; default its own choice). The last two exist to
-measure scheduling and threading choices with `bench` (SPG-16); the
-defaults are what the plugin runs. Exit
+`scan_interval`; default its own, 0), `--threads N` (ONNX Runtime
+intra-op threads per model; default its own choice) and
+`--recognizer-runs N` (recognizer model runs side by side in one cycle,
+`TextRecognizerConfig::parallel_runs`, in [1, 16]; default 4). The last
+three exist to measure scheduling and threading choices with `bench`
+(SPG-16, SPG-16c); the defaults are what the plugin runs with its default
+worker. Exit
 codes: 0 done (for `scrub`: no leak), 1 failed (a missing model, an
 unreadable frame, a suite whose frame count or frame size disagrees with
 `suite.json`, a policy file outside the limits in
@@ -97,8 +100,13 @@ Every stage is wrapped (`timed()`) and timed with `steady_clock`:
 `decode` (PNG decode, including the compositor's reloads in simulated
 `bench`), `readback` (scaling, when the scale is below 1), `face_detect`,
 `text_detect`, `recognize`, `policy` (per text), `cycle` (one whole
-`run_scan()`, simulated drivers) and `compose` (CPU compositor, simulated
-`bench` and `--write-frames`). `--timing` / `--report` write count, total,
+`run_scan()`, simulated drivers), `complete` (one `Lookahead::complete()`,
+the apply `Scheduler` runs under its lock; simulated drivers),
+`push` and `release` (the realtime feed's `wants_scan()` and `push()`, and
+its `release_due()`: the render-facing calls, including any wait for the
+lock while a worker applies a result; `push` also copies the readback when a
+scan is queued, which the plugin avoids with pooled buffers) and `compose` (CPU compositor,
+simulated `bench` and `--write-frames`). `--timing` / `--report` write count, total,
 mean, nearest-rank p50 and p95, and max per stage, plus the detection
 latencies, fail-closed count and rate, padding and late frames, the scheduler
 counters and the providers each model runs on.

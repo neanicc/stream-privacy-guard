@@ -2478,3 +2478,112 @@ Template:
   leak 0.0036, clean-frame blur unchanged; decoy blur CI 0.4188 to 0.4255,
   local 0.5226 to 0.5284 (the wider spread). Two workers: every mask plan in
   all three suites is still byte-identical to main a474cde.
+
+## 2026-10-13 — SPG-16c One-worker default and realtime re-measure (#85)
+
+- Method. Dev Mac: Apple M4 (16 GB), macOS 26.5.2, ONNX Runtime 1.30.0
+  with Core ML. Realtime suite as `run_eval.py --mode local` runs it
+  (`spg-cli bench --realtime`, the 15 1080p sequences of the full text
+  suite, seed 20261012, scored with `eval/thresholds.toml`), driven by a
+  scratch script that, before each run, waited until no `cmake`, `clang`,
+  `make`, `ninja`, `ctest` or other `spg-cli` process ran and the 1-minute
+  load was under 4 (at most 60 min), and recorded the load. Main 630139a
+  (two workers, its default) and the branch (one worker, its default)
+  ran as interleaved pairs, alternating which went first. Another agent's
+  eval kept the Mac busy for about three hours: the first pair ran after
+  the wait expired (load 9.6 to 21) and is invalid (one stage call stalled
+  for about 30 minutes in each run; the main run ended with "frames were
+  not released in time"). Every run below started quiet (load 3.2 to 4.0;
+  `mediaanalysisd` alone kept it near 3.5).
+- Realtime, four quiet pairs, fail-closed rate / p95 latency in run
+  order: main 0.129 / 415 ms, branch 0.018 / 266 ms; main 0.097 / 396 ms,
+  branch 0.018 / 270 ms; branch 0.010 / 270 ms, main 0.226 / 477 ms; main
+  0.143 / 427 ms, branch 0.029 / 281 ms. Six more one-worker runs at the
+  default (in the sweep below): 0.024, 0.010, 0.018, 0.007, 0.021, 0.016,
+  p95 258 to 284 ms. One worker, ten runs: fail-closed median 0.018
+  (0.007 to 0.029), p95 258 to 284 ms. Two workers: median 0.136 (0.097
+  to 0.226), p95 396 to 477 ms. Limits: fail-closed 0.01, p95 400 ms.
+  One worker meets p95 in every run and fail-closed in 1 of 10.
+- Where the frames fail. In one quiet one-worker run 17 of 24 failed
+  frames were in one chat sequence (seq-010), in runs of 4 to 6 frames
+  every 16 frames. With one worker and 500 ms of lookahead a frame airs
+  clean only when a cycle that starts at or after it ends by its release,
+  so with cycles d apart about the first `2d - 500` ms after each scan
+  start fail closed once a cycle runs past 250 ms. Stage medians, one
+  worker: text 82 to 94 ms, recognition 42 to 46 ms (p95 110 to 124 ms on
+  chat frames), faces 35 to 40 ms. Two workers: text 121 to 129, recognition
+  51 to 56 (p95 177 to 226), faces 54 to 57.
+- Recognizer runs (`--recognizer-runs`, new, for `bench`), one worker,
+  interleaved: 2 runs 0.033 and 0.025; 8 runs 0.022 and 0.022; 6 runs
+  0.007, 0.012, 0.019, 0.007, 0.058, 0.002 (median 0.010, p95 244 to
+  301 ms) against 4 runs in the same rounds 0.024, 0.010, 0.018, 0.007,
+  0.021, 0.016 (median 0.017). Six does not separate from four in this
+  spread and gave the worst single run, so the default stays 4.
+- Decision: one worker by default (`SchedulerConfig::workers = 1`), which
+  the plugin and `spg-cli` follow. It is the configuration the
+  measurements favor: fail-closed falls from 0.136 to 0.018 (median) and
+  p95 from about 420 to about 270 ms. The fail-closed limit is still
+  missed by about 0.8 pp on this Mac; that gap goes to a human (below).
+- Simulated eval on the same generated suites (fixed 200 ms cycle), main
+  630139a two workers against the branch with its one-worker default, on
+  the final head:
+
+  | Metric | Main, 2 workers | Branch, 1 worker |
+  | --- | --- | --- |
+  | CI watch-list / first-frame / PII recall | 1 / 1 / 1 | 1 / 1 / 1 |
+  | CI text leak | 0 (0/285) | 0 (0/285) |
+  | CI clean-frame blur | 0 | 0 |
+  | CI decoy blur | 0.4233 (378/893) | 0.4255 (380/893) |
+  | Local watch-list pair recall | 0.9992 | 0.9992 |
+  | Local first-frame recall | 0.9623 (51/53) | 0.9623 (51/53) |
+  | Local PII pair recall | 0.9990 | 0.9990 |
+  | Local text leak | 0.0036 (7/1919) | 0.0036 (7/1919) |
+  | Local clean-frame blur | 0.0027 | 0.0025 |
+  | Local decoy blur | 0.5090 (2369/4654) | 0.5284 (2459/4654) |
+  | Face pair recall | 0.9995 | 1.0000 |
+  | Faces leak | 0.0009 (1/1080) | 0 (0/1080) |
+  | Faces clean-frame blur | 0 | 0 |
+
+  Every recall and leak metric is equal or better; decoy blur rises
+  0.2 pp (CI) and 1.9 pp (local), the first-sighting spread's cost
+  (SPG-16d). Decoy blur already fails its limit on main (#75). The branch
+  with `--workers 2` writes mask plans byte-identical to main in all 64
+  sequences. `scripts/ci/run.sh eval` on the final tree: `THRESHOLDS:
+  FAIL` from decoy blur only (0.4255).
+- #83 review inputs. (1) Recognizer runs in flight: the plugin opens the
+  recognizer with `recognizer_parallel_runs(workers)`, a budget of 4 runs
+  per filter split across its workers (4 with one worker; it was 2 x 4 =
+  8). Filters share one session, so N filters can still have 4N in flight:
+  follow-up. (2) Cost of `complete()` under the lock: the simulated drivers
+  now time it (`complete` stage): p95 at most 0.09 ms and max 0.15 ms on
+  the text and faces suites. The realtime feed now times the render-facing
+  calls, which include any wait for that lock: `release` (release_due) p95
+  0.008 ms, max 0.03 to 0.4 ms; `push` (wants_scan and push) p95 1.2 to
+  1.5 ms, max 2.7 to 51 ms, most of it the 8 MB readback copy that the
+  plugin avoids with pooled buffers. (3) Double model load: only the text
+  detector fixes shapes, and the extra plain CPU session `dim_overrides()`
+  opens took 8.6 to 15.6 ms (scratch probe, six opens), once per model
+  load. No change. (4) The realtime fitting test no longer needs a frame
+  to make its deadline: fallback plans carry fitted rects too, so it
+  checks every plan with rects and needs only one cycle to finish.
+  (5) GPU readback time needs OBS: deferred to the live pass (#71).
+  (6) Other backends and 720p were not measured (no CUDA or DirectML
+  machine here); #86 covers sub-1080p cost.
+- Test change. `cli_pipeline_test` checked that the decoy line is never
+  blurred. With one worker the first sighting of the lines that appear on
+  frame 12 is spread, which reaches the decoy 80 px above on frames 12 to
+  18. The test now runs twice: two workers with the strict check on every
+  frame, and the default with the same check on every frame outside the
+  12 frames (one 200 ms cycle) after the lines appear.
+- Also: `eval/run_eval.py --workers N` passes a worker count to every
+  `spg-cli` call and records it (`workers:` line, report.json), as #90
+  asks; #90 is left open for its owner to close.
+- Human ask (done-when 1 not met). On the dev Mac one worker measures
+  fail-closed 0.018 median (0.007 to 0.029, ten quiet runs) against
+  `fail_closed_frame_rate_max = 0.01`; p95 passes. Choose one: (a) set
+  `[suite.realtime] fail_closed_frame_rate_max` to 0.03 for this
+  hardware; (b) keep 0.01 and keep the release gate open until the
+  heaviest frames' cycle is under 250 ms (#86, recognizing only new
+  tracks); or (c) raise the default lookahead from 500 ms (plan section
+  4) so two cycles fit, which delays the stream and audio further. Live
+  OBS not tested.

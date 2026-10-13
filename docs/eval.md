@@ -145,9 +145,11 @@ python3 eval/score.py --mode ci --suite text=eval-out/text --reference noop
 `run.sh eval` builds the tree, then calls `eval/run_eval.py`, which
 generates the suites for the mode, runs the sanity checks, runs
 `build/cli/spg-cli eval` on each suite (simulated time, fixed 200 ms cycles,
-2 workers; [cli.md](cli.md)) and scores the plans. In local mode it also runs
-`spg-cli bench --realtime` on the text suite's 1920x1080 sequences for the
-realtime suite. A missing or failing `spg-cli` prints `THRESHOLDS: FAIL` in
+the scheduler's default of 1 worker; [cli.md](cli.md)) and scores the plans.
+In local mode it also runs `spg-cli bench --realtime` on the text suite's
+1920x1080 sequences for the realtime suite. `--workers N` passes another
+worker count to every `spg-cli` call (a `workers:` line and report.json
+record it), for comparisons such as SPG-16c's. A missing or failing `spg-cli` prints `THRESHOLDS: FAIL` in
 every mode; there is no "not run" outcome. The report lines include each
 suite's frame and fail-closed counts and stage medians. SPG-16 tunes the
 realtime numbers.

@@ -82,6 +82,20 @@ struct ModelFiles {
 // to call from several worker threads at once.
 class LoadedModels;
 
+// Recognizer model runs in flight at once per filter, summed over its
+// scheduler's workers: each worker inside recognize() runs up to
+// TextRecognizerConfig::parallel_runs crops side by side, all on the one
+// shared session and its ONNX Runtime intra-op pool. 4 is what one worker ran
+// when the dev Mac met the realtime limits (agent-log SPG-16, SPG-16c); the
+// old default of two workers with 4 runs each put 8 in flight (#85).
+inline constexpr std::size_t kRecognizerRunBudget = 4;
+
+// parallel_runs for a scheduler with `workers` workers: the budget split
+// evenly, at least 1. So workers * parallel_runs <= kRecognizerRunBudget for
+// up to kRecognizerRunBudget workers; past that each worker still reads one
+// crop at a time.
+[[nodiscard]] std::size_t recognizer_parallel_runs(std::size_t workers) noexcept;
+
 struct LoadOptions {
   // Platform default execution providers with CPU fallback, or CPU only.
   bool cpu_only = false;
@@ -92,8 +106,11 @@ struct LoadResult {
   ModelReport report;
 };
 
-// locate_models(), then opens and warms up each model. Slow (hundreds of
-// milliseconds to seconds): never call it on the graphics or UI thread.
+// locate_models(), then opens and warms up each model. The recognizer runs
+// recognizer_parallel_runs(SchedulerConfig{}.workers) crops at once, sized
+// for the workers every filter's scheduler gets (SchedulerConfig::from_policy
+// keeps the default). Slow (hundreds of milliseconds to seconds): never call
+// it on the graphics or UI thread.
 // Throws only std::bad_alloc.
 [[nodiscard]] LoadResult load_models(std::span<const std::filesystem::path> dirs, const LoadOptions& options = {});
 

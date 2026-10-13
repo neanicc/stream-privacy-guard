@@ -21,6 +21,7 @@
 #include "inputs.hpp"
 #include "spg/compose.hpp"
 #include "spg/json.hpp"
+#include "spg/lookahead.hpp"
 #include "stages.hpp"
 #include "synthetic_text.hpp"
 
@@ -83,6 +84,7 @@ TEST_CASE("spg-cli run masks a watch-list line, a card number and a face on the 
   // and the card appear on frame 12 and stay; a decoy line is there all along.
   constexpr std::size_t kFrames = 36;
   constexpr std::size_t kAppear = 12;
+  constexpr std::size_t kCycleFrames = 12;  // the default 200 ms simulated cycle at 60 fps
   spg::Rect entry_ink;
   spg::Rect card_ink;
   spg::Rect decoy_ink;
@@ -105,46 +107,68 @@ TEST_CASE("spg-cli run masks a watch-list line, a card number and a face on the 
     policy << R"({"schema": 1, "watchlist": [")" << kEntry << R"("]})";
   }
 
-  const std::vector<std::string> args = {"run",     "--frames", (dir / "frames").string(), "--policy",
-                                         (dir / "policy.json").string(), "--out", (dir / "plans.jsonl").string(),
-                                         "--timing", (dir / "timing.json").string(), "--cache", SPG_CACHE_DIR,
-                                         "--cpu",   "--write-frames", (dir / "composed").string()};
-  const std::vector<std::string_view> views(args.begin(), args.end());
-  std::ostringstream out;
-  std::ostringstream err;
-  const int code = spg::cli::run_cli(views, out, err);
-  INFO(err.str());
-  REQUIRE(code == 0);
-
-  std::vector<spg::MaskPlan> plans;
-  std::istringstream lines(slurp(dir / "plans.jsonl"));
-  for (std::string line; std::getline(lines, line);) {
-    plans.push_back(spg::parse_mask_plan(line));
-  }
-  REQUIRE(plans.size() == kFrames);
-  for (std::size_t i = 0; i < kFrames; ++i) {
-    INFO("frame " << i);
-    CHECK_FALSE(plans[i].fallback);
-    CHECK(plans[i].rects.size() <= spg::kMaskRectCapacity);
-    // The face is on every frame.
-    CHECK(overlaps(plans[i], spg::Rect{1000, 416, 160, 208}));
-    if (i >= kAppear) {
-      // Covered from the first frame it shows, by retroactive masking.
-      CHECK(contains(plans[i], entry_ink));
-      CHECK(contains(plans[i], card_ink));
+  // The default (one worker, as the plugin runs), then two workers.
+  for (const std::size_t workers : {std::size_t{0}, std::size_t{2}}) {
+    INFO("workers " << (workers == 0 ? std::string("default") : std::to_string(workers)));
+    std::vector<std::string> args = {"run",     "--frames", (dir / "frames").string(), "--policy",
+                                     (dir / "policy.json").string(), "--out", (dir / "plans.jsonl").string(),
+                                     "--timing", (dir / "timing.json").string(), "--cache", SPG_CACHE_DIR,
+                                     "--cpu"};
+    if (workers == 0) {
+      args.insert(args.end(), {"--write-frames", (dir / "composed").string()});
+    } else {
+      args.insert(args.end(), {"--workers", std::to_string(workers)});
     }
-    // The decoy line is not sensitive.
-    CHECK_FALSE(overlaps(plans[i], decoy_ink));
-  }
+    const std::vector<std::string_view> views(args.begin(), args.end());
+    std::ostringstream out;
+    std::ostringstream err;
+    const int code = spg::cli::run_cli(views, out, err);
+    INFO(err.str());
+    REQUIRE(code == 0);
 
-  const nlohmann::json timing = nlohmann::json::parse(slurp(dir / "timing.json"));
-  for (const char* stage : {"decode", "face_detect", "text_detect", "recognize", "policy", "cycle", "compose"}) {
-    INFO(stage);
-    CHECK(timing["stages"][stage]["count"].get<int>() > 0);
-  }
-  CHECK(spg::cli::list_frames(dir / "composed").size() == kFrames);
-  for (const std::string& text : {out.str(), err.str(), slurp(dir / "plans.jsonl"), slurp(dir / "timing.json")}) {
-    CHECK(text.find(kEntry) == std::string::npos);
-    CHECK(text.find("Quanticor") == std::string::npos);
+    std::vector<spg::MaskPlan> plans;
+    std::istringstream lines(slurp(dir / "plans.jsonl"));
+    for (std::string line; std::getline(lines, line);) {
+      plans.push_back(spg::parse_mask_plan(line));
+    }
+    REQUIRE(plans.size() == kFrames);
+    for (std::size_t i = 0; i < kFrames; ++i) {
+      INFO("frame " << i);
+      CHECK_FALSE(plans[i].fallback);
+      CHECK(plans[i].rects.size() <= spg::kMaskRectCapacity);
+      // The face is on every frame.
+      CHECK(overlaps(plans[i], spg::Rect{1000, 416, 160, 208}));
+      if (i >= kAppear) {
+        // Covered from the first frame it shows, by retroactive masking.
+        CHECK(contains(plans[i], entry_ink));
+        CHECK(contains(plans[i], card_ink));
+      }
+      // The decoy line is not sensitive. With one worker (the default since
+      // SPG-16c) the new lines' first sighting is spread on the frames between
+      // the last scan that missed them and that sighting (SPG-16d,
+      // docs/scheduler.md "Masks"), which reaches the decoy 80 px above. That
+      // sighting comes from the first scan after kAppear, at most one 200 ms
+      // cycle (12 frames) later, so only frames in that window may blur it;
+      // the decoy-blur metric measures that cost (#75). Two workers in step
+      // spread nothing, so there the decoy is never blurred.
+      if (workers != 0 || i < kAppear || i >= kAppear + kCycleFrames) {
+        CHECK_FALSE(overlaps(plans[i], decoy_ink));
+      }
+    }
+
+    const nlohmann::json timing = nlohmann::json::parse(slurp(dir / "timing.json"));
+    CHECK(timing["workers"].get<std::size_t>() == (workers == 0 ? spg::SchedulerConfig{}.workers : workers));
+    for (const char* stage : {"decode", "face_detect", "text_detect", "recognize", "policy", "cycle", "complete"}) {
+      INFO(stage);
+      CHECK(timing["stages"][stage]["count"].get<int>() > 0);
+    }
+    if (workers == 0) {
+      CHECK(timing["stages"]["compose"]["count"].get<int>() > 0);
+      CHECK(spg::cli::list_frames(dir / "composed").size() == kFrames);
+    }
+    for (const std::string& text : {out.str(), err.str(), slurp(dir / "plans.jsonl"), slurp(dir / "timing.json")}) {
+      CHECK(text.find(kEntry) == std::string::npos);
+      CHECK(text.find("Quanticor") == std::string::npos);
+    }
   }
 }
