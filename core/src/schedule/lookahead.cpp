@@ -264,17 +264,36 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
     }
     tracked.push_back(held);
   }
-  // The velocity of the track each detection joined, for back-projection.
-  std::vector<Velocity> velocities;
-  tracker_.update(job.frame_time, tracked, &velocities);
+  // The motion of the track each detection joined, for back-projection.
+  std::vector<TrackMotion> motions;
+  tracker_.update(job.frame_time, tracked, &motions);
 
   // Retroactive masking: the tracker only covers frames at or after the
   // frame a detection was seen on; earlier buffered frames get the boxes here.
   // Each box is masked where it was found and, when its track is moving and
   // no resize came between, also moved back along the track's velocity to
   // where it was on the earlier frame (text sliding or scrolling in).
+  //
+  // A translating track that was first seen moving entered from somewhere
+  // along its path, and an ease-out slide is first seen near rest, slower
+  // than it came in, so the measured velocity under-projects it. On frames
+  // before it was first seen, its box is also trailed back to the frame edge
+  // it moves away from, but only after the last frame a complete cycle
+  // scanned before then: that cycle would most likely have found it (a box it
+  // missed gets the static and moved rects, as before).
   const Timestamp from = job.frame_time - config_.retro;
   const bool same_size = job.size_epoch == current;
+  // Every frame released so far is older than every buffered one, so only
+  // buffered frames can bound a trail.
+  std::vector<std::optional<Timestamp>> last_scan(result.detections.size());
+  for (std::size_t i = 0; i < result.detections.size(); ++i) {
+    for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
+      if (it->scanned && it->t < motions[i].first_seen) {
+        last_scan[i] = it->t;
+        break;
+      }
+    }
+  }
   for (FrameRecord& frame : frames_) {
     if (frame.bad_timestamp || frame.t < from || frame.t > job.frame_time) {
       continue;
@@ -295,15 +314,21 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
                          mask::scale_between(mask_here, job.source, frame.source));
         }
         add_retro(frame, r);
-        const Velocity v = velocities[i];
+        const Velocity v = motions[i].velocity;
         if (same_size && frame.source == job.source && (v.dx_per_s != 0.0F || v.dy_per_s != 0.0F)) {
           add_retro(frame, mask::grow_by_margin(mask::moved(d.box.rect, v, back), margin_px, margin_ratio));
+          if (motions[i].translating && frame.t < motions[i].first_seen &&
+              (!last_scan[i].has_value() || frame.t > *last_scan[i])) {
+            add_retro(frame, mask::grow_by_margin(mask::trail_to_edge(d.box.rect, v, job.source), margin_px,
+                                                  margin_ratio));
+          }
         }
       }
     }
     // Only a complete cycle is a scan; a partial one only adds masks.
     if (result.complete && frame.segment == job.segment) {
       frame.covered = true;
+      frame.scanned = frame.scanned || frame.id == job.frame;
     }
   }
 

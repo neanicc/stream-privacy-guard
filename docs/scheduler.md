@@ -170,6 +170,20 @@ frame. The static rect stays, so back-projection only adds blur. SPG-12
 measured why: a toast token sliding in at about 480 px/s on the text suite
 was first scanned 100 ms after it appeared, and the static rect covered only
 57-89% of it on its first five frames.
+
+A constant velocity under-projects an ease-out slide: it is first seen near
+rest, much slower than it came in. So on a frame before its track was first
+seen (`TrackMotion::first_seen`), a box whose track is translating (its last
+measurement moved both edges at least a pixel the way the velocity points, so
+it slid or scrolled rather than grew while typed or faded in) is also
+**trailed** back to the frame edge it moves away from, along the axis it moves
+most on (`mask::trail_to_edge`), with the margin. Only frames after the last
+frame a complete cycle scanned before that first sighting get the trail: that
+cycle would most likely have found the box if it was already there. SPG-12c
+measured why: on the full text suite two toasts were first scanned near rest,
+at about -710 and -160 px/s, and the static and moved rects missed them on
+5 and 7 frames (on its first frame one was 418 px right of where the cycles
+found it, about 300 px beyond its back-projected rect).
 Per frame, a rect contained in another is dropped, and past `max_retro_rects`
 they merge into one hull (more blur, never less).
 

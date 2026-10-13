@@ -544,6 +544,96 @@ TEST_CASE("retroactive masks follow a moving track back to the frames before it 
   }
 }
 
+TEST_CASE("retroactive masks trail an ease-out slide-in back to the edge it entered from", "[schedule]") {
+  // A toast slides in from the right edge of a 1280 px frame from 1100 on,
+  // easing out (cubic) to rest at x = 900 by 1300; SPG-12c, text suite
+  // seq-016. Cycles at 1260 and 1270 first see it, nearly at rest: the
+  // velocity they measure (about -180 px/s) puts it 27 px right of 903 on
+  // 1110, where it really was at about 1226. Frames before its first sighting
+  // get the box trailed back to the right edge.
+  const auto box_at = [](std::int64_t t) {
+    const double p = std::clamp(static_cast<double>(t - 1100) / 200.0, 0.0, 1.0);
+    const double eased = 1.0 - std::pow(1.0 - p, 3.0);
+    const double x = 1280.0 + (900.0 - 1280.0) * eased;
+    // Clipped to the frame, as a detector or the scorer sees it.
+    return Rect{static_cast<float>(x), 100.0F, static_cast<float>(std::min(200.0, 1280.0 - x)), 20.0F};
+  };
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 300ms;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const std::int64_t ms = spg::to_ns(t) / 1'000'000;
+                                    std::vector<Detection> out;
+                                    const Rect b = box_at(ms);
+                                    if (ms > 1100) {
+                                      out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                    }
+                                    return out;
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  for (std::int64_t t = 950; t <= 1300; t += 10) {
+    const bool scan = t == 1000 || t == 1260 || t == 1270 || t == 1300;
+    sim.push(t, scan);
+    if (scan) {
+      sim.scan_now();
+    }
+  }
+  const auto out = sim.release_at(1900);
+  REQUIRE(out.size() == 36);
+  for (const ReleasedFrame& r : out) {
+    const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+    INFO("frame " << t);
+    CHECK(r.action == FallbackAction::None);
+    if (t > 1100) {
+      CHECK(covered_by(r.plan, box_at(t)));
+    }
+    if (t > 1000 && t < 1260) {
+      continue;  // trailed: after the empty cycle at 1000, before the first sighting
+    }
+    // No trail on frames at or before the last scan that did not see it
+    // (960 .. 1000 are within retro of 1260), nor from the first sighting on,
+    // where the tracker and the static and moved rects cover it.
+    for (const spg::MaskRect& m : r.plan.rects) {
+      CHECK(m.box.rect.x + m.box.rect.width < 1280.0F);
+    }
+  }
+}
+
+TEST_CASE("a box that grows in place is not trailed back to an edge", "[schedule]") {
+  // Typing: the box keeps its left edge and grows right by 2 px per 10 ms, so
+  // its center moves right but it does not translate. Its first sighting at
+  // 1200 gets no trail to the left edge; the static and moved rects stay.
+  const auto box_at = [](std::int64_t t) {
+    return Rect{600.0F, 100.0F, static_cast<float>(100 + (t - 1100) / 5), 20.0F};
+  };
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 300ms;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const Rect b = box_at(spg::to_ns(t) / 1'000'000);
+                                    return std::vector<Detection>{face_at(b.x, b.y, b.width, b.height)};
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  for (std::int64_t t = 1100; t <= 1300; t += 10) {
+    const bool scan = t == 1200 || t == 1210 || t == 1300;
+    sim.push(t, scan);
+    if (scan) {
+      sim.scan_now();
+    }
+  }
+  const auto out = sim.release_at(1900);
+  REQUIRE(out.size() == 21);
+  for (const ReleasedFrame& r : out) {
+    const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+    INFO("frame " << t);
+    CHECK(r.action == FallbackAction::None);
+    CHECK(covered_by(r.plan, box_at(std::max<std::int64_t>(t, 1200))));
+    for (const spg::MaskRect& m : r.plan.rects) {
+      CHECK(m.box.rect.x > 500.0F);
+    }
+  }
+}
+
 TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {
   // A static box whose detections jitter 12 px left and right each cycle: the
   // track's velocity flips sign every 20 ms (an outlier-ridden estimate).
@@ -1550,6 +1640,17 @@ TEST_CASE("mask rect helpers round outward", "[schedule]") {
   const Rect m = spg::mask::moved(Rect{100, 50, 20, 10}, spg::Velocity{10.0F, -10.0F}, 0.025);
   CHECK(m == Rect{100, 49, 21, 11});
   CHECK(contains(m, Rect{100.25F, 49.75F, 20, 10}));
+  // trail_to_edge(): stretched back to the edge the box moves away from, along
+  // the faster axis; nothing it covered is lost.
+  const Rect b{100, 50, 20, 10};
+  CHECK(spg::mask::trail_to_edge(b, spg::Velocity{-300.0F, 40.0F}, k720) == Rect{100, 50, 1180, 10});
+  CHECK(spg::mask::trail_to_edge(b, spg::Velocity{300.0F, -40.0F}, k720) == Rect{0, 50, 120, 10});
+  CHECK(spg::mask::trail_to_edge(b, spg::Velocity{5.0F, -60.0F}, k720) == Rect{100, 50, 20, 670});
+  CHECK(spg::mask::trail_to_edge(b, spg::Velocity{-5.0F, 60.0F}, k720) == Rect{100, 0, 20, 60});
+  CHECK(spg::mask::trail_to_edge(b, spg::Velocity{}, k720) == b);
+  // A box already past the edge keeps its extent.
+  CHECK(spg::mask::trail_to_edge(Rect{1270, 50, 20, 10}, spg::Velocity{-300.0F, 0.0F}, k720) ==
+        Rect{1270, 50, 20, 10});
   // NaN edges cover rather than vanish.
   const Rect nan_rect = spg::mask::pixel_rect(std::nan(""), 0, 5, 5);
   CHECK(nan_rect.width > 1e6F);

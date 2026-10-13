@@ -206,6 +206,7 @@ class Lookahead {
     std::uint64_t size_epoch = 0;
     std::uint64_t segment = 0;
     bool covered = false;
+    bool scanned = false;  // a complete cycle ran on this frame itself
     bool bad_timestamp = false;
     bool apply_failed = false;
     std::vector<Rect> retro;
