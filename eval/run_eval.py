@@ -17,6 +17,11 @@
 The text and faces suites run in simulated time with a fixed cycle, so they
 are evidence about plan logic, not timing margin (docs/cli.md).
 
+`--workers N` passes the scan worker count to every `spg-cli eval` and
+`bench` call (simulated workers, or worker threads in the realtime suite).
+Without it spg-cli uses the scheduler's default, as the plugin runs. The
+value is printed on a `workers:` line and recorded in report.json.
+
 A missing or failing spg-cli is an error and prints `THRESHOLDS: FAIL`, in
 every mode: no run passes without the pipeline.
 
@@ -83,7 +88,16 @@ def _late_frames_line(bench: dict) -> str:
             f"(no limit in thresholds.toml yet, #68)")
 
 
-def run_pipeline(build_dir: Path, suite_dir: Path, plans_dir: Path, cache: Path) -> dict:
+def _workers_args(workers: int | None) -> list[str]:
+    return [] if workers is None else ["--workers", str(workers)]
+
+
+def _workers_line(workers: int | None) -> str:
+    return f"workers: {workers if workers is not None else 'spg-cli default (the scheduler default)'}"
+
+
+def run_pipeline(build_dir: Path, suite_dir: Path, plans_dir: Path, cache: Path,
+                 workers: int | None = None) -> dict:
     """Run spg-cli on every sequence in suite_dir, writing <plans_dir>/<seq>/mask_plans.jsonl.
 
     `spg-cli eval` reads the suite's frames, policy.json and fps from
@@ -93,12 +107,12 @@ def run_pipeline(build_dir: Path, suite_dir: Path, plans_dir: Path, cache: Path)
     """
     timing = plans_dir / "timing.json"
     _run([str(find_cli(build_dir)), "eval", "--suite", str(suite_dir), "--plans", str(plans_dir),
-          "--timing", str(timing), "--cache", str(cache)])
+          "--timing", str(timing), "--cache", str(cache), *_workers_args(workers)])
     return json.loads(timing.read_text(encoding="utf-8"))
 
 
 def run_realtime(build_dir: Path, source_dir: Path, plans_dir: Path, spec: dict,
-                 cache: Path) -> tuple[scoring.SuiteRun, dict]:
+                 cache: Path, workers: int | None = None) -> tuple[scoring.SuiteRun, dict]:
     """Replay source_dir's sequences at spec's resolution and fps on the wall clock, with the models from `cache`.
 
     A frame the replay could not feed on time keeps its due timestamp in
@@ -115,7 +129,7 @@ def run_realtime(build_dir: Path, source_dir: Path, plans_dir: Path, spec: dict,
                                  f"{index.get('fps')} fps")
     report_path = plans_dir / "bench.json"
     command = [str(find_cli(build_dir)), "bench", "--realtime", "--suite", str(source_dir), "--plans", str(plans_dir),
-               "--report", str(report_path), "--cache", str(cache)]
+               "--report", str(report_path), "--cache", str(cache), *_workers_args(workers)]
     if "resolution" in spec:
         command += ["--resolution", str(spec["resolution"])]
     _run(command)
@@ -159,9 +173,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--out", type=Path, default=Path("eval-out"))
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--cache", type=Path, default=default_cache())
+    parser.add_argument("--workers", type=int, default=None,
+                        help="scan workers for every spg-cli call (default: spg-cli's, as the plugin runs)")
     args = parser.parse_args(argv)
+    if args.workers is not None and args.workers < 1:
+        parser.error("--workers must be at least 1")
 
-    lines: list[str] = []
+    lines: list[str] = [_workers_line(args.workers)]
     try:
         thresholds = scoring.load_thresholds(args.thresholds)
         suite_dirs = {}
@@ -178,7 +196,7 @@ def main(argv: list[str]) -> int:
             # Plans left by an earlier run must never be scored as this run's output.
             plans_dir = args.out / "plans" / name
             shutil.rmtree(plans_dir, ignore_errors=True)
-            timing = run_pipeline(args.build_dir, suite_dir, plans_dir, args.cache)
+            timing = run_pipeline(args.build_dir, suite_dir, plans_dir, args.cache, args.workers)
             lines.append(_timing_line(name, timing))
             runs[name] = suite.load_run(suite_dir, plans_dir)
         realtime = thresholds["suite"].get("realtime")
@@ -186,7 +204,7 @@ def main(argv: list[str]) -> int:
             plans_dir = args.out / "plans" / "realtime"
             shutil.rmtree(plans_dir, ignore_errors=True)
             runs["realtime"], bench = run_realtime(args.build_dir, suite_dirs[REALTIME_SOURCE], plans_dir, realtime,
-                                                   args.cache)
+                                                   args.cache, args.workers)
             lines.append(_timing_line("realtime", bench))
             lines.append(_late_frames_line(bench))
         print("\n".join(line for line in lines if line.startswith(("pipeline:", "unscored:"))))
@@ -194,12 +212,13 @@ def main(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001 - any failure must end in a FAIL verdict
         print(f"run_eval: error: {exc}", file=sys.stderr)
         print("THRESHOLDS: FAIL")
-        scoring.write_report(args.out, [*lines, f"error: {exc}"], "THRESHOLDS: FAIL", {}, mode=args.mode)
+        scoring.write_report(args.out, [*lines, f"error: {exc}"], "THRESHOLDS: FAIL", {}, mode=args.mode,
+                             workers=args.workers)
         return 1
     print("\n".join(report.lines))
     print(report.verdict)
     scoring.write_report(args.out, [*lines, *report.lines], report.verdict, report.suites,
-                         mode=args.mode, seed=args.seed)
+                         mode=args.mode, seed=args.seed, workers=args.workers)
     return 0 if report.passed else 1
 
 

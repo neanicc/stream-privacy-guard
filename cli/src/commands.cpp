@@ -69,12 +69,13 @@ constexpr std::string_view kUsage =
     "  --cache DIR            models cache (default: $SPG_CACHE_DIR or ~/.cache/spg)\n"
     "  --cpu                  run the models on CPU only\n"
     "  --readback-scale S     scan a copy scaled by S in (0, 1] (default 1)\n"
-    "  --workers N            detection workers (default 2, as the plugin runs); scrub:\n"
+    "  --workers N            detection workers (default 1, as the plugin runs); scrub:\n"
     "                         frames scanned at once (default 2)\n"
     "  --cycle-ms MS          run/eval: simulated time per detection cycle (default 200)\n"
     "  --scan-interval-ms MS  frame time between scans a worker may take (default: the\n"
     "                         scheduler's, as the plugin runs)\n"
     "  --threads N            ONNX Runtime threads per model (default: its own choice)\n"
+    "  --recognizer-runs N    recognizer runs side by side per cycle, in [1, 16] (default 4)\n"
     "\n"
     "  --version  print the version and exit\n"
     "  --help     print this help and exit\n";
@@ -150,7 +151,8 @@ Size parse_resolution(const std::string& text) {
 }
 
 const std::set<std::string_view> kPipelineValued = {"--cache",    "--readback-scale",   "--workers",
-                                                    "--cycle-ms", "--scan-interval-ms", "--threads"};
+                                                    "--cycle-ms", "--scan-interval-ms", "--threads",
+                                                    "--recognizer-runs"};
 
 struct PipelineSetup {
   DriverOptions driver;
@@ -194,6 +196,12 @@ PipelineSetup pipeline_setup(const Options& o, bool simulated_fixed) {
   }
   if (const auto v = o.get("--threads")) {
     s.stages.intra_op_threads = static_cast<int>(std::min<std::uint32_t>(parse_count(*v, "--threads"), 256));
+  }
+  if (const auto v = o.get("--recognizer-runs")) {
+    s.stages.recognizer_runs = parse_count(*v, "--recognizer-runs");
+    if (s.stages.recognizer_runs > 16) {
+      throw UsageError("--recognizer-runs must be in [1, 16]");
+    }
   }
   return s;
 }
@@ -306,6 +314,7 @@ json report_json(std::string_view command, std::string_view mode, std::uint32_t 
            {"readback_scale", setup.driver.readback_scale},
            {"scan_interval_ms", to_ms(driver_config(PolicyConfig{}, setup.driver).scan_interval)},
            {"threads", setup.stages.intra_op_threads},
+           {"recognizer_runs", setup.stages.recognizer_runs},
            {"providers", providers},
            {"frames", totals.frames},
            {"padding_frames", totals.padding},

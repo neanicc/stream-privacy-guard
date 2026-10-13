@@ -94,7 +94,8 @@ class FakeCli:
 
 
 class DriverTests(unittest.TestCase):
-    def run_driver(self, mode: str, cli: FakeCli | None, find_cli=None) -> tuple[int, str, dict]:
+    def run_driver(self, mode: str, cli: FakeCli | None, find_cli=None,
+                   extra: tuple[str, ...] = ()) -> tuple[int, str, dict]:
         driver = load_driver()
         driver.generate_suite = fake_generate_suite
         if cli is not None:
@@ -107,7 +108,8 @@ class DriverTests(unittest.TestCase):
             stdout, stderr = io.StringIO(), io.StringIO()
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 code = driver.main(["--mode", mode, "--build-dir", str(Path(tmp) / "build"), "--out", str(out),
-                                    "--thresholds", str(THRESHOLDS), "--cache", str(Path(tmp) / "cache")])
+                                    "--thresholds", str(THRESHOLDS), "--cache", str(Path(tmp) / "cache"),
+                                    *extra])
             report = json.loads((out / "report.json").read_text())
             return code, stdout.getvalue(), report
 
@@ -167,6 +169,32 @@ class DriverTests(unittest.TestCase):
             with self.subTest(command[1]):
                 self.assertIn("--cache", command)
                 self.assertEqual(Path(command[command.index("--cache") + 1]).name, "cache")
+
+    def test_workers_reach_every_cli_call_and_the_report(self) -> None:
+        cli = FakeCli("oracle")
+        code, stdout, report = self.run_driver("local", cli, extra=("--workers", "3"))
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual([c[1] for c in cli.commands], ["eval", "eval", "bench"])
+        for command in cli.commands:
+            with self.subTest(command[1]):
+                self.assertEqual(command[command.index("--workers") + 1], "3")
+        self.assertIn("workers: 3", stdout.splitlines())
+        self.assertEqual(report["workers"], 3)
+
+    def test_without_workers_spg_cli_keeps_its_default(self) -> None:
+        cli = FakeCli("oracle")
+        _, stdout, report = self.run_driver("local", cli)
+        for command in cli.commands:
+            with self.subTest(command[1]):
+                self.assertNotIn("--workers", command)
+        self.assertIn("workers: spg-cli default (the scheduler default)", stdout.splitlines())
+        self.assertIsNone(report["workers"])
+
+    def test_workers_below_one_is_a_usage_error(self) -> None:
+        driver = load_driver()
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            driver.main(["--workers", "0"])
+        self.assertEqual(raised.exception.code, 2)
 
     def test_realtime_line_reports_late_frames(self) -> None:
         cli = FakeCli("oracle", late_frames=3)

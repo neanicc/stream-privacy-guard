@@ -307,7 +307,7 @@ Offline, `spg-cli` (SPG-11) drives `Lookahead` directly: push, take a job,
 | Setting | Default | Source |
 | --- | --- | --- |
 | `lookahead`, `retro`, `hold`, margin, fallback, mask style, `scan.categories` | from `PolicyConfig` | plan section 4 |
-| `workers` | 2 | SPG-10 starting point; SPG-16 measured 1 against 2 (one worker misses far fewer frames, but the tracker then loses the velocities it gets from the two workers' paired cycles; agent-log SPG-16). Since SPG-16b and SPG-16d one worker matches two on the simulated suites' recall and leak metrics; switching is #85 |
+| `workers` | 1 | SPG-16c (agent-log): on the dev Mac one worker cut the realtime fail-closed rate from 0.14 to 0.018 (median; limit 0.01, still missed) and p95 from about 420 to 270 ms (limit 400 ms, met), and since SPG-16b (motion gate) and SPG-16d (first-sighting spread) it matches two on the simulated suites' recall and leak metrics. Two take frames 16 ms apart and finish together, so the second adds little coverage while both share the GPU and CPU. The cost is decoy blur near new text (the spread; #75) |
 | `queue_capacity` | 1 (the newest frame) | plan section 4 ("workers process the newest readback frame") |
 | `scan_interval` | 0 (offer every frame) | SPG-10 starting point; SPG-16 tried 120 and 150 ms with two workers: staggering them cut fail-closed frames a little (single runs) but far less than one worker did, and it gives up the paired cycles the tracker's velocities come from |
 | `max_buffered_frames` | 600 (5 s at 120 fps) | `kMaxLookahead` |
