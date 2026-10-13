@@ -18,8 +18,13 @@ tracker, scheduler) on PNG frame sequences, with no OBS. SPG-18 adds
 Pipeline options: `--cache DIR` (models; default `$SPG_CACHE_DIR`, else
 `~/.cache/spg`), `--cpu` (CPU execution provider only; default is the
 platform order with CPU fallback, CoreML on macOS), `--readback-scale S`
-(default 1; not `scrub`), `--workers N` (default 2; for `scrub` the frames
-scanned at once), `--cycle-ms MS` (`run` and `eval` only, default 200). Exit
+(default 1; not `scrub`), `--workers N` (default 2, the scheduler's, as the
+plugin runs; for `scrub` the frames scanned at once), `--cycle-ms MS` (`run`
+and `eval` only, default 200), `--scan-interval-ms MS` (the scheduler's
+`scan_interval`; default its own, 0) and `--threads N` (ONNX Runtime
+intra-op threads per model; default its own choice). The last two exist to
+measure scheduling and threading choices with `bench` (SPG-16); the
+defaults are what the plugin runs. Exit
 codes: 0 done (for `scrub`: no leak), 1 failed (a missing model, an
 unreadable frame, a suite whose frame count or frame size disagrees with
 `suite.json`, a policy file outside the limits in

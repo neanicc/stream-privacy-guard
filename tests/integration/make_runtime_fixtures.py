@@ -3,6 +3,8 @@
 
     scale_static.onnx   y = 2 * x, x: float32 [2, 3]
     scale_dynamic.onnx  y = 2 * x, x: float32 [batch, 4]
+    scale_square.onnx   y = 2 * x, x: float32 [n, n] (one name, two dimensions)
+    scale_unnamed.onnx  y = 2 * x, x: float32 [?, 4] with the ? unnamed
     not_a_model.onnx    bytes that are not an ONNX model
     text_wrong_shape.onnx  DBNet-shaped (x [1, 3, h, w], y [1, 1, oh, ow]) but
                         y is SpaceToDepth(2) of the channel mean: [1, 4, h/2, w/2],
@@ -63,18 +65,21 @@ def field_bytes(number: int, payload: bytes | str) -> bytes:
     return varint((number << 3) | 2) + varint(len(data)) + data
 
 
-def value_info(name: str, dims: list[int | str]) -> bytes:
+def value_info(name: str, dims: list[int | str | None]) -> bytes:
     shape = b""
     for dim in dims:
-        # Dimension: dim_value = 1, dim_param = 2
-        entry = field_varint(1, dim) if isinstance(dim, int) else field_bytes(2, dim)
+        # Dimension: dim_value = 1, dim_param = 2; neither (None) is an unnamed dynamic dimension
+        if dim is None:
+            entry = b""
+        else:
+            entry = field_varint(1, dim) if isinstance(dim, int) else field_bytes(2, dim)
         shape += field_bytes(1, entry)
     tensor_type = field_varint(1, FLOAT) + field_bytes(2, shape)  # elem_type, shape
     type_proto = field_bytes(1, tensor_type)  # TypeProto.tensor_type
     return field_bytes(1, name) + field_bytes(2, type_proto)  # ValueInfoProto
 
 
-def scale_model(dims: list[int | str], metadata: dict[str, str]) -> bytes:
+def scale_model(dims: list[int | str | None], metadata: dict[str, str]) -> bytes:
     # TensorProto: data_type = 2, name = 8, raw_data = 9 (scalar, no dims)
     two = field_varint(2, FLOAT) + field_bytes(8, "two") + field_bytes(9, struct.pack("<f", 2.0))
     # NodeProto: input = 1, output = 2, name = 3, op_type = 4
@@ -178,6 +183,8 @@ def main(argv: list[str]) -> int:
     meta = {"spg_fixture": "scale-by-two"}
     (args.out / "scale_static.onnx").write_bytes(scale_model([2, 3], meta))
     (args.out / "scale_dynamic.onnx").write_bytes(scale_model(["batch", 4], meta))
+    (args.out / "scale_square.onnx").write_bytes(scale_model(["n", "n"], meta))
+    (args.out / "scale_unnamed.onnx").write_bytes(scale_model([None, 4], meta))
     (args.out / "not_a_model.onnx").write_bytes(b"this is not an ONNX model\n")
     # Channel mean (keepdims), then SpaceToDepth: the right number of values in
     # the wrong shape, so only the shape check can reject it.

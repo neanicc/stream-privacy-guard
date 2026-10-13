@@ -52,6 +52,15 @@ SessionOptions cpu_only() {
   return options;
 }
 
+// 640 x 640 tiles, for cases about what happens at tile edges: the default
+// tile holds a whole 1080p readback, so it has none there.
+TextDetectorConfig square_tiles() {
+  TextDetectorConfig config;
+  config.tile_width = 640;
+  config.tile_height = 640;
+  return config;
+}
+
 // One detector per provider choice for the whole run; opening costs a warmup.
 const TextDetector& detector(bool accelerated = false) {
   static const TextDetector cpu = TextDetector::open(shared_env(), ppocr_det_path(), {}, cpu_only());
@@ -126,7 +135,7 @@ const std::vector<std::string> kLines{"SPG SYNTHETIC LINE 0123", "hello stream 4
 
 TEST_CASE("TextDetector rejects a bad config before opening anything", "[text][detector]") {
   TextDetectorConfig config;
-  config.tile_size = 650;
+  config.tile_width = 650;
   CHECK_THROWS_AS(TextDetector::open(shared_env(), "does-not-exist.onnx", config), TextDetectorError);
   config = {};
   config.db.box_threshold = -0.1F;
@@ -148,8 +157,25 @@ TEST_CASE("TextDetector reports a missing model and refuses a model that is not 
 
 // Fixture models whose output dims are symbolic pass the open-time check, so
 // only detect() can catch what they return. Neither needs the pinned model.
+// The session keeps its dynamic input: TextDetector::open() fixes it to the
+// tile, after which ONNX Runtime infers the output shape and open() itself
+// rejects a wrong one (checked below), so detect()'s own check is reached
+// only through a session opened like this.
 TextDetector fixture_detector(const char* file) {
-  return TextDetector::open(shared_env(), fs::path(SPG_RUNTIME_FIXTURES) / file, {}, cpu_only());
+  SessionOptions options = cpu_only();
+  options.warmup_shapes = {{1, 3, 640, 640}};
+  return TextDetector(spg::runtime::Session::open(shared_env(), fs::path(SPG_RUNTIME_FIXTURES) / file, options),
+                      square_tiles());
+}
+
+TEST_CASE("TextDetector::open rejects a model whose fixed output has the wrong shape", "[text][detector]") {
+  CHECK_THROWS_AS(TextDetector::open(shared_env(), fs::path(SPG_RUNTIME_FIXTURES) / "text_wrong_shape.onnx",
+                                     square_tiles(), cpu_only()),
+                  TextDetectorError);
+  // The well-shaped fixture opens, with its input fixed to the tile.
+  const TextDetector sqrt_model = TextDetector::open(
+      shared_env(), fs::path(SPG_RUNTIME_FIXTURES) / "text_sqrt.onnx", square_tiles(), cpu_only());
+  CHECK(sqrt_model.session().inputs()[0].shape == std::vector<std::int64_t>{1, 3, 640, 640});
 }
 
 TEST_CASE("TextDetector fails the frame when the model returns the wrong shape", "[text][detector]") {
@@ -178,8 +204,15 @@ TEST_CASE("TextDetector fails the frame on a non-finite output, even after a goo
 TEST_CASE("TextDetector opens the pinned PP-OCR detector", "[text][detector][model]") {
   SPG_REQUIRE_PPOCR_DET();
   CHECK(detector().session().provider() == Provider::Cpu);
-  CHECK(detector().config().tile_size == 640);
-  CHECK_NOTHROW(detector(true));
+  CHECK(detector().config().tile_width == 1920);
+  CHECK(detector().config().tile_height == 1088);
+  // The input is fixed to the one tile shape, so an accelerator that needs
+  // static shapes (Core ML) can take the graph.
+  CHECK(detector().session().inputs()[0].shape == std::vector<std::int64_t>{1, 3, 1088, 1920});
+  CHECK(detector(true).session().inputs()[0].shape == std::vector<std::int64_t>{1, 3, 1088, 1920});
+#if defined(__APPLE__)
+  CHECK(detector(true).session().provider() == Provider::CoreMl);
+#endif
 }
 
 TEST_CASE("TextDetector rejects invalid frames and sources", "[text][detector][model]") {
@@ -301,9 +334,58 @@ TEST_CASE("TextDetector covers small lines at readback scale", "[text][detector]
   }
 }
 
+TEST_CASE("TextDetector tiles a readback larger than its default tile", "[text][detector][model]") {
+  SPG_REQUIRE_PPOCR_DET();
+  // A 4K readback (spg-cli only; the plugin reads back at most 1080p) is
+  // larger than the default 1920 x 1088 tile in both directions: nine tiles
+  // at scale 1. Lines near every far edge and one across all three tile
+  // columns must each come back as Source boxes that cover them.
+  const Scene scene{{3840, 2160}, {3840, 2160}, spg::PixelFormat::BGRA};
+  const TextDetectorConfig& config = detector().config();
+  const auto crops = spg::detect::tile_crops(scene.readback, Size{config.tile_width, config.tile_height},
+                                             config.tile_overlap);
+  REQUIRE(crops.size() == 9);
+  Canvas canvas(3840, 2160, {245, 245, 245});
+  const Bgr ink{20, 20, 20};
+  std::vector<Rect> truth;
+  const auto line = [&](const std::string& text, int x, int baseline, double height) {
+    const Rect box = spg::test::draw_text(canvas, text, x, baseline, height, ink);
+    REQUIRE(static_cast<double>(box.x) + box.width < 3839.0);
+    truth.push_back(to_source(box, scene));
+    return box;
+  };
+  (void)line("SPG SYNTHETIC LINE 0123", 40, 60, 20.0);           // top-left tile
+  (void)line("hello stream 42", 3400, 1100, 18.0);               // right column, across the first row seam
+  (void)line("QUICK BROWN FOX", 1700, 1640, 22.0);               // middle, across the second row seam
+  (void)line("TEST 555-0100", 3500, 2140, 16.0);                 // bottom-right corner
+  const Rect wide = line("lorem ipsum dolor sit amet SPG SYNTHETIC TILE SEAM LINE 0123456789 QUICK BROWN FOX "
+                         "lorem ipsum dolor sit amet",
+                         200, 760, 32.0);
+  // In no single tile: it starts before the second column and ends past the
+  // end of the second column.
+  REQUIRE(wide.x < 960.0F);
+  REQUIRE(static_cast<double>(wide.x) + wide.width > 2880.0);
+  const auto frame = spg::test::to_frame(canvas, scene.format);
+  const auto found = detector().detect(frame.view, scene.source);
+  INFO(found.size() << " boxes:" << boxes_text(found));
+  for (const spg::Detection& d : found) {
+    CHECK(d.box.space == spg::Space::Source);
+    CHECK(std::any_of(truth.begin(), truth.end(), [&](const Rect& t) { return overlaps(d.box.rect, t); }));
+  }
+  for (std::size_t i = 0; i < truth.size(); ++i) {
+    INFO("line " << i << " at " << truth[i].x << "," << truth[i].y << " size " << truth[i].width << "x"
+                 << truth[i].height);
+    CHECK(std::any_of(found.begin(), found.end(),
+                      [&](const spg::Detection& d) { return covers(d.box.rect, truth[i], kSlack); }));
+  }
+}
+
 TEST_CASE("TextDetector merges a line that crosses a tile edge", "[text][detector][model]") {
   SPG_REQUIRE_PPOCR_DET();
-  // 1600 px wide readback: tiles start at x = 0, 480 and 960 (overlap 160).
+  // 1600 px wide readback in 640 x 640 tiles: they start at x = 0, 480 and
+  // 960 (overlap 160).
+  static const TextDetector tiled = TextDetector::open(shared_env(), ppocr_det_path(), square_tiles(), cpu_only());
+  REQUIRE(spg::detect::tile_crops({1600, 400}, 640, 64).size() == 3);
   const Scene scene{{1600, 400}, {1600, 400}, spg::PixelFormat::BGRA};
   Canvas canvas(1600, 400, {30, 30, 30});
   const Rect line = spg::test::draw_text(canvas, "SPG SYNTHETIC TILE EDGE CROSSING LINE 0123456789", 40, 200, 30.0,
@@ -311,7 +393,7 @@ TEST_CASE("TextDetector merges a line that crosses a tile edge", "[text][detecto
   REQUIRE(line.x < 480.0F);
   REQUIRE(static_cast<double>(line.x) + line.width > 1120.0);  // past the first two tiles
   const auto frame = spg::test::to_frame(canvas, scene.format);
-  const auto found = detector().detect(frame.view, scene.source);
+  const auto found = tiled.detect(frame.view, scene.source);
   INFO(found.size() << " boxes:" << boxes_text(found));
   REQUIRE(!found.empty());
   CHECK(std::any_of(found.begin(), found.end(),

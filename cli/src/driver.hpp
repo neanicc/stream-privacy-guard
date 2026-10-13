@@ -47,9 +47,11 @@ struct DriverOptions {
   // Readback size as a fraction of the source, in (0, 1].
   double readback_scale = 1.0;
   // Worker threads (realtime) or simulated workers (simulated).
-  std::size_t workers = 2;
+  std::size_t workers = SchedulerConfig{}.workers;
   // Simulated cycle length; unset means the measured time of each cycle.
   std::optional<Duration> cycle = std::chrono::milliseconds{200};
+  // SchedulerConfig::scan_interval; unset keeps the scheduler's default.
+  std::optional<Duration> scan_interval;
   // Run the CPU compositor on every released frame (simulated mode only),
   // timing it as kStageCompose, and hand each composed real frame to
   // `on_composed` when set.
@@ -58,8 +60,9 @@ struct DriverOptions {
   CompositorConfig compositor;
 };
 
-// SchedulerConfig::from_policy(policy) with the driver's worker count and the
-// mask limits taken from the compositor's rect capacity (kMaskRectCapacity).
+// SchedulerConfig::from_policy(policy) with the driver's worker count and scan
+// interval and the mask limits taken from the compositor's rect capacity
+// (kMaskRectCapacity).
 [[nodiscard]] SchedulerConfig driver_config(const PolicyConfig& policy, const DriverOptions& options);
 
 struct SequenceResult {

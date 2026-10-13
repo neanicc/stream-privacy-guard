@@ -6,6 +6,7 @@
 #include <numeric>
 #include <utility>
 
+#include "ocr/run_batches.hpp"
 #include "spg/error.hpp"
 #include "spg/secure_memory.hpp"
 
@@ -17,6 +18,7 @@ constexpr std::uint32_t kMaxInputHeight = 1024;
 constexpr std::uint32_t kMaxStride = 64;
 constexpr std::uint32_t kMaxWidth = 1U << 14;
 constexpr std::size_t kMaxBatch = 64;
+constexpr std::size_t kMaxParallelRuns = 16;
 
 std::string shape_text(std::span<const std::int64_t> shape) {
   std::string text = "[";
@@ -134,6 +136,9 @@ void validate(const TextRecognizerConfig& config) {
   if (config.max_batch < 1 || config.max_batch > kMaxBatch) {
     throw TextRecognizerError("text recognizer: max_batch must be in [1, 64]");
   }
+  if (config.parallel_runs < 1 || config.parallel_runs > kMaxParallelRuns) {
+    throw TextRecognizerError("text recognizer: parallel_runs must be in [1, 16]");
+  }
   try {
     validate(config.lines);
   } catch (const std::invalid_argument& error) {
@@ -247,7 +252,9 @@ std::vector<Recognition> TextRecognizer::recognize(const FrameView& frame, Size 
   std::vector<SecureText> texts(jobs.size());
   std::vector<CtcStats> stats(jobs.size());
   const std::size_t classes = alphabet_.size();
-  for (std::size_t first = 0; first < order.size(); first += config_.max_batch) {
+  // One model run: the batch of jobs order[first, first + count). Batches
+  // write disjoint entries of texts and stats, so they can run at once.
+  const auto run_batch = [&](std::size_t first) {
     const std::size_t count = std::min(config_.max_batch, order.size() - first);
     std::vector<detect::BgrImage> images;
     images.reserve(count);
@@ -279,7 +286,11 @@ std::vector<Recognition> TextRecognizer::recognize(const FrameView& frame, Size 
       const std::size_t j = order[first + k];
       stats[j] = ctc_greedy_decode(all.subspan(k * steps * classes, steps * classes), steps, alphabet_, texts[j]);
     }
-  }
+  };
+  // Widest batches first, so the lanes finish close together.
+  const std::size_t batches = (order.size() + config_.max_batch - 1) / config_.max_batch;
+  run_batches(batches, config_.parallel_runs,
+              [&](std::size_t b) { run_batch((batches - 1 - b) * config_.max_batch); });
 
   // Join each region's texts: chunks of one view by ' ', views by '\n'.
   std::vector<SecureText> joined(regions.size());
