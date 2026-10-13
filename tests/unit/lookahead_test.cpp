@@ -936,13 +936,131 @@ TEST_CASE("a new box at rest is spread only before its first sighting, within th
   // The line and its margin: 20 + 2 * 9 px.
   CHECK(taller_than(frames, 40.0F, 1110, 1800).empty());
   CHECK(taller_than(frames, 40.0F, 1010, 1110).size() == 10);
+  // The reach is in sizes of the largest box the gate pairs with the line
+  // (motion_size_ratio = 2: 400 x 40), around that box with its margin.
   const double reach = 20.0 * 0.19;  // motion_gate_per_s * (1200 - 1010) ms
-  const Rect bound = spg::mask::spread(spg::mask::grow_by_margin(line, 4.0F, 0.25F), reach * 200.0, reach * 20.0);
+  const Rect largest = spg::mask::grow_by_margin(spg::mask::spread(line, 100.0, 10.0), 4.0F, 0.25F);
+  const Rect bound = spg::mask::spread(largest, reach * 400.0, reach * 40.0);
   for (const ReleasedFrame& r : frames) {
     for (const spg::MaskRect& m : r.plan.rects) {
       CHECK(spg::mask::contains(bound, m.box.rect));
     }
   }
+}
+
+TEST_CASE("the spread before a first sighting reaches a box that shrank as it moved", "[schedule]") {
+  // A face fades in at 1020, 80 px across, and shrinks to 40 px by its first
+  // sighting on 1200 while it moves right at 900 px/s (then 500 px/s). The
+  // gate would pair the 80 px box with the 40 px one (motion_size_ratio 2)
+  // and measures the gap in the larger box's sizes, so the spread does too:
+  // on 1050 the face is 135 px left of the 1200 box and 73 px across, past a
+  // spread of three 40 px sizes around the 40 px box.
+  const auto box_at = [](std::int64_t t) {
+    if (t < 1020) {
+      return Rect{};
+    }
+    const auto before = static_cast<float>(std::min<std::int64_t>(t, 1200) - 1020);
+    const auto after = static_cast<float>(std::max<std::int64_t>(t, 1200) - 1200);
+    const float cx = 400.0F + 0.9F * before + 0.5F * after;
+    const float w = 80.0F - 40.0F * before / 180.0F;
+    return Rect{cx - w / 2.0F, 400.0F - w / 2.0F, w, w};
+  };
+  const std::function<Rect(std::int64_t)> face = box_at;
+  SchedulerConfig config = one_worker_config();
+  CHECK(uncovered(one_worker(config, face, 1000, 1800), face).empty());
+
+  // With the reach in the 1200 box's own sizes (as with motion_size_ratio 1,
+  // where the gate pairs equal sizes only) the frames it shrank on leak.
+  config.tracker.motion_size_ratio = 1.0F;
+  const std::vector<std::int64_t> leaked = uncovered(one_worker(config, face, 1000, 1800), face);
+  CHECK(std::find(leaked.begin(), leaked.end(), 1050) != leaked.end());
+}
+
+TEST_CASE("a job queued on a later frame bounds the spread before a first sighting", "[schedule]") {
+  // One worker on 200 ms cycles, every frame offered at a 100 ms cadence.
+  // The line above appears at 1150; the 1200 cycle is its first sighting and
+  // lands at 1400, when a later frame is already queued. The worker takes it
+  // then, and its result lands at 1600, not a cadence later: only the frames
+  // due by 1600 (1010 .. 1100) are spread. The 1100 offer was replaced by
+  // 1200 before a worker was free, so 1000 is the last scan.
+  const Rect line{500.0F, 300.0F, 200.0F, 20.0F};
+  const auto box_at = [&](std::int64_t t) { return t < 1150 ? Rect{} : line; };
+  SchedulerConfig config = one_worker_config();
+  config.workers = 1;
+  config.scan_interval = 100ms;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const Rect b = box_at(spg::to_ns(t) / 1'000'000);
+                                    std::vector<Detection> out;
+                                    if (b.width > 0.0F) {
+                                      out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                    }
+                                    return out;
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  std::optional<std::pair<spg::ScanJob, spg::ScanResult>> busy;
+  std::int64_t done = 0;
+  std::vector<ReleasedFrame> frames;
+  for (std::int64_t t = 1000; t <= 2800; t += 10) {
+    sim.clock.set(at_ms(t));
+    if (busy.has_value() && done <= t) {
+      sim.la.complete(busy->first, busy->second);
+      busy.reset();
+    }
+    if (t <= 1800) {
+      sim.push(t, true);
+    }
+    if (!busy.has_value()) {
+      if (std::optional<spg::ScanJob> job = sim.la.take_job(); job.has_value()) {
+        busy.emplace(*job, spg::run_scan(sim.stages, *job, served(sim.la.config().scan, sim.stages)));
+        done = t + 200;
+      }
+    }
+    const std::vector<ReleasedFrame> out = sim.release_at(t);
+    frames.insert(frames.end(), out.begin(), out.end());
+  }
+  CHECK(uncovered(frames, std::function<Rect(std::int64_t)>(box_at)).empty());
+  CHECK(taller_than(frames, 40.0F, 1110, 1800).empty());
+  CHECK(taller_than(frames, 40.0F, 1010, 1110).size() == 10);
+}
+
+TEST_CASE("a first sighting on the first cycle that completes is spread", "[schedule]") {
+  // No cycle has completed before the 1200 one, which lands at 1400 and is
+  // the face's first sighting. Its own duration (recorded before it is
+  // applied) sets when the next result can land, 1600, so the frames due by
+  // then (1000 .. 1100) are spread rather than none.
+  const std::function<Rect(std::int64_t)> box_at = fast_face_at;
+  Sim sim(one_worker_config(), spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                                 const Rect b = box_at(spg::to_ns(t) / 1'000'000);
+                                                 std::vector<Detection> out;
+                                                 if (b.width > 0.0F) {
+                                                   out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                                 }
+                                                 return out;
+                                               }),
+                                               nullptr, nullptr, nullptr});
+  std::optional<std::pair<spg::ScanJob, spg::ScanResult>> busy;
+  std::int64_t done = 0;
+  std::vector<ReleasedFrame> frames;
+  for (std::int64_t t = 1000; t <= 2800; t += 10) {
+    sim.clock.set(at_ms(t));
+    if (busy.has_value() && done <= t) {
+      sim.la.complete(busy->first, busy->second);
+      busy.reset();
+    }
+    const bool scan = t >= 1200 && t <= 1800 && !busy.has_value();
+    if (t <= 1800) {
+      sim.push(t, scan);
+    }
+    if (scan) {
+      busy = sim.run();
+      done = t + 200;
+    }
+    const std::vector<ReleasedFrame> out = sim.release_at(t);
+    frames.insert(frames.end(), out.begin(), out.end());
+  }
+  CHECK(uncovered(frames, box_at).empty());
+  CHECK(taller_than(frames, 80.0F, 1000, 1110).size() == 11);
+  CHECK(taller_than(frames, 80.0F, 1110, 1200).empty());
 }
 
 TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {

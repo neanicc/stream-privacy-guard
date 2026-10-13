@@ -234,7 +234,8 @@ class Lookahead {
   [[nodiscard]] Duration longest_cycle() const noexcept;
   // When the next result that could see a box `job` found again can land at
   // the latest a recent cycle took: a cycle still running on a later frame
-  // (the earliest of them), else one that has not started yet.
+  // (the earliest of them), else a job queued on a later frame, which starts
+  // now, else one that has not been queued yet.
   [[nodiscard]] Timestamp next_result(const ScanJob& job) const noexcept;
   void apply(const ScanJob& job, const ScanResult& result);
   // A result that cannot be applied (complete, or partial with detections)

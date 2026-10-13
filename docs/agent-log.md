@@ -2462,3 +2462,19 @@ Template:
   builds on this Mac), so nothing here is a timing or realtime claim. Live
   OBS not tested. The plugin still defaults to two workers; #85 decides
   whether to switch.
+- Review fixes. (1) The spread now uses the gate's size rule: the gate
+  measures in the larger box's sizes and pairs boxes up to
+  `motion_size_ratio` (2) apart, so a face that shrank from 80 to 40 px while
+  moving could sit outside a spread of the 40 px box's sizes. The spread is
+  now the reach in sizes of a box `motion_size_ratio` times this one, around
+  that box with its margin (test: a shrinking, moving face; it leaks with
+  ratio 1). (2) With a job already queued on a later frame, the next result
+  is expected at now plus a cycle, not a further `scan_interval` later
+  (test with a 100 ms cadence). (3) The landing estimate's cycle history is
+  never empty when it is used: the cycle that returned the sighting is
+  recorded first (test: a first sighting on the first cycle that completes).
+  Same suites and seed, one worker: faces leak 0, CI text leak 0, local
+  first-frame recall 0.9623, local watch-list pair recall 0.9992, local text
+  leak 0.0036, clean-frame blur unchanged; decoy blur CI 0.4188 to 0.4255,
+  local 0.5226 to 0.5284 (the wider spread). Two workers: every mask plan in
+  all three suites is still byte-identical to main a474cde.
