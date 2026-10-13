@@ -1,5 +1,6 @@
-# spg-cli: drives spg-core on PNG sequences (SPG-11): run, eval and bench.
-# The commands live in spg-cli-lib so the tests can call them in process.
+# spg-cli: drives spg-core on PNG sequences: run, eval and bench (SPG-11) and
+# scrub (SPG-18). The commands live in spg-cli-lib so the tests can call them
+# in process.
 
 # stb_image (PNG decoding) and stb_image_write v2.30 / v1.16, MIT or public
 # domain, pinned by commit and the SHA-256 of each header. Downloaded once
@@ -46,6 +47,7 @@ add_library(spg-cli-lib STATIC
   src/driver.cpp
   src/image_io.cpp
   src/inputs.cpp
+  src/scrub.cpp
   src/stages.cpp
   src/timing.cpp)
 target_include_directories(spg-cli-lib PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")

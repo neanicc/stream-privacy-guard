@@ -22,6 +22,8 @@
 #include "driver.hpp"
 #include "image_io.hpp"
 #include "inputs.hpp"
+#include "scrub.hpp"
+#include "spg/category.hpp"
 #include "spg/error.hpp"
 #include "spg/json.hpp"
 #include "spg/version.hpp"
@@ -55,13 +57,19 @@ constexpr std::string_view kUsage =
     "            simulated feed (default): cycles take their measured time, the\n"
     "            CPU compositor runs on every frame; --realtime: worker threads\n"
     "            on the wall clock, fed at fps\n"
-    "  scrub   find planted strings still readable in a recording (SPG-18, not implemented)\n"
+    "  scrub   report the frames of a recorded session in which a planted string\n"
+    "          is still readable, and exit 3 when there is any\n"
+    "            --frames DIR --planted FILE [--fps N] [--report FILE]\n"
+    "            [--sensitivity normal|high]  fuzzy matching, as the plugin's\n"
+    "                                         setting (default high)\n"
+    "            FILE holds one planted string per line; output names them by\n"
+    "            number (#1 is the first) and never prints them\n"
     "\n"
     "pipeline options:\n"
     "  --cache DIR            models cache (default: $SPG_CACHE_DIR or ~/.cache/spg)\n"
     "  --cpu                  run the models on CPU only\n"
     "  --readback-scale S     scan a copy scaled by S in (0, 1] (default 1)\n"
-    "  --workers N            detection workers (default 2)\n"
+    "  --workers N            detection workers; scrub: frames scanned at once (default 2)\n"
     "  --cycle-ms MS          run/eval: simulated time per detection cycle (default 200)\n"
     "\n"
     "  --version  print the version and exit\n"
@@ -295,6 +303,17 @@ json report_json(std::string_view command, std::string_view mode, std::uint32_t 
   return doc;
 }
 
+void print_stages(std::ostream& out, const StageTimes& times) {
+  out << std::fixed << std::setprecision(1);
+  out << std::left << std::setw(14) << "stage" << std::right << std::setw(8) << "calls" << std::setw(10) << "mean ms"
+      << std::setw(10) << "p50 ms" << std::setw(10) << "p95 ms" << std::setw(10) << "max ms" << '\n';
+  for (const auto& [name, s] : times.summary()) {
+    out << std::left << std::setw(14) << name << std::right << std::setw(8) << s.count << std::setw(10) << s.mean_ms
+        << std::setw(10) << s.p50_ms << std::setw(10) << s.p95_ms << std::setw(10) << s.max_ms << '\n';
+  }
+  out.unsetf(std::ios::floatfield);
+}
+
 void print_summary(std::ostream& out, std::string_view command, std::string_view mode, const std::string& providers,
                    const Totals& totals, const StageTimes& times) {
   out << "spg-cli " << command << " (" << mode << "): " << totals.frames << " frames, " << totals.fail_closed
@@ -310,13 +329,8 @@ void print_summary(std::ostream& out, std::string_view command, std::string_view
   out << std::fixed << std::setprecision(1);
   out << "detection latency: " << lat.count << " cycles, p50 " << lat.p50_ms << " ms, p95 " << lat.p95_ms
       << " ms, max " << lat.max_ms << " ms\n";
-  out << std::left << std::setw(14) << "stage" << std::right << std::setw(8) << "calls" << std::setw(10) << "mean ms"
-      << std::setw(10) << "p50 ms" << std::setw(10) << "p95 ms" << std::setw(10) << "max ms" << '\n';
-  for (const auto& [name, s] : times.summary()) {
-    out << std::left << std::setw(14) << name << std::right << std::setw(8) << s.count << std::setw(10) << s.mean_ms
-        << std::setw(10) << s.p50_ms << std::setw(10) << s.p95_ms << std::setw(10) << s.max_ms << '\n';
-  }
   out.unsetf(std::ios::floatfield);
+  print_stages(out, times);
 }
 
 int cmd_run(std::span<const std::string_view> args, std::ostream& out, std::ostream& err, const CliHooks& hooks) {
@@ -449,6 +463,143 @@ int cmd_bench(std::span<const std::string_view> args, std::ostream& out, const C
   return kExitOk;
 }
 
+// Seconds from the first frame, as "12.345".
+std::string seconds_text(std::size_t frame, std::uint32_t fps) {
+  std::ostringstream text;
+  text << std::fixed << std::setprecision(3) << static_cast<double>(frame) / static_cast<double>(fps);
+  return text.str();
+}
+
+std::string planted_list(const std::vector<std::size_t>& planted) {
+  std::string text;
+  for (const std::size_t index : planted) {
+    text += (text.empty() ? "#" : ", #") + std::to_string(index);
+  }
+  return text;
+}
+
+json box_json(const Box& box) {
+  return json{{"x", box.rect.x}, {"y", box.rect.y}, {"width", box.rect.width}, {"height", box.rect.height}};
+}
+
+// Planted strings, recognized text and frames stay in memory: the output and
+// the report hold frame indices and file names, times, boxes and the 1-based
+// numbers of the planted strings.
+int cmd_scrub(std::span<const std::string_view> args, std::ostream& out, std::ostream& err, const CliHooks& hooks) {
+  const Options o(args, {"--frames", "--planted", "--fps", "--report", "--sensitivity", "--cache", "--workers"},
+                  {"--cpu"});
+  const fs::path frames_dir = o.need("--frames");
+  const fs::path planted_file = o.need("--planted");
+  FrameSequence seq;
+  seq.name = "scrub";
+  seq.fps = o.get("--fps") ? parse_count(*o.get("--fps"), "--fps") : 60;
+  ScrubSensitivity sensitivity = ScrubSensitivity::High;
+  if (const auto v = o.get("--sensitivity")) {
+    if (*v == "normal") {
+      sensitivity = ScrubSensitivity::Normal;
+    } else if (*v != "high") {
+      throw UsageError("--sensitivity must be normal or high");
+    }
+  }
+  PipelineSetup setup;
+  setup.cache = o.get("--cache") ? fs::path(*o.get("--cache")) : default_cache_dir();
+  setup.stages.cpu_only = o.flag("--cpu");
+  setup.stages.thorough = true;
+  if (const auto v = o.get("--workers")) {
+    setup.driver.workers = parse_count(*v, "--workers");
+  }
+
+  seq.frames = list_frames(frames_dir);
+  const std::vector<Secret> planted = read_planted(planted_file);
+  const FuzzyLimits fuzzy = scrub_fuzzy(sensitivity);
+  const PlantedMatcher matcher(planted, fuzzy);
+  PolicyConfig policy;
+  policy.categories = CategorySet{};
+  policy.categories.insert(Category::Watchlist);
+  policy.watchlist = planted;
+  policy.fuzzy = fuzzy;
+  const OpenedStages opened = open_for(hooks, policy, setup);
+  auto times = std::make_shared<StageTimes>();
+
+  ScrubOptions options;
+  options.workers = setup.driver.workers;
+  const std::size_t total = seq.frames.size();
+  options.progress = [&err, total](std::size_t done) {
+    if (done % 100 == 0 || done == total) {
+      err << "spg-cli scrub: " << done << "/" << total << " frames\n";
+    }
+  };
+  const ScrubResult result = scrub(png_source(seq, *times), timed(opened.stages, times), matcher, options, *times);
+
+  const std::string_view level = sensitivity == ScrubSensitivity::High ? "high" : "normal";
+  json leaks = json::array();
+  for (const ScrubLeak& leak : result.leaks) {
+    const std::string file = seq.frames.at(leak.frame).filename().string();
+    const Rect& r = leak.box.rect;
+    out << "leak: frame " << leak.frame << " (" << file << ", " << seconds_text(leak.frame, seq.fps)
+        << " s): planted " << planted_list(leak.planted) << " at x " << std::lround(r.x) << " y " << std::lround(r.y)
+        << ", " << std::lround(r.width) << "x" << std::lround(r.height) << '\n';
+    leaks.push_back(json{{"frame", leak.frame},
+                         {"file", file},
+                         {"time_ms", static_cast<double>(leak.frame) * 1000.0 / static_cast<double>(seq.fps)},
+                         {"box", box_json(leak.box)},
+                         {"score", leak.score},
+                         {"planted", leak.planted}});
+  }
+  const std::vector<std::size_t> leak_frames = result.leak_frames();
+  out << "spg-cli scrub: " << result.frames << " frames, " << result.regions << " text regions read, "
+      << planted.size() << " planted strings, sensitivity " << level << '\n';
+  if (!opened.providers.empty()) {
+    out << "providers: " << opened.providers << '\n';
+  }
+  json per_planted = json::array();
+  for (std::size_t index = 1; index <= planted.size(); ++index) {
+    const std::vector<std::size_t> frames = result.leak_frames_of(index);
+    out << "planted #" << index << ": ";
+    if (frames.empty()) {
+      out << "not readable in any frame\n";
+    } else {
+      out << "readable in " << frames.size() << (frames.size() == 1 ? " frame" : " frames") << ", first " << frames.front() << " ("
+          << seconds_text(frames.front(), seq.fps) << " s), last " << frames.back() << " ("
+          << seconds_text(frames.back(), seq.fps) << " s)\n";
+    }
+    per_planted.push_back(json{{"planted", index},
+                               {"leak_frames", frames.size()},
+                               {"first_frame", frames.empty() ? json(nullptr) : json(frames.front())},
+                               {"last_frame", frames.empty() ? json(nullptr) : json(frames.back())}});
+  }
+  print_stages(out, *times);
+  if (leak_frames.empty()) {
+    out << "PASS: no planted string is readable in any of the " << result.frames << " frames\n";
+  } else {
+    out << "LEAK: a planted string is readable in " << leak_frames.size() << " of " << result.frames
+        << " frames; look at each one\n";
+  }
+  if (const auto report = o.get("--report")) {
+    json stages = json::object();
+    for (const auto& [name, s] : times->summary()) {
+      stages[name] = summary_json(s);
+    }
+    write_json(*report, json{{"schema", 1},
+                             {"command", "scrub"},
+                             {"version", version()},
+                             {"result", leak_frames.empty() ? "pass" : "leak"},
+                             {"fps", seq.fps},
+                             {"frames", result.frames},
+                             {"text_regions", result.regions},
+                             {"planted_strings", planted.size()},
+                             {"sensitivity", level},
+                             {"workers", setup.driver.workers},
+                             {"providers", opened.providers},
+                             {"leak_frames", leak_frames.size()},
+                             {"leak_frame_indices", leak_frames},
+                             {"planted", per_planted},
+                             {"leaks", leaks},
+                             {"stages", stages}});
+  }
+  return leak_frames.empty() ? kExitOk : kExitLeak;
+}
+
 }  // namespace
 
 int run_cli(std::span<const std::string_view> args, std::ostream& out, std::ostream& err, const CliHooks& hooks) {
@@ -477,8 +628,7 @@ int run_cli(std::span<const std::string_view> args, std::ostream& out, std::ostr
       return cmd_bench(rest, out, hooks);
     }
     if (command == "scrub") {
-      err << "spg-cli: 'scrub' is not implemented yet (SPG-18)\n";
-      return kExitUsage;
+      return cmd_scrub(rest, out, err, hooks);
     }
     err << "spg-cli: unknown command '" << command << "'\n" << kUsage;
     return kExitUsage;
