@@ -5,6 +5,8 @@ out/
 _deps/
 cmake-build-*/
 compile_commands.json
+# Packages written by scripts/package.sh (CI uploads them; never committed)
+dist/
 *.o
 *.obj
 *.a
