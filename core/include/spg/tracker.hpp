@@ -70,7 +70,8 @@ struct TrackMotion {
   // tie), in the direction of the velocity: the box translated (it slid or
   // scrolled), not grew or shrank as text does while it fades in or is
   // typed, nor shifted by less than a mask pixel. False with no measurement
-  // yet.
+  // yet. A late detection older than all the track's others also counts its
+  // move to the latest box (results that finished out of order).
   bool translating = false;
 
   friend bool operator==(const TrackMotion&, const TrackMotion&) = default;
@@ -110,7 +111,8 @@ class Tracker {
   // Adds the detections found on the frame with timestamp `frame_time`. Each
   // joins the best-matching live track of its kind (greedy by IoU) or starts
   // a new track. Detections may arrive late or out of order; an older
-  // detection still holds but does not move its track. Validates every
+  // detection still holds but does not move its track (the earliest one can
+  // give a track its first velocity; see TrackMotion). Validates every
   // detection first and throws ContractError (changing nothing) when one is
   // invalid or not in Source space. Then drops expired detections.
   //

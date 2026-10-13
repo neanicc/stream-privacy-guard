@@ -277,10 +277,25 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
 
 void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) {
   Track& track = state.track;
+  const bool earliest = frame_time < state.first_seen;
   state.first_seen = std::min(state.first_seen, frame_time);
   if (frame_time <= track.last_confirmed) {
     // Late or same-frame detection: it holds, predicted at the track's
     // current velocity, but does not move the track.
+    if (earliest) {
+      // Older than every detection the track has taken (cycles that finish
+      // out of order): its move to the latest box is motion no measurement
+      // has seen. A track without a velocity takes it; either way the move
+      // can show a translation. Neither the box nor a measured velocity
+      // changes.
+      const double dt = seconds(track.last_confirmed - frame_time);
+      if (!state.has_velocity) {
+        track.velocity = Velocity{to_velocity((center_x(track.box.rect) - center_x(box)) / dt),
+                                  to_velocity((center_y(track.box.rect) - center_y(box)) / dt)};
+        state.has_velocity = true;
+      }
+      state.translating = state.translating || translated(box, track.box.rect, track.velocity);
+    }
     state.held.push_back(make_held(box, frame_time, track.velocity));
     return;
   }

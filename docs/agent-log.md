@@ -2060,6 +2060,15 @@ Template:
   (dev Mac under heavy load from other processes): fail-closed 1.000 on both
   builds in two interleaved pairs, p95 latency 1014/1059 ms main vs
   1046/1127 ms head, within run-to-run noise; SPG-16 owns it.
+- Review fix (Greptile): with two workers the paired cycles can finish out
+  of order. The newer result started the track with no motion and the older
+  one only moved `first_seen` back, so the next cycle, near rest, measured
+  0.4 px and never marked the track translating: no trail. A late detection
+  older than all of a track's others now counts its move to the latest box:
+  a track with no velocity takes it, and a translation the way the velocity
+  points sets `translating`. The track's box and a measured velocity do not
+  change. Eval is unchanged: the simulated suites use a fixed cycle, so
+  cycles finish in start order (CI-mode text metrics identical).
 - Open issues or follow-ups: misses (2) and (3) remain and are recorded as
   scoring artifacts; the metric passes by one instance (51/53 against 0.95).
   Whether the first-frame metric should use the revealed part of a typed

@@ -599,6 +599,58 @@ TEST_CASE("retroactive masks trail an ease-out slide-in back to the edge it ente
   }
 }
 
+TEST_CASE("an ease-out slide-in is trailed when its first cycles finish out of order", "[schedule]") {
+  // The slide-in above, first seen by cycles at 1250 and 1280 that finish in
+  // reverse order (two workers): the 1280 result starts the track with no
+  // motion, then the 1250 result shows a 5.6 px move left. The next cycle, at
+  // 1300, sees the box move only 0.4 px. The 1250 result still trails the
+  // frames before it back to the right edge.
+  const auto box_at = [](std::int64_t t) {
+    const double p = std::clamp(static_cast<double>(t - 1100) / 200.0, 0.0, 1.0);
+    const double eased = 1.0 - std::pow(1.0 - p, 3.0);
+    const double x = 1280.0 + (900.0 - 1280.0) * eased;
+    return Rect{static_cast<float>(x), 100.0F, static_cast<float>(std::min(200.0, 1280.0 - x)), 20.0F};
+  };
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 300ms;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const std::int64_t ms = spg::to_ns(t) / 1'000'000;
+                                    std::vector<Detection> out;
+                                    const Rect b = box_at(ms);
+                                    if (ms > 1100) {
+                                      out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                    }
+                                    return out;
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  std::optional<std::pair<spg::ScanJob, spg::ScanResult>> older;
+  for (std::int64_t t = 950; t <= 1300; t += 10) {
+    const bool scan = t == 1000 || t == 1250 || t == 1280 || t == 1300;
+    sim.push(t, scan);
+    if (t == 1250) {
+      older = sim.run();  // still in flight when 1280 finishes
+    } else if (t == 1280) {
+      auto [job, result] = sim.run();
+      sim.la.complete(job, result);
+      REQUIRE(older.has_value());
+      sim.la.complete(older->first, older->second);
+    } else if (scan) {
+      sim.scan_now();
+    }
+  }
+  const auto out = sim.release_at(1900);
+  REQUIRE(out.size() == 36);
+  for (const ReleasedFrame& r : out) {
+    const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+    INFO("frame " << t);
+    CHECK(r.action == FallbackAction::None);
+    if (t > 1100) {
+      CHECK(covered_by(r.plan, box_at(t)));
+    }
+  }
+}
+
 TEST_CASE("a box that grows in place is not trailed back to an edge", "[schedule]") {
   // Typing: the box keeps its left edge and grows right by 2 px per 10 ms, so
   // its center moves right but it does not translate. Its first sighting at

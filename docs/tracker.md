@@ -65,6 +65,11 @@ chained resizes) and a 60 s hold with 600 held detections.
   `velocity_smoothing`. Box size follows the latest detection.
 - A detection for a frame at or before the track's last confirmation (a late
   or second result for the same frame) is held but does not move the track.
+  When it is older than every detection the track has taken (cycles that
+  finished out of order), its move to the latest box still counts as motion:
+  a track with no velocity yet takes that velocity, and a move of both edges
+  the way the velocity points marks the track translating. The box and an
+  already measured velocity stay as they are.
 - An object that moves more than roughly half its size between detection
   cycles fails the IoU gate and starts a new track. Its detections are still
   held; only prediction is lost until the new track has a velocity.
