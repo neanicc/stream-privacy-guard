@@ -814,6 +814,59 @@ TEST_CASE("tracker: a missed cycle ends the run and keeps the full hold", "[trac
   CHECK_FALSE(holds(1200, 440.0F));
 }
 
+TEST_CASE("tracker: a static line keeps its hold while a same-size line scrolls past", "[tracker]") {
+  // A static 200 x 40 secret line at y = 500 and a decoy line of the same
+  // size scrolling up through it, 20 px per 200 ms cycle (100 px/s), from
+  // y = 600 to y = 400. Every box of the secret line stays covered, with the
+  // default margins, on every frame of its hold: when both are found every
+  // cycle, when the secret line is missed on a cycle the decoy overlaps it
+  // by half or exactly, or on all four cycles it overlaps it, and whichever
+  // track was created first (IoU ties go to the older track). The decoy's
+  // track gets confirmed moving and follows; the secret's own box always
+  // wins the association, so its track never moves.
+  const std::vector<std::vector<int>> misses{{}, {4}, {5}, {6}, {4, 5, 6, 7}};
+  for (const bool decoy_first : {false, true}) {
+    for (const std::vector<int>& missed : misses) {
+      INFO("decoy first " << decoy_first << ", secret missed on " << missed.size() << " cycles from "
+                          << (missed.empty() ? -1 : missed.front()));
+      ManualClock clock;
+      const TrackerConfig config;
+      Tracker tracker(clock, config);
+      const Detection secret = text(100.0F, 500.0F, 200.0F, 40.0F);
+      std::vector<std::int64_t> seen;  // frame times the secret was found on
+      for (int i = 0; i <= 10; ++i) {
+        const std::int64_t now = 200 * static_cast<std::int64_t>(i);
+        const Detection decoy = text(100.0F, 600.0F - 20.0F * static_cast<float>(i), 200.0F, 40.0F);
+        std::vector<Detection> found;
+        if (decoy_first) {
+          found.push_back(decoy);
+        }
+        if (std::find(missed.begin(), missed.end(), i) == missed.end()) {
+          found.push_back(secret);
+          seen.push_back(now);
+        }
+        if (!decoy_first) {
+          found.push_back(decoy);
+        }
+        clock.set(at_ms(now));
+        tracker.update(at_ms(now), found);
+        // The frames this cycle's result releases, and up to the hold past
+        // the last one.
+        const std::int64_t until = i == 10 ? now + 750 : now;
+        for (std::int64_t t = std::max<std::int64_t>(0, now - 175); t <= until; t += 25) {
+          for (const std::int64_t s : seen) {
+            if (t < s || t > s + 750) {
+              continue;
+            }
+            INFO("frame " << t << ", secret box from " << s);
+            CHECK(covered(tracker.masks(at_ms(t)), required(secret.box.rect, config)));
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST_CASE("tracker: a track that stops for longer than the hold ends its run", "[tracker]") {
   // A tall box is confirmed moving up 20 px per 200 ms, then stays put
   // (confirmations under follow_min_move are not measured) for longer than

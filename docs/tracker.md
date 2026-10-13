@@ -138,8 +138,10 @@ and a drift under the minimum move do not either, two workers' confirmations
 17 ms apart do not break a run, a restarted run follows only from where it
 restarted, a missed cycle keeps the full hold of every earlier box after the
 track is found again, a track that stood still for longer than the hold
-starts a new run, and late detections, boxes from before a resize and frames
-after the last confirmation keep their hold.
+starts a new run, a static line keeps its hold while a same-size line
+scrolls through it (even when it is missed while they overlap), and late
+detections, boxes from before a resize and frames after the last
+confirmation keep their hold.
 
 ## Association and motion
 

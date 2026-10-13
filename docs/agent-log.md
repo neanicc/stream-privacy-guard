@@ -2134,7 +2134,12 @@ Template:
   track cannot carry a stale run into a takeover. The following-on property
   test now derives misses and the confirmation count from what it delivered,
   not from tracker state; removing the confirmation guard or the miss reset
-  each makes it fail. AGENTS.md wording: #82 (`needs-human`).
+  each makes it fail. A unit case pins a static secret line with a
+  same-size decoy line scrolling through it, the secret missed on up to four
+  overlapping cycles: every secret box keeps its hold. It holds by
+  association (the secret's own box always wins its track), so it also
+  passes with the follow guards removed. AGENTS.md wording: #82
+  (`needs-human`).
 - Rejected with evidence: measuring each confirmation against the previous
   one. The eval's two workers confirm frames 17 ms apart, where a chat line
   moves under 2 px and the box jitters 1-2 px, so almost every pair broke the
