@@ -1564,7 +1564,102 @@ Template:
   rebuilds nothing. Building schedulers off the graphics thread is SPG-14d;
   the model hand-over adds no model work to that path.
 
-## 2026-10-12 — SPG-14d Build schedulers off the graphics thread (#62)
+## 2026-10-12 — SPG-17 Packaging and docs (#63)
+
+- Decision / change: `scripts/package.sh` (called by `scripts/ci/run.sh
+  package`) installs a new CMake component, `obs-spg`
+  (`cmake/SpgInstall.cmake`, included by the root `CMakeLists.txt` after
+  `plugin/`, so `plugin/CMakeLists.txt` is unchanged), into
+  `build/package-stage/`, adds `INSTALL.txt` for the OS, the GPL license,
+  `scripts/fetch_models.py` with `fetch_deps.py` and `models/manifest.json`
+  (so the fetch step works from the unpacked folder), runs
+  `build-aux/package_tool.py check` and writes
+  `dist/obs-spg-<version>-<os>.zip` (macOS, Windows) or `.tar.gz` (Linux) and
+  `SHA256SUMS.txt`. README gains Install, Usage, Limitations, Privacy and
+  Packaging sections; draft notes in `docs/release-notes/0.1.0.md` (no
+  release, tag or upload).
+- Decisions (no one to ask; smallest change, safety first):
+  (1) Layout is what OBS 32 loads per user: the macOS bundle for
+  `~/Library/Application Support/obs-studio/plugins/`, and
+  `obs-spg/bin/64bit` + `obs-spg/data` for `C:\ProgramData\obs-studio\plugins\`
+  and `~/.config/obs-studio/plugins/`. Archives, not a `.pkg` or an installer:
+  nothing to sign, and the same tree on every OS. (2) The macOS bundle
+  installs whole, so whatever the module build puts in it (ONNX Runtime in
+  `Contents/Frameworks` once SPG-14b lands) is packaged. On Windows and
+  Linux ONNX Runtime is installed beside the module under the name it is
+  loaded by (`onnxruntime.dll`, its SONAME) only when the module links it:
+  a configure-time walk of the module's link graph (static libraries'
+  `$<LINK_ONLY:>` included) decides, and prints `obs-spg package ships ONNX
+  Runtime: TRUE/FALSE`. On `main` today it is FALSE. (3) The check is the
+  package's test: every library the module imports must be shipped beside it
+  or be libobs or an allow-listed OS library, nothing shipped may be unused,
+  macOS rpaths must stay inside the bundle, the licenses and data must be
+  present, and no `.onnx` may be present without `--with-models`. Windows
+  imports are read from the PE file itself (no dumpbin needed). (4) macOS:
+  the installed bundle has a linker signature but no resource seal, so
+  `codesign --verify` rejects it; the script seals it with an ad-hoc
+  signature (as obs-plugintemplate does without an identity) after all files
+  are in place, and the check verifies it with `--strict --deep`. No
+  Developer ID signing or notarization exists; packages are documented as
+  unsigned. (5) No model weights by default (AGENTS.md); `--with-models`
+  (never in CI) copies the pinned models from `$SPG_CACHE_DIR` into
+  `data/models/<name>/<version>/<file>` after a size and SHA-256 check, with
+  their license texts. (6) License texts the prebuilt packages lack are
+  committed in `build-aux/package/licenses/` (OpenCV 4.9.0, YuNet, RapidOCR
+  3.9.2, fetched from their pinned tags); ONNX Runtime's LICENSE and
+  ThirdPartyNotices, OpenCV's bundled third-party licenses and nlohmann/json's
+  LICENSE.MIT are installed from the pinned inputs. A test keeps the notices'
+  versions in step with `deps/manifest.json` and `core/CMakeLists.txt`.
+- Evidence (automated, dev Mac, macOS 26.5.2 arm64): `scripts/ci/run.sh
+  setup`, `build`, `package`: `obs-spg-0.1.0-macos-arm64.zip` (20 files), the
+  check passes, the unzipped bundle passes `codesign --verify --strict
+  --deep`, and `python3 -I scripts/fetch_models.py --verify` run from the
+  unzipped folder finds the three cached models. `--with-models` writes a
+  9.7 MB package whose check passes. Against a local merge of PR #61 (not
+  pushed): configure prints `ships ONNX Runtime: TRUE`, the bundle has
+  `Contents/Frameworks/libonnxruntime.1.dylib`, the only rpath is
+  `@loader_path/../Frameworks` and the check passes; deleting the dylib from
+  the staged bundle fails it (missing import, broken seal). New ctest
+  `scripts.package_tool` (16 cases: PE import and delay-import parsing,
+  dependency rules per OS, layout and model checks, archive folder, modes
+  and owner scrubbing, checksums, notices in step with the pins). Windows and
+  Linux packages are built only by CI; see the PR's Validation section.
+- Eval delta: not affected (packaging and docs only).
+- Merged `main` after SPG-14b (#61) landed: configure now reports `ships
+  ONNX Runtime: TRUE`; the README status, limitations, INSTALL texts and
+  release notes say the plugin loads the models. The package contents per OS
+  from CI are listed in the PR's Validation section.
+- After that merge the Windows check failed: `obs-spg.dll` imports
+  `CONCRT140.dll`. Cause: the pinned static OpenCV (`opencv_core490.lib`) is
+  built with MSVC's Concurrency Runtime as its `parallel_for` backend
+  (`/DEFAULTLIB:"concrt"`, `Concurrency::structured_task_group`), and
+  SPG-14b links it into the module. Not removable without rebuilding
+  OpenCV: the static `libconcrt.lib` is `/MT` and cannot link into a `/MD`
+  module. Decision: `concrt140.dll` joins `msvcp140`/`vcruntime140` as part
+  of the Microsoft Visual C++ 2015-2022 Redistributable, which OBS 32
+  requires to start (`vc_runtime_outdated()` in `frontend/obs-main.cpp`
+  checks `msvcp140.dll` >= 14.40) and which installs all three in System32.
+  Shipping it beside the module instead would take a Microsoft binary out
+  of the GPL-2.0 system-library exception the other two rely on. The
+  requirement is now stated in INSTALL-windows.txt, the README and the
+  notices. Review follow-ups (Greptile): search paths are now resolved and
+  normalized (`$ORIGIN`, `@loader_path`) and must stay inside the plugin
+  folder or bundle and reach the shipped libraries' folder (`$ORIGIN/../lib`
+  and `@loader_path/../../../outside` fail); the libraries shipped beside the
+  module are read too, so a missing dependency of ONNX Runtime fails the
+  check, and a library loaded only by another shipped one counts as used.
+  Windows ONNX Runtime 1.30.0 imports `SETUPAPI.dll`, now allow-listed as
+  an OS DLL. Checked against the pinned ONNX Runtime binaries of all three
+  OSes: no problems. `scripts.package_tool` now has 25 cases, including ONNX
+  Runtime imported but not shipped (Linux and Windows fixtures, and a whole
+  `check()` on PE files), the guard against the install's link walk missing
+  it. CI on `bb191c5`: the package check passed on all three OSes with ONNX
+  Runtime beside the module.
+- Open issues or follow-ups: no live OBS install from a package has been
+  done; the live check should install from the CI artifact rather than the
+  build tree.
+
+## 2026-10-12 — SPG-14d Build schedulers off the graphics thread (#67)
 
 - Decision / change: OBS runs a filter's `update` and `video_tick` on the
   graphics thread, which also runs `video_render`, so neither may construct a
