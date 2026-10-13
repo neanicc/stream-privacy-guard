@@ -154,7 +154,8 @@ instead of holding the partial list.
 `MaskPlan.rects` for a frame at `t` is the union of:
 
 - `Tracker::masks(t)`: every detection seen in `[t - hold, t]`, with margin and
-  constant-velocity prediction ([tracker.md](tracker.md));
+  constant-velocity prediction, moved to where a confirmed moving track went
+  ([tracker.md](tracker.md#follow-spg-12b));
 - **retroactive rects**: each box of a cycle (complete, or partial) at `ts` in `(t, t + retro]`
   that finished while the frame was buffered, grown by the same margin and
   rounded outward to whole pixels. The tracker only covers frames at or after
@@ -214,6 +215,22 @@ at rest is not a first sighting. The gate's reach on a wide text line is
 several line widths, so this blurs neighbouring content on those few frames:
 SPG-16d measured it (agent-log). `motion_gate_per_s = 0` turns it off with the
 gate.
+
+None of these rects is added on a frame at or after the box's
+`TrackMotion::bridged_from` (SPG-12b). The tracker reports it only while the
+box's track is confirmed moving (steady translations one way): from the
+start of that run, and never before the track's first sighting or its
+latest motion-gate pairing. On those frames the tracker's own held masks
+already cover the text, through the hull of the two sightings around each
+frame. A rect where a scrolling line was found would only blur where it is
+going: SPG-12d attributed 121 of 376 covered decoys on the CI text suite to
+retroactive rects. Frames before the run, before a new track's first
+sighting (the first-frame case above) and boxes of tracks that are not
+moving steadily keep every rect. Text that grows in place (typed) keeps them
+too: a later, longer box can cover glyphs an earlier one fell short of, which
+a run of this skip on every track showed (one watch-list frame of the
+address-bar template lost coverage). A first sighting is never in a
+confirmed run, so its spread is never left out.
 Per frame, a rect contained in another is dropped, and past `max_retro_rects`
 they merge into one hull (more blur, never less).
 

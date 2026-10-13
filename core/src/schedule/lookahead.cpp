@@ -368,6 +368,13 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
                               std::min(job.frame_time - frame.t, config_.tracker.max_prediction))
                               .count();
       for (std::size_t i = 0; i < result.detections.size(); ++i) {
+        if (frame.t >= motions[i].bridged_from) {
+          // The track is moving steadily and its own held masks cover its
+          // path from there to this detection (SPG-12b): a rect where it was
+          // found would only blur where the text is going, over the lines it
+          // passes.
+          continue;
+        }
         const Detection& d = result.detections[i];
         const Rect mask_here = mask::grow_by_margin(d.box.rect, margin_px, margin_ratio);
         Rect r = mask_here;

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <vector>
 
@@ -55,6 +56,13 @@ struct TrackerConfig {
   // yields the hull of its masks. Merging only adds coverage. 1 merges a
   // track into one rect.
   std::size_t max_rects_per_track = 8;
+  // Follow confirmed moving tracks (SPG-12b). On a frame time that two
+  // detections of a confirmed moving track bracket (see Tracker), its older
+  // held boxes are masked at the track's measured position, each with its own
+  // size and margin, instead of where they were seen. false holds every box
+  // where it was seen and reports no bridged frames (TrackMotion), as before
+  // SPG-12b.
+  bool follow_moving_tracks = true;
 
   // Hold, margin and retention (lookahead) from `policy`; the rest default.
   [[nodiscard]] static TrackerConfig from_policy(const PolicyConfig& policy);
@@ -95,6 +103,17 @@ struct TrackMotion {
   // same answer. False with no measurement yet. A late detection older than
   // all the track's others also counts its move to the latest box.
   bool translating = false;
+  // The track the detection joined (Track::id).
+  TrackId track = 0;
+  // While the track is confirmed moving (see Tracker, Follow): from this
+  // frame time up to the detection's, the track's own held masks cover the
+  // path between its sightings (the hull of each two in a row), so a
+  // retroactive rect adds nothing there (SPG-12b). It is the start of the
+  // track's current run, and never before its first sighting or its latest
+  // motion-gate pairing (the pairing may be wrong, and the path from before
+  // it another object's). Otherwise (also with follow_moving_tracks off),
+  // and by default, it covers no frame.
+  Timestamp bridged_from = Timestamp::max();
 
   friend bool operator==(const TrackMotion&, const TrackMotion&) = default;
 };
@@ -105,7 +124,24 @@ struct TrackMotion {
 // Guarantees, all in Source pixels and frame time:
 //   * Hold: a detection with box b on frame time td is covered, grown by the
 //     margin, on every frame time t in [td, td + hold]. Later detections,
-//     tracking loss, missed cycles and resizes never remove that coverage.
+//     tracking loss, missed cycles and resizes never remove that coverage,
+//     with the one exception below.
+//   * Follow (SPG-12b, follow_moving_tracks): on a frame time t that two
+//     sightings a and b of a confirmed moving track bracket (the latest and
+//     earliest of its detections that moved it forward, at or before and at
+//     or after t), a detection d of the track's current run seen before a is
+//     masked at the track's measured position instead of where it was seen:
+//     d's box moved by the measured move from d to a and from d to b (the
+//     hull of both), grown by d's margin. The hull of a and b, grown by the
+//     larger of their margins, is masked too, so text that moved one way
+//     from a to b is covered at every frame time between them. A track is
+//     confirmed moving after two steady translations the same way (each
+//     move within half, or 3 px, of what the last one's speed predicts); its
+//     run ends when its box stops, turns, changes speed, is paired by the
+//     motion gate or the source is resized. Late detections, boxes held
+//     before the run and boxes held before a gate pairing or resize are
+//     never moved. On frame times after the track's last detection, every
+//     box is held where it was seen.
 //   * Prediction: on frame times after td the mask also covers b moved at the
 //     track's estimated velocity for min(t - td, max_prediction), as the hull
 //     of b and the moved box, so between detection cycles the mask only grows.
@@ -119,7 +155,8 @@ struct TrackMotion {
 //     reports that motion once it has one, so a wrong pairing never removes
 //     coverage the detection would have had without the gate.
 //   * Updates only add: masks(t) after update() contains every rect masks(t)
-//     returned before, for any t the retention still covers.
+//     returned before, for any t the retention still covers that is after
+//     every track's last detection (before it, Follow may move boxes).
 //   * Resize: after rescale(from, to), masks(t) contains every rect masks(t)
 //     returned before, both as it was and scaled to the new size (rounded
 //     outward), so content blurred before a resize stays blurred after it.
@@ -193,6 +230,23 @@ class Tracker {
     Velocity high;
     double margin_x = 0.0;
     double margin_y = 0.0;
+    bool bridge = false;    // the hull between two sightings, not a detection
+    bool late = false;      // a detection that did not move its track forward
+    std::uint64_t seq = 0;  // order held in its track
+  };
+  // Whether a track is confirmed moving (SPG-12b). Measured from a checkpoint
+  // box, so the short gap between two workers' paired cycles (a pixel or two)
+  // neither counts nor breaks the run.
+  struct Follow {
+    Rect checkpoint;
+    Timestamp checkpoint_time{};
+    bool has_checkpoint = false;
+    int translations = 0;      // steady, the same way, from run_start
+    bool along_x = true;       // their axis
+    bool positive = true;      // and direction along it
+    double speed = 0.0;        // of the last one along that axis, px/s
+    Timestamp run_start{};     // checkpoint the run's first translation left
+    std::uint64_t barrier = 0;  // boxes held before this seq never move
   };
   // What confirm() measures from a run of detections: the latest box (in
   // frame time) and its frame time, the earliest frame time, the velocity
@@ -213,6 +267,11 @@ class Tracker {
     // track that detection would have started without the gate. The same as
     // `motion` until the gate pairs the track.
     Motion since_gate;
+    Follow follow;
+    std::uint64_t next_seq = 0;
+    // The track's first sighting or latest gate pairing: its bridges cover
+    // the path from here (see TrackMotion::bridged_from).
+    Timestamp bridged_from{};
   };
 
   [[nodiscard]] Rect predicted(const Track& track, Timestamp t) const noexcept;
@@ -226,6 +285,13 @@ class Tracker {
   void bridge(TrackState& state, const Rect& from, Timestamp since, const Rect& to) const;
   [[nodiscard]] Held make_held(const Rect& box, Timestamp seen, Velocity velocity) const noexcept;
   [[nodiscard]] Rect mask_rect(const Held& held, Timestamp t) const noexcept;
+  // Appends `held` to the track with the next seq.
+  static void hold(TrackState& state, Held held);
+  // A forward detection moved the track to `box` on `frame_time`.
+  static void follow_measure(Follow& follow, const Rect& box, Timestamp frame_time) noexcept;
+  // Masks of one track on frame time `t`, merged into `slots` time buckets.
+  void track_masks(const TrackState& state, Timestamp t, std::int64_t width, std::int64_t first,
+                   std::span<Box> slots) const noexcept;
 
   const Clock* clock_;
   TrackerConfig config_;

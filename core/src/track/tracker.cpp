@@ -153,6 +153,19 @@ std::int64_t floor_div(std::int64_t a, std::int64_t b) noexcept {
 
 constexpr std::size_t kMaxRectsPerTrackLimit = 64;
 
+// A box that has not translated from its checkpoint for longer than this has
+// stopped: its track is no longer confirmed moving (SPG-12b). At this
+// duration, text slower than 4 px/s counts as stopped.
+constexpr Duration kStopWindow = std::chrono::milliseconds{250};
+// A translation is steady when its move differs from the move the run's last
+// speed predicts by at most half that move or this many pixels (box jitter:
+// a static line's detection edges move about a pixel between cycles).
+constexpr double kSteadyJitterPx = 3.0;
+// Moves are judged over at least this much frame time from the checkpoint.
+// Two workers' paired cycles land a frame apart, where a pixel of jitter is
+// as large as the move and would make any speed measured over it noise.
+constexpr Duration kMinBaseline = std::chrono::milliseconds{100};
+
 // The larger of two positive lengths over the smaller; infinite when either
 // is not positive, so an empty box never passes a size gate.
 double size_ratio(float a, float b) noexcept {
@@ -274,8 +287,15 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
       // has a measurement, so a wrong pairing cannot take away the motion
       // the detections would have had on a track of their own.
       const Motion& m = state.since_gate.has_velocity ? state.since_gate : state.motion;
-      (*motions)[di] = m.has_velocity ? TrackMotion{m.velocity, m.first_seen, m.translating}
-                                      : TrackMotion{Velocity{}, m.first_seen, false};
+      // Bridged only while the track moves steadily: a box found where text
+      // rests can still cover glyphs an earlier box at that place fell short
+      // of, but text that moves one way never was where it is found now.
+      const Timestamp bridged = config_.follow_moving_tracks && state.follow.translations >= 2
+                                    ? std::max(state.bridged_from, state.follow.run_start)
+                                    : Timestamp::max();
+      (*motions)[di] = m.has_velocity
+                           ? TrackMotion{m.velocity, m.first_seen, m.translating, state.track.id, bridged}
+                           : TrackMotion{Velocity{}, m.first_seen, false, state.track.id, bridged};
     }
   };
   for (const Candidate& c : candidates) {
@@ -352,7 +372,12 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     state.track.kind = detection.kind;
     state.motion = Motion{detection.box.rect, frame_time, frame_time, Velocity{}, false, false};
     state.since_gate = state.motion;
-    state.held.push_back(make_held(detection.box.rect, frame_time, Velocity{}));
+    state.bridged_from = frame_time;
+    follow_measure(state.follow, detection.box.rect, frame_time);
+    hold(state, make_held(detection.box.rect, frame_time, Velocity{}));
+    if (motions != nullptr) {
+      (*motions)[di].track = state.track.id;
+    }
     tracks_.push_back(std::move(state));
   }
 
@@ -423,8 +448,21 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box, 
     // The detection may be a new object near this track. From here on it is
     // also measured as the track it would have started (SPG-16b).
     state.since_gate = Motion{box, frame_time, frame_time, Velocity{}, false, false};
+    // Boxes held before it may be another object's: they never move, and
+    // the track is confirmed moving again only from here (SPG-12b).
+    state.follow = Follow{};
+    state.follow.barrier = state.next_seq;
+    if (forward) {
+      follow_measure(state.follow, box, frame_time);
+    }
+    // The path is bridged again from this detection on: the next sighting
+    // bridges from its box (SPG-16b).
+    state.bridged_from = frame_time;
   } else {
     advance(state.since_gate, frame_time, box);
+    if (forward) {
+      follow_measure(state.follow, box, frame_time);
+    }
   }
   Track& track = state.track;
   track.velocity = state.motion.velocity;
@@ -436,10 +474,68 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box, 
   // Predicted over both velocities, so a wrong gate pairing still predicts
   // where the detection's own track would have.
   Held held = make_held(box, frame_time, state.motion.velocity);
+  held.late = !forward;
   const Velocity& other = state.since_gate.velocity;
   held.low = Velocity{std::min(held.low.dx_per_s, other.dx_per_s), std::min(held.low.dy_per_s, other.dy_per_s)};
   held.high = Velocity{std::max(held.high.dx_per_s, other.dx_per_s), std::max(held.high.dy_per_s, other.dy_per_s)};
+  hold(state, held);
+}
+
+void Tracker::hold(TrackState& state, Held held) {
+  held.seq = state.next_seq++;
   state.held.push_back(held);
+}
+
+void Tracker::follow_measure(Follow& follow, const Rect& box, Timestamp frame_time) noexcept {
+  // Measured from the checkpoint, not the last box, over at least
+  // kMinBaseline: two workers' paired cycles land a frame apart, and a pixel
+  // or two of move between them is neither a translation nor a stop.
+  if (!follow.has_checkpoint) {
+    follow.checkpoint = box;
+    follow.checkpoint_time = frame_time;
+    follow.has_checkpoint = true;
+    return;
+  }
+  if (frame_time - follow.checkpoint_time < kMinBaseline) {
+    return;
+  }
+  const double dx = center_x(box) - center_x(follow.checkpoint);
+  const double dy = center_y(box) - center_y(follow.checkpoint);
+  if (translated(follow.checkpoint, box, Velocity{to_velocity(dx), to_velocity(dy)})) {
+    const bool along_x = std::abs(dx) >= std::abs(dy);
+    const double moved = std::abs(along_x ? dx : dy);
+    const bool positive = (along_x ? dx : dy) > 0.0;
+    const double dt = seconds(frame_time - follow.checkpoint_time);
+    const double expected = follow.speed * dt;
+    // Steady: the same way at about the run's speed. A box that moved much
+    // less or more than that (another line that took the track's place after
+    // missed cycles, an ease-out, a jump) starts a new run instead.
+    if (follow.translations > 0 && along_x == follow.along_x && positive == follow.positive &&
+        std::abs(moved - expected) <= std::max(expected / 2.0, kSteadyJitterPx)) {
+      ++follow.translations;
+    } else {
+      // A first translation, a turn or a change of speed: a new run starts.
+      follow.translations = 1;
+      follow.run_start = follow.checkpoint_time;
+      follow.along_x = along_x;
+      follow.positive = positive;
+    }
+    follow.speed = moved / dt;
+    follow.checkpoint = box;
+    follow.checkpoint_time = frame_time;
+    return;
+  }
+  // Not a translation: a short gap, jitter, a box that grows, or a stop. A
+  // move of both edges against the run, or no translation for kStopWindow,
+  // ends the run.
+  const float back = follow.positive ? -1.0F : 1.0F;
+  const Velocity against = follow.along_x ? Velocity{back, 0.0F} : Velocity{0.0F, back};
+  if ((follow.translations > 0 && translated(follow.checkpoint, box, against)) ||
+      frame_time - follow.checkpoint_time > kStopWindow) {
+    follow.translations = 0;
+    follow.checkpoint = box;
+    follow.checkpoint_time = frame_time;
+  }
 }
 
 void Tracker::bridge(TrackState& state, const Rect& from, Timestamp since, const Rect& to) const {
@@ -467,7 +563,8 @@ void Tracker::bridge(TrackState& state, const Rect& from, Timestamp since, const
       since, Velocity{});
   held.margin_x = held.margin_y =
       std::max(make_held(from, since, Velocity{}).margin_x, make_held(to, since, Velocity{}).margin_x);
-  state.held.push_back(held);
+  held.bridge = true;
+  hold(state, held);
 }
 
 Tracker::Held Tracker::make_held(const Rect& box, Timestamp seen,
@@ -519,20 +616,7 @@ void Tracker::masks(Timestamp t, std::vector<Box>& out) const {
   for (const TrackState& state : tracks_) {
     const std::size_t start = out.size();
     out.resize(start + slots, Box{kNoRect, Space::Source});
-    for (const Held& held : state.held) {
-      if (t < held.seen || t > held.seen + config_.hold) {
-        continue;
-      }
-      const std::int64_t bucket =
-          slots > 1 ? floor_div(held.seen.time_since_epoch().count(), width) - first : 0;
-      // Always in [0, slots) by the bound above; the clamp only guards the
-      // buffer (merging into a neighbor would still keep the coverage).
-      const std::size_t slot = std::min(static_cast<std::size_t>(std::max<std::int64_t>(0, bucket)),
-                                        slots - 1);
-      Rect& r = out[start + slot].rect;
-      const Rect m = mask_rect(held, t);
-      r = is_slot_empty(r) ? m : hull(r, m);
-    }
+    track_masks(state, t, width, first, std::span<Box>(out).subspan(start, slots));
     // Leave out a rect another one contains; of two equal rects keep the
     // first. Each dropped rect lies inside one still kept, so the union is
     // unchanged.
@@ -556,6 +640,92 @@ void Tracker::masks(Timestamp t, std::vector<Box>& out) const {
       }
     }
     out.resize(kept);
+  }
+}
+
+void Tracker::track_masks(const TrackState& state, Timestamp t, std::int64_t width, std::int64_t first,
+                          std::span<Box> slots) const noexcept {
+  const auto add = [&](Timestamp seen, const Rect& m) {
+    const std::int64_t bucket =
+        slots.size() > 1 ? floor_div(seen.time_since_epoch().count(), width) - first : 0;
+    // Always in [0, slots) by the bound in masks(); the clamp only guards the
+    // buffer (merging into a neighbor would still keep the coverage).
+    const std::size_t slot =
+        std::min(static_cast<std::size_t>(std::max<std::int64_t>(0, bucket)), slots.size() - 1);
+    Rect& r = slots[slot].rect;
+    r = is_slot_empty(r) ? m : hull(r, m);
+  };
+
+  // Follow (SPG-12b): on a frame time that two detections of a confirmed
+  // moving track bracket, a (the latest seen at or before t) and b (the
+  // earliest at or after it), the text is where the track went from a to b:
+  // inside their hull, which is masked with the larger margin. Detections
+  // seen before a are masked there too, each with its own size and margin,
+  // instead of at the positions the text has left. After the track's last
+  // detection there is no b, and every box holds where it was seen.
+  const Follow& follow = state.follow;
+  const Held* a = nullptr;
+  const Held* b = nullptr;
+  bool on = config_.follow_moving_tracks && follow.translations >= 2 && t <= state.motion.last;
+  if (on) {
+    // Anchors are the sightings that moved the track forward: their frame
+    // times only increase, so no two share one. A late result is held where
+    // it was seen.
+    for (const Held& h : state.held) {
+      if (h.bridge || h.late) {
+        continue;
+      }
+      if (h.seen <= t && (a == nullptr || h.seen > a->seen)) {
+        a = &h;
+      }
+      if (h.seen >= t && (b == nullptr || h.seen < b->seen)) {
+        b = &h;
+      }
+    }
+    on = a != nullptr && b != nullptr && a->seq >= follow.barrier && a->seen >= follow.run_start &&
+         t <= a->seen + config_.hold;
+  }
+
+  for (const Held& held : state.held) {
+    if (t < held.seen || t > held.seen + config_.hold) {
+      continue;
+    }
+    // Only boxes of the current run move: held before a gate pairing or
+    // resize, before the run started, or late, they may be another object's.
+    if (!on || held.seen >= a->seen || held.seq < follow.barrier || held.seen < follow.run_start ||
+        held.late) {
+      add(held.seen, mask_rect(held, t));
+      continue;
+    }
+    if (held.bridge) {
+      // The path between two older sightings of the run, which the text has
+      // left: the hull of a and b covers its path from a.
+      continue;
+    }
+    // The held box moved by the measured move from it to a and to b.
+    const Rect& box = held.box;
+    const double ax = center_x(a->box) - center_x(box);
+    const double ay = center_y(a->box) - center_y(box);
+    const double bx = center_x(b->box) - center_x(box);
+    const double by = center_y(b->box) - center_y(box);
+    add(held.seen,
+        pixel_rect(static_cast<double>(box.x) + std::min(ax, bx) - held.margin_x,
+                   static_cast<double>(box.y) + std::min(ay, by) - held.margin_y,
+                   static_cast<double>(box.x) + static_cast<double>(box.width) + std::max(ax, bx) + held.margin_x,
+                   static_cast<double>(box.y) + static_cast<double>(box.height) + std::max(ay, by) +
+                       held.margin_y));
+  }
+  if (on) {
+    const double mx = std::max(a->margin_x, b->margin_x);
+    const double my = std::max(a->margin_y, b->margin_y);
+    add(a->seen, pixel_rect(std::min(static_cast<double>(a->box.x), static_cast<double>(b->box.x)) - mx,
+                            std::min(static_cast<double>(a->box.y), static_cast<double>(b->box.y)) - my,
+                            std::max(static_cast<double>(a->box.x) + static_cast<double>(a->box.width),
+                                     static_cast<double>(b->box.x) + static_cast<double>(b->box.width)) +
+                                mx,
+                            std::max(static_cast<double>(a->box.y) + static_cast<double>(a->box.height),
+                                     static_cast<double>(b->box.y) + static_cast<double>(b->box.height)) +
+                                my));
   }
 }
 
@@ -613,6 +783,10 @@ void Tracker::rescale(Size from, Size to) {
     }
     state.track.box = Box{state.motion.box, Space::Source};
     state.track.velocity = state.motion.velocity;
+    // Boxes held before the resize never move; the track is confirmed
+    // moving again only from detections in the new size (SPG-12b).
+    state.follow = Follow{};
+    state.follow.barrier = state.next_seq;
   }
 }
 

@@ -1063,6 +1063,92 @@ TEST_CASE("a first sighting on the first cycle that completes is spread", "[sche
   CHECK(taller_than(frames, 80.0F, 1110, 1200).empty());
 }
 
+TEST_CASE("one worker follows a scrolling line and stops blurring the line below", "[schedule]") {
+  // SPG-12b: a chat line scrolls up at 60 px/s, 34 px between lines (text
+  // suite chat template), so the next line down reaches where this one was
+  // within the hold. Held where they were seen, its boxes and the rects where
+  // later cycles found it blur that next line. Followed, it is covered where
+  // it is on every frame and the next line stays clear. (At 60 px/s one
+  // cycle moves the 30 px box 12 px, so IoU pairs it; a move the motion gate
+  // pairs keeps the boxes before it where they were seen, as a new track.)
+  const auto line = [](std::int64_t t) {
+    return Rect{100.0F, 600.0F - 0.06F * static_cast<float>(t - 1000), 300.0F, 30.0F};
+  };
+  const auto next_line = [&](std::int64_t t) {
+    Rect r = line(t);
+    r.y += 34.0F;
+    return r;
+  };
+  SchedulerConfig config = one_worker_config();
+  const auto followed = one_worker(config, line, 1000, 3000);
+  config.tracker.follow_moving_tracks = false;
+  const auto held = one_worker(config, line, 1000, 3000);
+  CHECK(uncovered(followed, line).empty());
+  CHECK(uncovered(held, line).empty());
+  const auto blurred = [&](const std::vector<ReleasedFrame>& frames) {
+    int n = 0;
+    for (const ReleasedFrame& r : frames) {
+      const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+      n += covered_by(r.plan, next_line(t)) ? 1 : 0;
+    }
+    return n;
+  };
+  INFO("next line blurred on " << blurred(held) << " frames held, " << blurred(followed) << " followed");
+  CHECK(blurred(held) > 100);
+  CHECK(blurred(followed) == 0);
+}
+
+TEST_CASE("retroactive rects of a followed line leave the line above clear", "[schedule]") {
+  // SPG-12b: the same line, scanned every 200 ms with results landing at
+  // once, so each one reaches 500 ms of buffered frames. A rect where a later
+  // cycle found the line is where the text is going: 375 ms or more back it
+  // covers the line above. Once the track is confirmed moving, its own held
+  // masks cover its path between sightings and those rects are left out; the
+  // line is still covered on every frame.
+  const auto line = [](std::int64_t t) {
+    return Rect{100.0F, 600.0F - 0.06F * static_cast<float>(t - 1000), 300.0F, 30.0F};
+  };
+  const auto run = [&](bool follow) {
+    SchedulerConfig config = one_worker_config();
+    config.tracker.follow_moving_tracks = follow;
+    Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                      const Rect b = line(spg::to_ns(t) / 1'000'000);
+                                      return std::vector<Detection>{face_at(b.x, b.y, b.width, b.height)};
+                                    }),
+                                    nullptr, nullptr, nullptr});
+    std::vector<ReleasedFrame> out;
+    for (std::int64_t t = 1000; t <= 3500; t += 10) {
+      if (t <= 3000) {
+        const bool scan = (t - 1000) % 200 == 0;
+        sim.push(t, scan);
+        if (scan) {
+          sim.scan_now();
+        }
+      }
+      const auto due = sim.release_at(t);
+      out.insert(out.end(), due.begin(), due.end());
+    }
+    REQUIRE(out.size() == 201);
+    return out;
+  };
+  const auto followed = run(true);
+  const auto held = run(false);
+  CHECK(uncovered(followed, line).empty());
+  CHECK(uncovered(held, line).empty());
+  const auto above = [&](const std::vector<ReleasedFrame>& frames) {
+    int n = 0;
+    for (const ReleasedFrame& r : frames) {
+      Rect p = line(spg::to_ns(r.frame_time) / 1'000'000);
+      p.y -= 34.0F;
+      n += covered_by(r.plan, p) ? 1 : 0;
+    }
+    return n;
+  };
+  INFO("line above blurred on " << above(held) << " frames held, " << above(followed) << " followed");
+  CHECK(above(held) > 50);
+  CHECK(above(followed) == 0);
+}
+
 TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {
   // A static box whose detections jitter 12 px left and right each cycle: the
   // track's velocity flips sign every 20 ms (an outlier-ridden estimate).
