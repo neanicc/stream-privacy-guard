@@ -2291,6 +2291,29 @@ Template:
     0.0019: identical. Local faces identical (pair 2206/2207, leak 1/1080,
     clean 0). Realtime (loaded machine, unreliable): fail-closed 0.9956,
     p95 857 ms, both FAIL as on main.
+- Babysit cycle 3 (staff review on `9c64230`, score 80):
+  - The containment math in `masks()` moved out of an inline lambda into
+    `core/src/track/follow.{hpp,cpp}` (`follow::active`,
+    `follow::contains_moved`) behind `Tracker::follow_target()` and
+    `Tracker::followed()`, with direct unit tests (contained, clipped on
+    each side, the low and high ends of the velocity range, following off).
+    Behavior unchanged: the tracker suite runs the same 18916864 assertions
+    in 33 test cases (29 before plus the 4 new ones).
+  - The following tests share a `Session` fixture (clock and tracker), so
+    no tracker outlives its clock; every scenario and assertion is kept. The
+    oracle `may_follow`, the tracker rule and `docs/tracker.md` carry a
+    keep-in-sync note.
+  - Eval on the merged head (local, dev Mac, `SPG_BUILD_PLUGIN=0`) against
+    main `827149c` built the same way, default seed. Local text: decoy
+    0.5082 (2365/4654) on main, 0.3889 (1810/4654) here; watch-list pair
+    3996/3999, first-frame 51/53, PII pair 4158/4162, leak 7/1919
+    identical; clean blur 0.0027 -> 0.0019. Local faces identical (pair
+    2206/2207, leak 1/1080, clean 0). Hosted CI eval job, head `9c64230`
+    merged into `827149c` vs main `827149c`: decoy 0.4211 (376/893) ->
+    0.3583 (320/893); watch-list pair 557/557, first-frame 15/15, PII pair
+    590/590, leak 0/285, clean 0: identical. Realtime numbers from the
+    shared dev Mac are not reliable and are not used.
+  - The same-size takeover risk is a tracked item on #71 (live leak test).
 - Rejected with evidence: measuring each confirmation against the previous
   one. The eval's two workers confirm frames 17 ms apart, where a chat line
   moves under 2 px and the box jitters 1-2 px, so almost every pair broke the

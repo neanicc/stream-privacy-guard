@@ -99,6 +99,16 @@ text is.
   again.
 - `follow_after = 0` turns following off.
 
+**Keep in sync.** This section is the one statement of the rule. Two
+implementations follow it and change with it: the tracker
+(`Tracker::follow_target()` and `Tracker::followed()` in
+`core/src/track/tracker.cpp`, with the "following active" and containment
+checks in `core/src/track/follow.hpp`, unit-tested directly in
+`tests/unit/follow_test.cpp`), and the property test's oracle `may_follow`
+in `tests/unit/tracker_test.cpp`, which restates the order, resize, miss and
+run-length conditions from what the test delivered. Both carry a comment
+pointing here.
+
 Why it does not uncover the text: on frame `t` the newest detection at or
 before `t` found the text at its box, and the run says the text kept moving
 the same way since the run began, so it does not return to the rows older
