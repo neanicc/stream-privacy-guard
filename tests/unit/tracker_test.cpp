@@ -591,20 +591,49 @@ TrackerConfig exact_follow_config() {
   return config;
 }
 
+// A tracker with its own clock, fed one detection cycle at a time; frame times
+// in ms. feed() first moves the clock to the frame time, as a live run does.
+// deliver() leaves the clock where it is: for a result that lands late, or a
+// scene whose clock stays at 0 so nothing is pruned. Not copyable or movable:
+// the tracker points at the clock.
+class Session {
+ public:
+  explicit Session(const TrackerConfig& config) : config_(config), tracker_(clock_, config) {}
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+  void feed(std::int64_t ms, const std::vector<Detection>& found) {
+    clock_.set(at_ms(ms));
+    deliver(ms, found);
+  }
+  void deliver(std::int64_t ms, const std::vector<Detection>& found) {
+    tracker_.update(at_ms(ms), found);
+  }
+
+  [[nodiscard]] std::vector<Box> masks(std::int64_t ms) const { return tracker_.masks(at_ms(ms)); }
+  // The masks of frame `ms` cover `g`.
+  [[nodiscard]] bool covers(std::int64_t ms, const Region& g) const { return covered(masks(ms), g); }
+  // The masks of frame `ms` cover `box` grown by this session's margin.
+  [[nodiscard]] bool holds(std::int64_t ms, const Rect& box) const {
+    return covers(ms, required(box, config_));
+  }
+  [[nodiscard]] std::size_t track_count() const { return tracker_.tracks().size(); }
+  Tracker& tracker() { return tracker_; }
+
+ private:
+  TrackerConfig config_;
+  ManualClock clock_;
+  Tracker tracker_;
+};
+
 }  // namespace
 
 TEST_CASE("tracker: a confirmed moving track's hold follows it while it is updated", "[tracker]") {
-  ManualClock clock;
   const TrackerConfig config = exact_follow_config();
   REQUIRE(config.follow_after == 2);
-  Tracker tracker(clock, config);
-  const auto feed = [&](int i) {
-    clock.set(at_ms(200 * i));
-    tracker.update(at_ms(200 * i), std::vector<Detection>{scrolled(i)});
-  };
-  const auto holds = [&](std::int64_t ms, int i) {
-    return covered(tracker.masks(at_ms(ms)), required(scrolled(i).box.rect, config));
-  };
+  Session session(config);
+  const auto feed = [&](int i) { session.feed(200 * i, {scrolled(i)}); };
+  const auto holds = [&](std::int64_t ms, int i) { return session.holds(ms, scrolled(i).box.rect); };
 
   feed(0);
   feed(1);
@@ -624,7 +653,7 @@ TEST_CASE("tracker: a confirmed moving track's hold follows it while it is updat
   // Between confirmations the newest earlier box holds, moved along the
   // velocity: at 300 ms box 1 and its 10 px prediction, not box 0.
   CHECK(holds(300, 1));
-  CHECK(covered(tracker.masks(at_ms(300)), {100.0, 470.0, 300.0, 520.0}));
+  CHECK(session.covers(300, {100.0, 470.0, 300.0, 520.0}));
   CHECK_FALSE(holds(300, 0));
   // Each frame's own detection holds on that frame.
   CHECK(holds(0, 0));
@@ -647,21 +676,21 @@ TEST_CASE("tracker: a confirmed moving track's hold follows it while it is updat
 }
 
 TEST_CASE("tracker: only a consistent run of translations confirms a moving track", "[tracker]") {
-  ManualClock clock;
+  // The clock stays at 0: nothing is pruned. Coverage is always checked with
+  // `config`'s zero margins, whatever config the scene ran with.
   const TrackerConfig config = exact_follow_config();
-  const auto run = [&](const std::vector<Rect>& boxes, TrackerConfig c) {
-    auto tracker = std::make_unique<Tracker>(clock, c);
+  const auto run = [](const std::vector<Rect>& boxes, const TrackerConfig& c) {
+    auto session = std::make_unique<Session>(c);
     for (std::size_t i = 0; i < boxes.size(); ++i) {
       const Rect& b = boxes[i];
-      tracker->update(at_ms(200 * static_cast<std::int64_t>(i)),
-                      std::vector<Detection>{text(b.x, b.y, b.width, b.height)});
+      session->deliver(200 * static_cast<std::int64_t>(i), {text(b.x, b.y, b.width, b.height)});
     }
-    REQUIRE(tracker->tracks().size() == 1);
-    return tracker;
+    REQUIRE(session->track_count() == 1);
+    return session;
   };
   const Rect r0{100.0F, 500.0F, 200.0F, 60.0F};
-  const auto still_held = [&](const Tracker& t, std::int64_t ms, const Rect& b) {
-    return covered(t.masks(at_ms(ms)), required(b, config));
+  const auto still_held = [&](const Session& s, std::int64_t ms, const Rect& b) {
+    return s.covers(ms, required(b, config));
   };
 
   // Steady: confirmed, the first box follows.
@@ -723,61 +752,58 @@ TEST_CASE("tracker: two workers' close confirmations do not break the run", "[tr
   // confirmations are not measured; the 200 ms moves are, and confirm it.
   // Default margins: the newest box's margin absorbs the jitter, so the
   // older boxes moved along the measured motion fit in it and follow.
-  ManualClock clock;
-  const TrackerConfig config;
-  Tracker tracker(clock, config);
+  Session session{TrackerConfig{}};
   const std::vector<std::pair<std::int64_t, Rect>> cycles{
       {0, {100.0F, 500.0F, 200.0F, 60.0F}},   {17, {100.0F, 499.0F, 200.0F, 62.0F}},
       {200, {100.0F, 480.0F, 200.0F, 60.0F}}, {217, {100.0F, 479.5F, 200.0F, 59.0F}},
       {400, {100.0F, 460.0F, 200.0F, 60.0F}}, {417, {100.0F, 458.0F, 200.0F, 61.0F}}};
   for (const auto& [ms, box] : cycles) {
-    tracker.update(at_ms(ms), std::vector<Detection>{text(box.x, box.y, box.width, box.height)});
+    session.deliver(ms, {text(box.x, box.y, box.width, box.height)});
   }
-  REQUIRE(tracker.tracks().size() == 1);
-  const std::vector<Box> masks = tracker.masks(at_ms(417));
-  CHECK_FALSE(covered(masks, required(cycles[0].second, config)));
-  CHECK_FALSE(covered(masks, required(cycles[2].second, config)));
-  CHECK(covered(masks, required(cycles[5].second, config)));
+  REQUIRE(session.track_count() == 1);
+  CHECK_FALSE(session.holds(417, cycles[0].second));
+  CHECK_FALSE(session.holds(417, cycles[2].second));
+  CHECK(session.holds(417, cycles[5].second));
 }
 
 TEST_CASE("tracker: late detections and boxes from before a resize are never followed", "[tracker]") {
-  ManualClock clock;
+  // The clock stays at 0: nothing is pruned.
   const TrackerConfig config = exact_follow_config();
 
   // A line scrolling up 6 px per cycle; a late result for 100 ms lands after
   // the track was confirmed moving. It holds; box 0 follows.
-  Tracker tracker(clock, config);
+  Session session(config);
   const auto slow = [](int i) { return text(100.0F, 500.0F - 6.0F * static_cast<float>(i), 200.0F, 20.0F); };
   for (int i = 0; i < 3; ++i) {
-    tracker.update(at_ms(200 * i), std::vector<Detection>{slow(i)});
+    session.deliver(200 * i, {slow(i)});
   }
   const Detection late = text(100.0F, 497.0F, 200.0F, 20.0F);
-  tracker.update(at_ms(100), std::vector<Detection>{late});
-  REQUIRE(tracker.tracks().size() == 1);
-  CHECK(covered(tracker.masks(at_ms(400)), required(late.box.rect, config)));
-  CHECK_FALSE(covered(tracker.masks(at_ms(400)), required(slow(0).box.rect, config)));
+  session.deliver(100, {late});
+  REQUIRE(session.track_count() == 1);
+  CHECK(session.holds(400, late.box.rect));
+  CHECK_FALSE(session.holds(400, slow(0).box.rect));
 
   // A resize: every box held before it keeps its hold where it was (and
   // scaled), even after the track is confirmed moving again.
-  Tracker resized(clock, config);
+  Session resized(config);
   for (int i = 0; i < 3; ++i) {
-    resized.update(at_ms(200 * i), std::vector<Detection>{scrolled(i)});
+    resized.deliver(200 * i, {scrolled(i)});
   }
-  const std::vector<Box> before = resized.masks(at_ms(400));
-  resized.rescale(Size{1920, 1080}, Size{1920, 1080});
-  CHECK(no_shrink(before, resized.masks(at_ms(400))));
+  const std::vector<Box> before = resized.masks(400);
+  resized.tracker().rescale(Size{1920, 1080}, Size{1920, 1080});
+  CHECK(no_shrink(before, resized.masks(400)));
   for (int i = 3; i < 8; ++i) {
-    resized.update(at_ms(200 * i), std::vector<Detection>{scrolled(i)});
+    resized.deliver(200 * i, {scrolled(i)});
   }
-  REQUIRE(resized.tracks().size() == 1);
+  REQUIRE(resized.track_count() == 1);
   for (int i = 0; i < 3; ++i) {
     INFO("box " << i);
-    CHECK(covered(resized.masks(at_ms(750)), required(scrolled(i).box.rect, config)));
+    CHECK(resized.holds(750, scrolled(i).box.rect));
   }
   // Boxes after the resize follow again once a new run is confirmed (the
   // boxes from before it have expired by 1200 ms).
-  CHECK_FALSE(covered(resized.masks(at_ms(1200)), required(scrolled(3).box.rect, config)));
-  CHECK(covered(resized.masks(at_ms(1200)), required(scrolled(6).box.rect, config)));
+  CHECK_FALSE(resized.holds(1200, scrolled(3).box.rect));
+  CHECK(resized.holds(1200, scrolled(6).box.rect));
 }
 
 TEST_CASE("tracker: a missed cycle ends the run and keeps the full hold", "[tracker]") {
@@ -785,25 +811,18 @@ TEST_CASE("tracker: a missed cycle ends the run and keeps the full hold", "[trac
   // moving; the cycle at 500 ms finds nothing; the line is found again at
   // 600 ms. The boxes held before the miss keep their whole hold, also on the
   // missed frame once the later confirmation arrives (default margins).
-  ManualClock clock;
   const TrackerConfig config;
   REQUIRE(config.follow_after == 2);
-  Tracker tracker(clock, config);
+  Session session(config);
   const auto line = [](float y) { return text(100.0F, y, 200.0F, 40.0F); };
-  const auto feed = [&](std::int64_t ms, const std::vector<Detection>& found) {
-    clock.set(at_ms(ms));
-    tracker.update(at_ms(ms), found);
-  };
-  const auto holds = [&](std::int64_t ms, float y) {
-    return covered(tracker.masks(at_ms(ms)), required(line(y).box.rect, config));
-  };
-  feed(0, {line(500.0F)});
-  feed(200, {line(480.0F)});
-  feed(400, {line(460.0F)});
+  const auto holds = [&](std::int64_t ms, float y) { return session.holds(ms, line(y).box.rect); };
+  session.feed(0, {line(500.0F)});
+  session.feed(200, {line(480.0F)});
+  session.feed(400, {line(460.0F)});
   REQUIRE_FALSE(holds(400, 500.0F));  // confirmed: box 0 follows
-  feed(500, {});                      // missed
-  feed(600, {line(440.0F)});
-  REQUIRE(tracker.tracks().size() == 1);
+  session.feed(500, {});              // missed
+  session.feed(600, {line(440.0F)});
+  REQUIRE(session.track_count() == 1);
   for (const std::int64_t ms : {400, 500, 600, 750}) {
     INFO("frame " << ms);
     CHECK(holds(ms, 500.0F));
@@ -813,13 +832,13 @@ TEST_CASE("tracker: a missed cycle ends the run and keeps the full hold", "[trac
   CHECK(holds(600, 440.0F));
 
   // A new run after the miss follows only the boxes found after it.
-  feed(800, {line(420.0F)});
-  feed(1000, {line(400.0F)});
+  session.feed(800, {line(420.0F)});
+  session.feed(1000, {line(400.0F)});
   CHECK(holds(1000, 460.0F));  // held before the miss: whole hold
   CHECK(holds(1150, 460.0F));
   // Found after the miss: follows once the box from 400 ms (whose prediction
   // also covers it) has expired.
-  feed(1200, {line(380.0F)});
+  session.feed(1200, {line(380.0F)});
   CHECK_FALSE(holds(1200, 440.0F));
 }
 
@@ -838,9 +857,7 @@ TEST_CASE("tracker: a static line keeps its hold while a same-size line scrolls 
     for (const std::vector<int>& missed : misses) {
       INFO("decoy first " << decoy_first << ", secret missed on " << missed.size() << " cycles from "
                           << (missed.empty() ? -1 : missed.front()));
-      ManualClock clock;
-      const TrackerConfig config;
-      Tracker tracker(clock, config);
+      Session session{TrackerConfig{}};
       const Detection secret = text(100.0F, 500.0F, 200.0F, 40.0F);
       std::vector<std::int64_t> seen;  // frame times the secret was found on
       for (int i = 0; i <= 10; ++i) {
@@ -857,8 +874,7 @@ TEST_CASE("tracker: a static line keeps its hold while a same-size line scrolls 
         if (!decoy_first) {
           found.push_back(decoy);
         }
-        clock.set(at_ms(now));
-        tracker.update(at_ms(now), found);
+        session.feed(now, found);
         // The frames this cycle's result releases, and up to the hold past
         // the last one.
         const std::int64_t until = i == 10 ? now + 750 : now;
@@ -868,7 +884,7 @@ TEST_CASE("tracker: a static line keeps its hold while a same-size line scrolls 
               continue;
             }
             INFO("frame " << t << ", secret box from " << s);
-            CHECK(covered(tracker.masks(at_ms(t)), required(secret.box.rect, config)));
+            CHECK(session.holds(t, secret.box.rect));
           }
         }
       }
@@ -882,17 +898,10 @@ TEST_CASE("tracker: a track that stops for longer than the hold ends its run", "
   // the hold. A box that then takes the track at a consistent speed from the
   // last measured one does not continue the old run, so the boxes held where
   // the track stood keep their hold.
-  ManualClock clock;
-  const TrackerConfig config = exact_follow_config();
-  Tracker tracker(clock, config);
+  Session session(exact_follow_config());
   const auto box = [](float y) { return text(100.0F, y, 200.0F, 300.0F); };
-  const auto feed = [&](std::int64_t ms, float y) {
-    clock.set(at_ms(ms));
-    tracker.update(at_ms(ms), std::vector<Detection>{box(y)});
-  };
-  const auto holds = [&](std::int64_t ms, float y) {
-    return covered(tracker.masks(at_ms(ms)), required(box(y).box.rect, config));
-  };
+  const auto feed = [&](std::int64_t ms, float y) { session.feed(ms, {box(y)}); };
+  const auto holds = [&](std::int64_t ms, float y) { return session.holds(ms, box(y).box.rect); };
   feed(0, 500.0F);
   feed(200, 480.0F);
   feed(400, 460.0F);
@@ -902,7 +911,7 @@ TEST_CASE("tracker: a track that stops for longer than the hold ends its run", "
   // 80 px up in 1 s from the box measured at 400 ms would continue the old
   // run (100 px/s, then 80 px/s); it is measured from the 1200 ms box instead.
   feed(1400, 380.0F);
-  REQUIRE(tracker.tracks().size() == 1);
+  REQUIRE(session.track_count() == 1);
   CHECK(holds(1400, 460.0F));  // the boxes from 800 and 1200 ms
 }
 
@@ -943,23 +952,20 @@ TEST_CASE("tracker: a clipped re-detection never releases a box that covered all
       for (const int clipped : {2, 3, 4}) {
         INFO("side " << static_cast<int>(side) << ", clipped by " << clip << " px on cycle "
                      << clipped);
-        ManualClock clock;
-        Tracker tracker(clock, config);
+        Session session(config);
         for (int i = 0; i <= 6; ++i) {
           const std::int64_t now = 200 * static_cast<std::int64_t>(i);
-          const Detection d = detected(i, side, i == clipped ? clip : 0.0F);
-          clock.set(at_ms(now));
-          tracker.update(at_ms(now), std::vector<Detection>{d});
-          REQUIRE(tracker.tracks().size() == 1);
+          session.feed(now, {detected(i, side, i == clipped ? clip : 0.0F)});
+          REQUIRE(session.track_count() == 1);
           for (std::int64_t t = std::max<std::int64_t>(200, now - 175); t <= now; t += 25) {
             INFO("frame " << t);
-            CHECK(covered(tracker.masks(at_ms(t)), truth(t)));
+            CHECK(session.covers(t, truth(t)));
           }
         }
         if (fraction == 0.0F && clipped == 2) {
           // Not vacuous: unclipped, the track follows, so the first row is
           // clear by 600 ms.
-          CHECK_FALSE(covered(tracker.masks(at_ms(600)), truth(0)));
+          CHECK_FALSE(session.covers(600, truth(0)));
         }
       }
     }
@@ -1000,8 +1006,7 @@ TEST_CASE("tracker: a line scrolling at an uneven speed stays covered while it i
       const auto top = [&](std::int64_t ms) {
         return 500.0 - profile.offset(static_cast<double>(ms) / 1000.0);
       };
-      ManualClock clock;
-      Tracker tracker(clock, config);
+      Session session(config);
       std::vector<std::int64_t> times;
       for (std::int64_t c = 0; c <= 1200; c += 200) {
         times.push_back(c);
@@ -1014,12 +1019,11 @@ TEST_CASE("tracker: a line scrolling at an uneven speed stays covered while it i
       for (const std::int64_t now : times) {
         // Detected boxes snap to whole pixels, as a detector's do.
         const float y = static_cast<float>(std::round(top(now)));
-        clock.set(at_ms(now));
-        tracker.update(at_ms(now), std::vector<Detection>{text(100.0F, y, 200.0F, 40.0F)});
-        REQUIRE(tracker.tracks().size() == 1);
+        session.feed(now, {text(100.0F, y, 200.0F, 40.0F)});
+        REQUIRE(session.track_count() == 1);
         for (std::int64_t t = queried + 1; t <= now; ++t) {
           INFO("frame " << t);
-          const std::vector<Box> masks = tracker.masks(at_ms(t));
+          const std::vector<Box> masks = session.masks(t);
           CHECK(covered(masks, Region{100.0, top(t), 300.0, top(t) + 40.0}));
           followed = followed || !covered(masks, Region{100.0, top(0), 300.0, top(0) + 40.0});
         }
@@ -1043,22 +1047,19 @@ TEST_CASE("tracker: a same-size line that continues a missed line's run takes it
   const auto line = [](float y) { return text(100.0F, y, 200.0F, 40.0F); };
   const Region a = region_of(line(460.0F).box.rect);
   const auto scene = [&](const TrackerConfig& config, const std::vector<Detection>& b) {
-    ManualClock clock;
-    auto tracker = std::make_unique<Tracker>(clock, config);
+    auto session = std::make_unique<Session>(config);
     const std::vector<Detection> a_found{line(500.0F), line(480.0F), line(460.0F)};
     for (std::size_t i = 0; i < a_found.size() + b.size(); ++i) {
       const Detection& d = i < a_found.size() ? a_found[i] : b[i - a_found.size()];
-      const std::int64_t now = 200 * static_cast<std::int64_t>(i);
-      clock.set(at_ms(now));
-      tracker->update(at_ms(now), std::vector<Detection>{d});
+      session->feed(200 * static_cast<std::int64_t>(i), {d});
     }
-    REQUIRE(tracker->tracks().size() == 1);
-    return tracker;
+    REQUIRE(session->track_count() == 1);
+    return session;
   };
-  const auto held_until_hold_ends = [&](const Tracker& tracker) {
+  const auto held_until_hold_ends = [&](const Session& session) {
     for (std::int64_t t = 400; t <= 1150; t += 25) {
       INFO("frame " << t);
-      CHECK(covered(tracker.masks(at_ms(t)), a));
+      CHECK(session.covers(t, a));
     }
   };
   const TrackerConfig config;
@@ -1066,13 +1067,13 @@ TEST_CASE("tracker: a same-size line that continues a missed line's run takes it
 
   // The risk: B continues the run, and A's box is released early.
   const auto taken = scene(config, continues);
-  CHECK(covered(taken->masks(at_ms(400)), a));
-  CHECK(covered(taken->masks(at_ms(575)), a));
-  CHECK_FALSE(covered(taken->masks(at_ms(600)), a));
-  CHECK_FALSE(covered(taken->masks(at_ms(800)), a));
-  CHECK_FALSE(covered(taken->masks(at_ms(1000)), a));
+  CHECK(taken->covers(400, a));
+  CHECK(taken->covers(575, a));
+  CHECK_FALSE(taken->covers(600, a));
+  CHECK_FALSE(taken->covers(800, a));
+  CHECK_FALSE(taken->covers(1000, a));
   // After the last confirmation nothing is followed.
-  CHECK(covered(taken->masks(at_ms(1025)), a));
+  CHECK(taken->covers(1025, a));
 
   SECTION("following off") {
     TrackerConfig off = config;
@@ -1259,6 +1260,13 @@ std::uint64_t run_hold_property(bool follow) {
       }
     };
     // Whether the hold may let detection i go on frame t (see above).
+    //
+    // Keep in sync. This oracle and the tracker's rule (Tracker::follow_target()
+    // and Tracker::followed() in core/src/track/tracker.cpp, with the checks in
+    // core/src/track/follow.hpp) both implement docs/tracker.md ("Following").
+    // The oracle stays independent on purpose: it is derived from what this
+    // test delivered, not from the tracker's run state. A rule change updates
+    // the doc, the tracker and this oracle together.
     const auto may_follow = [&fed, &last_miss, &config, follow](std::size_t i, Timestamp t) {
       const Fed& d = fed[i];
       if (!follow || d.before_resize || !d.in_order) {
