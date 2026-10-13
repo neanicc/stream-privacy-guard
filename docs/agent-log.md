@@ -2721,3 +2721,40 @@ Template:
   rects and frames past a sighting's hold (the two P1s). (2) The scrolling-chat leak test (#71) should run on this
   change. (3) A cycle cadence without the 17 ms paired cycles would halve
   the hull between sightings. Synthetic eval only; live OBS not tested.
+- Babysit cycle 3, tracker. Staff review P2 on `98a8c15`: Follow assumes
+  the text went one way between two sightings `a` and `b`. A new property
+  test (600 scenes: a steady run at 40 to 300 px/s along x or y, one or two
+  workers, then one to four missed cycles between `a` and `b` in which the
+  text overshoots `b` and comes back, stops past `b`, turns back past `a`,
+  or jumps from `a` to `b`, back on its steady path by `b`) compares
+  following with holding every box where it was seen, against where the
+  text is. Overshoots and stops past `b` were uncovered on 55 frames that
+  holding covered (through the older boxes' own velocity prediction).
+  Fix: a box that moves with the run also keeps its own prediction, cut to
+  start at the back of `a`'s mask along the run, so no position behind `a`
+  is masked again. Text that turned back behind `a` stays uncovered on
+  1,011 of 148,151 compared frames: holding covered it only through the
+  positions the run left, which is the decoy blur Follow removes and the
+  trade the AGENTS.md exception makes. The test counts those frames and
+  fails any other; `docs/tracker.md` records the limit. A turn that the
+  next sighting sees breaks the run before those frames are released.
+  Staff review P3: `Follow` and `follow_measure` moved to `spg::detail` so
+  a table-driven test drives the run state on its own (13 rows). The
+  follow property test now checks 55,927 releases.
+- Main moved to `5de5ca6` (#95, one scan worker by default); merged in.
+  Eval on the merged head, same method through `run_eval.py` (default one
+  worker, and `--workers 2`), against main `5de5ca6` as #95 recorded it
+  (one worker; its two-worker plans are byte-identical to `630139a`). One
+  worker: CI decoy 0.4255 to 0.4099 (366/893), local 0.5284 to 0.4682
+  (2179/4654); CI 557/557, 15/15, 590/590, leak 0/285, clean 0; local
+  3996/3999, 51/53, 4158/4162, leak 7/1919, clean 0.002681 to 0.0019;
+  faces 2207/2207, leak 0/1080, clean 0, all as on main. Two workers: CI
+  0.4233 to 0.3751 (335/893; 0.3718 at `98a8c15`), local 0.5090 to
+  0.3846 (1790/4654; 0.3816 at `98a8c15`), local clean blur 0.0020, every
+  recall and leak count as at `98a8c15`. The prediction rule costs 3 CI
+  and 14 local decoys with two workers and none with one. The realtime
+  suite ran on a Mac shared with other agents (one worker: fail-closed
+  0.1407, p95 357 ms); it is not compared.
+- Threshold ask after cycle 3 (one worker, now the default):
+  `decoy_blur_rate_max` must be at least 0.4682 (local; CI 0.4099), so
+  0.47 would pass both modes. With two workers the floor is 0.3846.
