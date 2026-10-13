@@ -1798,6 +1798,64 @@ Template:
   O(n^3) worst case; fine offline in `spg-cli`, to revisit before any per-frame
   use in the plugin.
 
+## 2026-10-12 — SPG-18 Leak scrubber and live QA protocol
+
+- Decision / change: `spg-cli scrub --frames DIR --planted FILE` in
+  `cli/src/scrub.cpp` ([cli.md](cli.md#scrub)) and the finalized
+  [live-check.md](live-check.md), which folds in every live check left on
+  #19 (SPG-13 plugin load; SPG-15 watch-list buttons, scene collection grep,
+  `0600` files, duplicated filter; SPG-15b undo/redo and the crash-dump log
+  line; SPG-14 render path and blur cell sizes; SPG-14b detection; SPG-14c
+  VRAM budget and the 1 s rebuild retry; SPG-14d settings-change fill and
+  removing the filter mid-rebuild) as ordered parts A to F with expected
+  results and a record template. The live run stays `needs-human`.
+  Choices: (1) Matching reuses the policy engine: one `PolicyEngine` per
+  planted string, watch-list category only, so a hit names the string by its
+  1-based number and the text is never needed outside a `Secret`. No hashes:
+  a hash of a short known string can be guessed, a number cannot. (2) Default
+  sensitivity is the plugin's High (3 edits, 0.3, partials from 5), since a
+  leak check should err toward reporting; `--sensitivity normal` is
+  available. (3) Offline detector settings (`StageOptions::thorough`, scrub
+  only): tile overlap 320 px instead of 64, box threshold 0.3 instead of 0.5.
+  `run`, `eval` and `bench` are unchanged. (4) Exit 3 for a leak, distinct
+  from 1 (could not finish) so a script cannot read a failed scrub as clean;
+  any frame that fails to decode or scan stops the scrub. (5) No frame is
+  ever written (no debug option either: the flagged frames are the user's own
+  extracted PNGs, named in the report). (6) The ffmpeg command extracts at
+  the canvas rate with `-start_number 0`, so frame `i` is at `i / fps` s.
+- Evidence: automated. `scripts/ci/run.sh build` and `test` on the dev Mac
+  (376/376 passed). `tests/unit/scrub_test.cpp` (fake stages) and
+  `tests/integration/scrub_pipeline_test.cpp` (pinned models, CPU): nine
+  drawn 1280x720 frames with three made-up planted strings (20 px name line,
+  20 px card number, 56 px line). Sharp frames 0 and 8 were flagged with the
+  right numbers; frames masked by the CPU compositor (blur, pixelate), by an
+  emulation of the plugin's GPU effect using its own `mask_levels.cpp`
+  (Smooth, Blocks) with masks grown only from the ink (finer cells than the
+  plugin draws), and by both whole-source blurs were not flagged. The
+  detector found no text box at all over the masked lines (11 regions in 9
+  frames: the planted lines on sharp frames and the decoy). This is
+  synthetic evidence that the SPG-14 cell sizes defeat this OCR on these
+  sizes; it is not live evidence.
+- Review fixes (Claude staff review, Greptile): (1) a scrub that read no
+  text region at all prints `NOTHING CHECKED` and exits 1, never `PASS`; the
+  PASS line says scrub finds only what its OCR reads. (2) The planted file is
+  read into one buffer of its exact size (at most 1 MiB), so no reallocation
+  leaves an unwiped copy. (3) The progress callback runs inside the worker's
+  catch, so a throwing callback fails the scrub instead of terminating.
+  (4) The GPU emulation samples every mask from the untouched frame, as the
+  plugin does, and the name and card masks now overlap. (5) live-check A4
+  removes an entry before re-adding it (a duplicate is refused), and the
+  positive control uses its own frame folder and report. `run.sh build` and
+  `test`: 378/378 passed.
+- Eval delta: not affected (scrub is a new command; `run`/`eval`/`bench`
+  open the stages exactly as before).
+- Open issues or follow-ups: the live run and the human leak test (#19's
+  live part) need Ali. Scrub only reports what this OCR reads: the protocol
+  adds a positive control and a by-eye pass for faces and transitions; a
+  face check in scrub and an upscaled pass for very small text are possible
+  follow-ups. Speed: about 0.85 s of text detection per 720p frame per
+  worker on CPU, so a 30 s 1080p60 session takes tens of minutes.
+
 ## 2026-10-12 — SPG-08b Reject fail-open policy configs (#28)
 
 - Decision / change: `validate(PolicyConfig)` and `parse_policy_config` now
