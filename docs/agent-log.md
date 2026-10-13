@@ -1848,10 +1848,12 @@ Template:
   profile, main's `spg-cli` scored on the same generated suite): watch-list
   pair 0.998 (+0.002), first-frame 0.943 (+0.038, FAIL by one instance of
   53), PII pair 0.997 (+0.063), leak 0.0099 (-0.134, PASS), clean blur 0.0027
-  (=), decoy 0.509 (+0.006, FAIL). Faces: pair 0.992 (+0.046), leak 0.0157
-  (-0.095, PASS), clean blur 0 (=). Face detection now costs about 37 ms p50
-  per cycle on the dev Mac instead of 6.5 ms (9 model runs at 1080p); the
-  realtime suite stays SPG-16's (fail-closed 0.98, p95 812 ms in this run).
+  (=), decoy 0.509 (+0.006, FAIL). Faces: pair 0.9995 (+0.053), leak 0.0009
+  (-0.109, PASS), clean blur 0 (=); dropping a whole-frame box for a tile's
+  partial one instead of merging them as a hull left 0.992 and 0.016. Face
+  detection now costs about 37 ms p50 per cycle on the dev Mac instead of
+  6.5 ms (9 model runs at 1080p); the realtime suite stays SPG-16's
+  (fail-closed 0.96, p95 744 ms in this run; 0.97 and 988 ms before).
 - Open issues or follow-ups: first-frame recall misses (a) toasts whose
   ease-out slide is nearly over when a cycle first sees them, so a constant
   velocity measured 16 ms apart under-projects; (b) a partially typed entry
