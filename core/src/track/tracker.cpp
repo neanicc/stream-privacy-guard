@@ -477,20 +477,22 @@ const Tracker::Held* Tracker::follow_target(const TrackState& state, Timestamp t
 }
 
 // An older run detection is covered by `newest`'s mask instead of its own
-// only if `newest`'s box grown by its margin contains it moved to `newest`'s
-// frame time at every velocity between the run's lowest and highest
-// measurement. A newer detection that found only part of the text (clipped
-// within the size tolerance) so never releases a box that covered all of it:
-// the part it missed lies outside it, and the measurement it biased only
-// widens the range.
+// only if `newest`'s box grown by its margin contains the older box grown by
+// its own margin, moved to `newest`'s frame time at every velocity between
+// the run's lowest and highest measurement. The older mask's margin so moves
+// with it instead of being dropped. A newer detection that found only part
+// of the text (clipped within the size tolerance) never releases a box that
+// covered all of it: the part it missed lies outside it, and the measurement
+// it biased only widens the range.
 bool Tracker::followed(const TrackState& state, const Held* newest, const Held& held) noexcept {
   if (newest == nullptr || !held.followable || held.seen < state.run_from ||
       held.seen >= newest->seen) {
     return false;
   }
   return follow::contains_moved(
-      follow::Target{newest->box, newest->seen, newest->margin_x, newest->margin_y}, held.box,
-      held.seen, state.run_low, state.run_high);
+      follow::Detected{newest->box, newest->seen, newest->margin_x, newest->margin_y},
+      follow::Detected{held.box, held.seen, held.margin_x, held.margin_y}, state.run_low,
+      state.run_high);
 }
 
 std::vector<Box> Tracker::masks(Timestamp t) const {

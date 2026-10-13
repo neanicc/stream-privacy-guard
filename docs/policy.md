@@ -89,10 +89,11 @@ the box's smaller side, on every edge). The semantics since SPG-12b (#75):
    detection of the run was seen at or before `t`, provided the track was
    found again at or after `t`, no scan cycle has missed it since that
    older detection, and the newest detection at or before `t`, grown by its
-   margin, contains the older box moved along every speed the run measured.
-   On that frame that newest detection (with its prediction and margin) is
-   what covers the text; a newer detection that found only part of the line
-   never releases an older box that covered all of it. A run that replaces
+   margin, contains the older box grown by its own margin and moved along
+   every speed the run measured. On that frame that newest detection (with
+   its prediction and margin) is what covers the text, margin included; a
+   newer detection that found only part of the line, or a tighter box with a
+   smaller margin, never releases an older box that covered more. A run that replaces
    a broken one starts with its own first measured box, so a line moving the
    other way never takes over the box the old run ended on. This is
    what lets a scrolling chat line's old rows clear while the line is still

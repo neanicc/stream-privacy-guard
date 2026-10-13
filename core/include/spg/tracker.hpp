@@ -143,11 +143,14 @@ struct TrackMotion {
 //        track; a later detection of the run was seen in (td, t]; the track
 //        was confirmed at or after t; and the newest detection of the run
 //        seen at or before t, grown by its margin, contains this one's box
-//        moved to its frame time at every velocity between the run's lowest
-//        and highest measurement (per axis). Its coverage on t is then the
-//        mask of that newest detection, which is held as above. A newer
-//        detection that found only part of the text so never releases one
-//        that covered all of it.
+//        grown by its own margin and moved to its frame time at every
+//        velocity between the run's lowest and highest measurement (per
+//        axis). Its coverage on t is then the mask of that newest detection,
+//        which is held as above and contains this one's margin-grown box
+//        where the run moved it: following moves a detection's margin, never
+//        drops it. A newer detection that found only part of the text, or a
+//        tighter box with a smaller margin, so never releases one that
+//        covered more.
 //     6. Never followed. A late detection, a detection taken before a resize
 //        or a missed cycle, any detection of a track that is not confirmed
 //        moving, and anything on a frame time after the track's last

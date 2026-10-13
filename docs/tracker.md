@@ -45,7 +45,10 @@ hold, and the lines that scroll into those rows (decoys, filler) with them.
 SPG-12b measured these stale rects as about 30% of the decoys blurred on the
 local text suite and 27% in CI ([agent-log.md](agent-log.md)). Following
 lets those held boxes go while the track's newer detections pin where the
-text is.
+text is. Since the containment check moves each older box with its own
+margin, following releases almost nothing on the synthetic suites (their
+detector boxes jitter by a pixel or two, and measured speeds vary), so it
+does not lower `decoy_blur_rate` there; SPG-12d (#81) continues that work.
 
 - **Measurement.** Confirmations taken in frame order (not a late or
   same-frame result) are measured against the last measured box (the
@@ -85,11 +88,12 @@ text is.
   seen in `(seen, t]`, the track was confirmed at or after `t` (it is
   still being updated: a later scan found it again), and the **newest
   detection of the run seen at or before `t`, grown by its margin, contains
-  this detection's box moved to the newest one's frame time at every
-  velocity between the run's lowest and highest measurement** (per axis). A
-  followed detection adds no rect on `t`; the track's coverage there is the
-  mask of that newest detection, which holds as usual (its box, its
-  prediction hull and margin).
+  this detection's box grown by its own margin and moved to the newest one's
+  frame time at every velocity between the run's lowest and highest
+  measurement** (per axis). A followed detection adds no rect on `t`; the
+  track's coverage there is the mask of that newest detection, which holds
+  as usual (its box, its prediction hull and margin) and contains the older
+  detection's margin-grown box where the run moved it.
 - **Never followed:** a late detection (its place in the run was not
   measured), a detection taken before a `rescale()` (a resize also ends the
   run) or before a missed cycle, any detection of a track that is not
@@ -106,8 +110,10 @@ implementations follow it and change with it: the tracker
 checks in `core/src/track/follow.hpp`, unit-tested directly in
 `tests/unit/follow_test.cpp`), and the property test's oracle `may_follow`
 in `tests/unit/tracker_test.cpp`, which restates the order, resize, miss and
-run-length conditions from what the test delivered. Both carry a comment
-pointing here.
+run-length conditions from what the test delivered, and of the containment
+check the part that holds at any velocity: the newest detection at or
+before `t`, grown by its margin, is at least as wide and as tall as the
+followed one grown by its own. Both carry a comment pointing here.
 
 Why it does not uncover the text: on frame `t` the newest detection at or
 before `t` found the text at its box, and the run says the text kept moving
@@ -118,9 +124,16 @@ quarter the size check allows, keeps the run going, but the older full box
 moved along the run's motion sticks out of it, so the older box keeps its
 hold. The check uses the whole range of the run's measurements, not the
 latest one alone, because the clipped box also biases the measurement taken
-to it (its center moved by half the clip). That newest detection's mask (unmoved box, hull to its
-prediction) and the retroactive rects of the later confirmation (static and
-moved back, [scheduler.md](scheduler.md#masks)) still cover `t`, as before.
+to it (its center moved by half the clip). The older box is grown by its own margin before
+the check, so following moves the margin with the box and never drops it: a
+re-detection a few pixels tighter than the text (a smaller box, so a smaller
+margin) contains the older box but not its margin, and the older box keeps
+its hold. The cost is that boxes of equal size have equal margins, so a run
+whose measured speeds differ, or a newest box smaller than an older one,
+follows nothing; following then applies mainly to steady scrolls. That
+newest detection's mask (unmoved box, hull to its prediction) and the
+retroactive rects of the later confirmation (static and moved back,
+[scheduler.md](scheduler.md#masks)) still cover `t`, as before.
 Following does not touch retroactive rects or the SPG-12c trail.
 
 ### Run state

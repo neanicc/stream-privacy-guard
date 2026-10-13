@@ -710,13 +710,27 @@ TEST_CASE("tracker: only a consistent run of translations confirms a moving trac
   CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 492, 200, 60}}, config), 400, r0));
   // Speed changes more than twofold (20 px, then 45 px).
   CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 435, 200, 60}}, config), 400, r0));
-  // Within the ratio (20 px, then 35 px) it is consistent. An older box
-  // follows only if the newest box grown by its margin contains it moved at
-  // every speed between the run's measurements (100 to 175 px/s): with the
-  // default margins (19 px) box 0 does; with zero margins it still holds.
+  // Within the ratio (20 px, then 35 px) it is consistent: the run goes on
+  // and its range is 100 to 175 px/s. An older box follows only if the
+  // newest box grown by its margin contains it, grown by its own margin,
+  // moved at every speed in that range. Equal boxes have equal margins, so
+  // the 30 px spread keeps box 0 held with the default margins too.
   const std::vector<Rect> faster{r0, {100, 480, 200, 60}, {100, 445, 200, 60}};
-  CHECK_FALSE(still_held(*run(faster, TrackerConfig{}), 400, r0));
+  CHECK(still_held(*run(faster, TrackerConfig{}), 400, r0));
   CHECK(still_held(*run(faster, config), 400, r0));
+  // The run seen through a fourth box, 35 px on again (prediction cut to
+  // 150 ms, so box 1's mask does not reach box 2's rows on 600 ms and only
+  // box 2's own rect can hold it). Consistent: the range stays 100 to 175
+  // px/s and box 2 keeps its hold on 600 ms. With follow_speed_ratio 1.5 the
+  // 35 px step breaks the run, the new run measures 175 px/s only, and box 2
+  // follows into box 3, which is exactly where it moved.
+  TrackerConfig still = config;
+  still.max_prediction = milliseconds{150};
+  const std::vector<Rect> on{r0, {100, 480, 200, 60}, {100, 445, 200, 60}, {100, 410, 200, 60}};
+  CHECK(still_held(*run(on, still), 600, on[2]));
+  TrackerConfig strict = still;
+  strict.follow_speed_ratio = 1.5F;
+  CHECK_FALSE(still_held(*run(on, strict), 600, on[2]));
   // Axis change: up, then left.
   CHECK(still_held(*run({r0, {100, 480, 200, 60}, {80, 480, 200, 60}}, config), 400, r0));
   // The box changed size by more than a quarter (another line took the track).
@@ -750,8 +764,12 @@ TEST_CASE("tracker: two workers' close confirmations do not break the run", "[tr
   // Two workers scan frames 17 ms apart, then 200 ms later again. Over 17 ms
   // the line moves under 2 px, less than the box jitters, so those
   // confirmations are not measured; the 200 ms moves are, and confirm it.
-  // Default margins: the newest box's margin absorbs the jitter, so the
-  // older boxes moved along the measured motion fit in it and follow.
+  // Default margins. The older boxes no larger than the newest one, moved
+  // along the measured motion with their margins, fit in its mask and
+  // follow: box 2 (200 ms) and the 217 ms box are released, so the run went
+  // on. The 17 ms box is the tallest (62 px): grown by its margin it sticks
+  // out of the newest mask, so it keeps its hold (and still covers box 0,
+  // which it overlaps).
   Session session{TrackerConfig{}};
   const std::vector<std::pair<std::int64_t, Rect>> cycles{
       {0, {100.0F, 500.0F, 200.0F, 60.0F}},   {17, {100.0F, 499.0F, 200.0F, 62.0F}},
@@ -761,8 +779,9 @@ TEST_CASE("tracker: two workers' close confirmations do not break the run", "[tr
     session.deliver(ms, {text(box.x, box.y, box.width, box.height)});
   }
   REQUIRE(session.track_count() == 1);
-  CHECK_FALSE(session.holds(417, cycles[0].second));
+  CHECK(session.holds(417, cycles[1].second));
   CHECK_FALSE(session.holds(417, cycles[2].second));
+  CHECK_FALSE(session.holds(417, cycles[3].second));
   CHECK(session.holds(417, cycles[5].second));
 }
 
@@ -967,6 +986,47 @@ TEST_CASE("tracker: a clipped re-detection never releases a box that covered all
           // clear by 600 ms.
           CHECK_FALSE(session.covers(600, truth(0)));
         }
+      }
+    }
+  }
+}
+
+TEST_CASE("tracker: a tighter re-detection never drops the older box's margin", "[tracker]") {
+  // A 200 x 40 line scrolls up at 100 px/s (y = 500 - 0.1 t, t in ms) and is
+  // detected every 200 ms. On one cycle the detector's box is `k` px tighter
+  // on every side, centered on the text, so the run goes on at the same
+  // speed. Its margin (4 px + a quarter of its smaller side) is k / 2 px
+  // smaller than a full box's 14 px: its mask holds the older full boxes
+  // themselves, but not their margins. On every frame from 200 ms to the last
+  // detection, queried once the update that releases it has run, the masks
+  // still cover the line grown by a full box's margin (default margins):
+  // following moves an older box's margin with it, never drops it.
+  const auto truth = [](std::int64_t ms) {
+    const double y = 500.0 - 0.1 * static_cast<double>(ms);
+    return Region{100.0 - 14.0, y - 14.0, 300.0 + 14.0, y + 40.0 + 14.0};
+  };
+  const TrackerConfig config;
+  REQUIRE(config.follow_after == 2);
+  REQUIRE(required(Rect{100.0F, 500.0F, 200.0F, 40.0F}, config).y0 == 486.0);
+  for (const float k : {0.0F, 1.0F, 2.0F, 4.0F}) {
+    for (const int tight : {2, 3, 4}) {
+      INFO(k << " px tighter on cycle " << tight);
+      Session session(config);
+      for (int i = 0; i <= 6; ++i) {
+        const std::int64_t now = 200 * static_cast<std::int64_t>(i);
+        const float y = 500.0F - 20.0F * static_cast<float>(i);
+        const float in = i == tight ? k : 0.0F;
+        session.feed(now, {text(100.0F + in, y + in, 200.0F - 2.0F * in, 40.0F - 2.0F * in)});
+        REQUIRE(session.track_count() == 1);
+        for (std::int64_t t = std::max<std::int64_t>(200, now - 175); t <= now; t += 25) {
+          INFO("frame " << t);
+          CHECK(session.covers(t, truth(t)));
+        }
+      }
+      if (k == 0.0F && tight == 2) {
+        // Not vacuous: with full boxes only the track follows, so the first
+        // row is clear by 600 ms.
+        CHECK_FALSE(session.covers(600, Region{100.0, 500.0, 300.0, 540.0}));
       }
     }
   }
@@ -1203,7 +1263,12 @@ std::vector<Region> expected_regions(const Fed& fed, double sx, double sy,
 //     the track (each measures at most one step of the run);
 //   * its object was detected again later, at or before t: following never
 //     uncovers an object's newest detection, whichever track took it (tracks
-//     that swap objects or take over another object's line).
+//     that swap objects or take over another object's line);
+//   * the newest such later detection of its track at or before t (the one
+//     it is followed into), grown by its margin, is at least as wide and as
+//     tall as this detection grown by its own margin: the containment check
+//     moves the older box with its margin into the newer mask, so that mask
+//     must be at least that large on each axis.
 // Every other detection, including the newest one of each track at or before
 // t and every detection on frames after its track's last confirmation
 // (tracking loss), stays covered. Returns how many times a detection was
@@ -1265,8 +1330,10 @@ std::uint64_t run_hold_property(bool follow) {
     // and Tracker::followed() in core/src/track/tracker.cpp, with the checks in
     // core/src/track/follow.hpp) both implement docs/tracker.md ("Following").
     // The oracle stays independent on purpose: it is derived from what this
-    // test delivered, not from the tracker's run state. A rule change updates
-    // the doc, the tracker and this oracle together.
+    // test delivered, not from the tracker's run state. It cannot know the
+    // run's velocity range, so of the containment check it restates the part
+    // that holds at any velocity: the size of the margin-grown boxes. A rule
+    // change updates the doc, the tracker and this oracle together.
     const auto may_follow = [&fed, &last_miss, &config, follow](std::size_t i, Timestamp t) {
       const Fed& d = fed[i];
       if (!follow || d.before_resize || !d.in_order) {
@@ -1277,21 +1344,32 @@ std::uint64_t run_hold_property(bool follow) {
       if (missed > d.call) {
         return false;  // a cycle after it did not find its track
       }
-      bool later = false;
       bool updated = false;
       bool seen_again = false;
       std::size_t measured = 0;
+      const Fed* newest = nullptr;  // newest later in-order detection at or before t
       for (const Fed& f : fed) {
         seen_again = seen_again || (f.object == d.object && f.seen > d.seen && f.seen <= t);
         if (f.track != d.track) {
           continue;
         }
         const bool usable = f.in_order && !f.before_resize;
-        later = later || (usable && f.seen > d.seen && f.seen <= t);
+        if (usable && f.seen > d.seen && f.seen <= t &&
+            (newest == nullptr || f.seen > newest->seen)) {
+          newest = &f;
+        }
         updated = updated || f.seen >= t;
         measured += (usable && !f.first && f.call > missed) ? 1U : 0U;
       }
-      return later && updated && seen_again && measured >= config.follow_after;
+      if (newest == nullptr || !updated || !seen_again || measured < config.follow_after) {
+        return false;
+      }
+      // Margin-grown sizes; the slack only absorbs double rounding.
+      const Region older = required(d.box, config);
+      const Region into = required(newest->box, config);
+      constexpr double kSlack = 1e-9;
+      return older.x1 - older.x0 <= into.x1 - into.x0 + kSlack &&
+             older.y1 - older.y0 <= into.y1 - into.y0 + kSlack;
     };
 
     const int frames = scene.uniform_int(60, 200);
