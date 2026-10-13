@@ -110,7 +110,11 @@ telemetry without a plan change.
   frame a secret appears is covered even though detection took time.
 - **Temporal hold.** A blurred region stays blurred for at least the configured
   hold after its last detection, with margin. Tracking loss, a dropped frame or a
-  source resize can extend a mask, never shrink it early.
+  source resize can extend a mask, never shrink it early. One exception: while a
+  track confirmed as moving (a consistent run of measured translations) is still
+  being updated, its hold follows the track, so an older box is released on
+  frames where a newer detection of the same track already pins the text. On
+  frames after the track's last detection, every box is held where it was.
 - **Recall over precision.** When uncertain, blur. Over-blur is bounded by the
   clean-frame blur budget in `eval/thresholds.toml`; recall targets are not
   traded away for it.
