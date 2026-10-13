@@ -62,8 +62,8 @@ set_tests_properties(cli.version PROPERTIES
   PASS_REGULAR_EXPRESSION "^spg-cli ${PROJECT_VERSION}\r?\n$")
 add_test(NAME cli.help COMMAND spg-cli --help)
 set_tests_properties(cli.help PROPERTIES PASS_REGULAR_EXPRESSION "usage: spg-cli")
-# Commands without their required options, the unimplemented scrub and
-# unknown commands must exit non-zero.
+# Commands without their required options and unknown commands must exit
+# non-zero.
 foreach(command run bench eval scrub frobnicate)
   add_test(NAME cli.rejects-${command} COMMAND spg-cli ${command})
   set_tests_properties(cli.rejects-${command} PROPERTIES WILL_FAIL TRUE)
@@ -71,15 +71,21 @@ endforeach()
 add_test(NAME cli.rejects-no-arguments COMMAND spg-cli)
 set_tests_properties(cli.rejects-no-arguments PROPERTIES WILL_FAIL TRUE)
 
-# spg-cli commands and drivers (SPG-11), in process. The unit cases use fake
-# stages; the model case runs the pinned models and skips when they are not
-# cached. Frames are written under the build tree.
-add_executable(spg-cli-tests unit/cli_test.cpp)
+# spg-cli commands and drivers (SPG-11) and scrub (SPG-18), in process. The
+# unit cases use fake stages; the model cases run the pinned models and skip
+# when they are not cached. Frames are written under the build tree.
+add_executable(spg-cli-tests unit/cli_test.cpp unit/scrub_test.cpp)
 target_link_libraries(spg-cli-tests PRIVATE spg-cli-lib nlohmann_json::nlohmann_json Catch2::Catch2WithMain)
 target_include_directories(spg-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/unit")
 target_compile_definitions(spg-cli-tests PRIVATE SPG_CLI_TEST_DIR="${CMAKE_CURRENT_BINARY_DIR}/cli-tmp")
 if(SPG_WITH_DEPS)
-  target_sources(spg-cli-tests PRIVATE integration/cli_pipeline_test.cpp)
+  # The scrub case draws masks as the plugin's GPU effect does, with the
+  # plugin's own level choice (mask_levels.cpp is pure, no OBS).
+  target_sources(spg-cli-tests PRIVATE
+    integration/cli_pipeline_test.cpp
+    integration/scrub_pipeline_test.cpp
+    "${PROJECT_SOURCE_DIR}/plugin/src/pipeline/mask_levels.cpp")
+  target_include_directories(spg-cli-tests PRIVATE "${PROJECT_SOURCE_DIR}/plugin/src")
   target_link_libraries(spg-cli-tests PRIVATE spg::opencv)
   target_compile_definitions(spg-cli-tests PRIVATE SPG_CACHE_DIR="${SPG_CACHE_DIR}")
   spg_copy_runtime_dlls(spg-cli-tests)

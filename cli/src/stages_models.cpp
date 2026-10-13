@@ -88,8 +88,13 @@ OpenedStages open_stages(const ModelPaths& models, const PolicyConfig& policy, c
       out.stages.faces = std::make_shared<OwningDetector<detect::FaceDetector>>(env, faces);
     }
     if (any_text(policy.categories)) {
+      detect::TextDetectorConfig text_config;
+      if (options.thorough) {
+        text_config.tile_overlap = text_config.tile_size / 2;
+        text_config.db.box_threshold = text_config.db.bin_threshold;
+      }
       auto text = std::make_shared<const detect::TextDetector>(
-          detect::TextDetector::open(*env, models.text_detector, {}, session));
+          detect::TextDetector::open(*env, models.text_detector, text_config, session));
       out.providers += "text_detect=" + provider_name(text->session()) + " ";
       out.stages.text = std::make_shared<OwningDetector<detect::TextDetector>>(env, text);
       auto rec = std::make_shared<const ocr::TextRecognizer>(

@@ -1,5 +1,5 @@
-// spg-cli entry point: drives spg-core on PNG sequences (SPG-11). Commands
-// live in commands.cpp; `scrub` is SPG-18 and still exits non-zero.
+// spg-cli entry point: drives spg-core on PNG sequences (SPG-11) and scrubs
+// recorded sessions for leaks (SPG-18). Commands live in commands.cpp.
 #include <cstddef>
 #include <iostream>
 #include <span>
