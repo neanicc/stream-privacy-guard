@@ -275,6 +275,18 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
               : TrackMotion{Velocity{}, state.first_seen, false, state.track.id};
     }
   }
+  // A cycle that did not find a track is a miss: the text may not be where
+  // the track says. The run ends and nothing the track held so far is ever
+  // followed, so a later confirmation cannot follow boxes across the miss.
+  for (std::size_t ti = 0; ti < track_taken.size(); ++ti) {
+    if (!track_taken[ti]) {
+      TrackState& state = tracks_[ti];
+      state.run = 0;
+      for (Held& held : state.held) {
+        held.followable = false;
+      }
+    }
+  }
 
   for (std::size_t di = 0; di < detections.size(); ++di) {
     if (detection_taken[di]) {
@@ -365,6 +377,14 @@ void Tracker::measure_run(TrackState& state, Timestamp frame_time, const Rect& b
   if (std::max(std::abs(dx), std::abs(dy)) < static_cast<double>(config_.follow_min_move)) {
     // Too close to the last measured box to tell motion from detection
     // jitter (two workers can scan frames a few ms apart): not measured yet.
+    // A track that has not measurably moved for longer than the hold has
+    // stopped: the run ends, and the next one starts from this box, so what
+    // it held while still is never followed.
+    if (frame_time - state.anchor_time > config_.hold) {
+      state.run = 0;
+      state.anchor = box;
+      state.anchor_time = frame_time;
+    }
     return;
   }
   const double dt = seconds(frame_time - state.anchor_time);

@@ -47,8 +47,8 @@ struct TrackerConfig {
   // taken in frame order) were consistent: see Tracker for the rule. While a
   // confirmed track is still being updated, the hold of an older detection
   // follows the track instead of keeping the box where it was. 0 turns
-  // following off:
-  // every detection then holds where it was found, as before SPG-12b.
+  // following off: every detection then holds where it was found, as before
+  // SPG-12b.
   std::size_t follow_after = 2;
   // A consistent measurement moves at a speed, along the axis and in the
   // direction of the one before it, within this factor of that one's speed
@@ -57,7 +57,9 @@ struct TrackerConfig {
   // A confirmation is measured only once its box center has moved at least
   // this far (Source pixels, along either axis) from the last measured box;
   // closer ones (two workers can scan frames a few ms apart, where detection
-  // jitter outweighs motion) neither extend nor break the run. At least 1.
+  // jitter outweighs motion) neither extend nor break the run, unless the
+  // last measurement is more than the hold old (the track stopped: the run
+  // ends). At least 1.
   float follow_min_move = 4.0F;
 
   // Hold, margin and retention (lookahead) from `policy`; the rest default.
@@ -70,8 +72,8 @@ struct TrackerConfig {
 // negative duration, a negative or non-finite margin, an IoU threshold
 // outside (0, 1], a smoothing weight outside (0, 1], a
 // max_rects_per_track outside [1, 64], a follow_after above 64, or a
-// follow_speed_ratio or follow_min_move below 1 or not finite. A zero hold or margin
-// is accepted here; whether to impose a floor is #28 (SPG-08b).
+// follow_speed_ratio or follow_min_move below 1 or not finite. A zero hold
+// or margin is accepted here; whether to impose a floor is #28 (SPG-08b).
 void validate(const TrackerConfig& config);
 
 // What Tracker::update() reports for one detection: the track it joined,
@@ -122,18 +124,23 @@ struct TrackMotion {
 //     height differs by more than a quarter from the last measured box ends
 //     the run, as does an inconsistent measurement that is not a translation;
 //     a translation that does not continue the run starts a new one. A
-//     track whose last follow_after measurements form one consistent run is
-//     confirmed moving. A detection
-//     of such a track is followed on frame time t when all of these hold:
-//     it was taken in frame order at or after the confirmation the run
-//     started from; a later detection of the same run was seen in (td, t];
-//     and the track was confirmed at or after t. Its coverage on t is then the
-//     track's: the mask of the newest detection of the run seen at or before
-//     t, which is held as above. Nothing is followed on frame times after the
-//     track's last confirmation (tracking lost, or not updated yet), and a
-//     late detection, a detection taken before a resize and any detection of
-//     a track that is not confirmed moving are never followed. With
-//     follow_after 0 nothing is ever followed.
+//     confirmation that is not measured more than the hold after the last
+//     measurement ends the run (the track stopped), and the next run starts
+//     from it. A track whose last follow_after measurements form one
+//     consistent run is confirmed moving. A detection of such a track is
+//     followed on frame time t when all of these hold: it was taken in frame
+//     order at or after the confirmation the run started from; no update()
+//     since it missed the track; a later detection of the same run was seen
+//     in (td, t]; and the track was confirmed at or after t. Its coverage on
+//     t is then the track's: the mask of the newest detection of the run
+//     seen at or before t, which is held as above. An update() that does not
+//     find a track (a missed cycle, in or out of frame order) ends its run,
+//     and no detection the track held before it is ever followed. Nothing is
+//     followed on frame times after the track's last confirmation (tracking
+//     lost, or not updated yet), and a late detection, a detection taken
+//     before a resize and any detection of a track that is not confirmed
+//     moving are never followed. With follow_after 0 nothing is ever
+//     followed.
 //   * Updates only add: masks(t) after update() contains every rect masks(t)
 //     returned before, for any t the retention still covers, except the rects
 //     of detections the update made followed on t.
@@ -205,7 +212,8 @@ class Tracker {
   struct Held {
     Rect box;
     Timestamp seen{};
-    // Taken in frame order (not late) since the last resize: may be followed.
+    // Taken in frame order (not late) since the last resize, and no update()
+    // has missed its track since: may be followed.
     bool followable = false;
     Velocity low;
     Velocity high;

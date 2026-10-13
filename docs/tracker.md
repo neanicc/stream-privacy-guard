@@ -42,8 +42,9 @@ A text line that scrolls keeps moving after each detection. Held where it was
 found, each detection would keep the rows the line left blurred for the whole
 hold, and the lines that scroll into those rows (decoys, filler) with them.
 SPG-12b measured these stale rects as about 30% of the decoys blurred on the
-local text suite and 27% in CI ([agent-log.md](agent-log.md)). Following lets those held boxes
-go while the track's newer detections pin where the text is.
+local text suite and 27% in CI ([agent-log.md](agent-log.md)). Following
+lets those held boxes go while the track's newer detections pin where the
+text is.
 
 - **Measurement.** Confirmations taken in frame order (not a late or
   same-frame result) are measured against the last measured box (the
@@ -61,12 +62,22 @@ go while the track's newer detections pin where the text is.
   (2) starts a new run from the box it was measured from; one that fails (1)
   ends the run. A confirmation whose width or height differs by more than a
   quarter from the last measured box also ends the run (another line that
-  takes over the track usually has another size).
+  takes over the track usually has another size), and so does a confirmation
+  that is not measured more than `hold` after the last measurement (the
+  track stopped); the next run is then measured from that confirmation, so
+  nothing held while the track stood still is followed.
+- **Missed cycle.** An `update()` that does not find a track (a scan cycle
+  that missed it, in or out of frame order, or matched its text to another
+  track) ends the track's run, and no detection the track held at that point
+  is ever followed. A later confirmation can confirm a new run, but it only
+  follows detections taken after the miss, so it never follows boxes across
+  a gap in which a scan did not see the text.
 - **Confirmed moving.** The track's last `follow_after` (default 2, so three
   detections) measurements form one run.
 - **Followed.** A held detection of a confirmed moving track is followed on
   frame time `t` when it was taken in frame order at or after the
-  confirmation the run started from, a later detection of the same run was
+  confirmation the run started from, no cycle has missed the track since it
+  was taken, a later detection of the same run was
   seen in `(seen, t]`, and the track was confirmed at or after `t` (it is
   still being updated: a later scan found it again). A followed detection adds
   no rect on `t`; the track's coverage there is the mask of the newest
@@ -74,9 +85,11 @@ go while the track's newer detections pin where the text is.
   its prediction hull and margin).
 - **Never followed:** a late detection (its place in the run was not
   measured), a detection taken before a `rescale()` (a resize also ends the
-  run), any detection of a track that is not confirmed moving, and anything on
-  a frame time after the track's last confirmation. So tracking loss, a missed
-  cycle or a resize keeps every box held where it was, for its whole hold.
+  run) or before a missed cycle, any detection of a track that is not
+  confirmed moving, and anything on a frame time after the track's last
+  confirmation. So tracking loss, a missed cycle or a resize keeps every box
+  held where it was, for its whole hold, even after the track is found
+  again.
 - `follow_after = 0` turns following off.
 
 Why it does not uncover the text: on frame `t` the newest detection at or
@@ -96,7 +109,7 @@ where it is followed. These properties follow and are tested:
 | Property | Statement |
 | --- | --- |
 | Hold | A detection with box `b` on frame time `td` is covered, grown by the margin, on every frame time in `[td, td + hold]` on which it is not followed. With following off: whatever arrives later. |
-| Following | A detection may be followed on `t` only when it was taken in frame order after any resize, a later in-order detection of its track was seen in `(td, t]` and the track was confirmed at or after `t`. The newest detection of a track at or before `t` always holds. |
+| Following | A detection may be followed on `t` only when it was taken in frame order after any resize, no `update()` since missed its track, a later in-order detection of its track was seen in `(td, t]`, the track was confirmed at or after `t`, and the track has had at least `follow_after` in-order confirmations since its last resize and miss. The newest detection of a track at or before `t` always holds. |
 | Monotone in frame time (following off) | Between `t` and `t'`, if no detection active at `t` reaches its hold expiry before `t'`, every rect of `masks(t)` lies inside a rect of `masks(t')`. |
 | Updates only add | `update()` and `rescale()` never remove coverage from `masks(t)` for any frame time still in the lookahead buffer, except the rects of detections an update made followed on `t`. `rescale()` never does. |
 | Resize keeps scaled coverage | After `rescale()`, every rect `masks(t)` returned before is covered both as it was and scaled to the new size. |
@@ -113,14 +126,20 @@ so every comparison is between non-empty masks. Unit cases cover association,
 prediction, expiry, pruning, validation, resize (including a 2x upscale and two
 chained resizes) and a 60 s hold with 600 held detections. The same 2000 scenes
 run again with following on (random `follow_after` 1 to 3, speed ratio 1 to 3
-and minimum move 1 to 8 px): every detection that may not be followed by the rule in the table stays
-covered, and the scenes do follow some. Unit cases cover the rule: one
+and minimum move 1 to 8 px): every detection that may not be followed by the
+rule in the table stays covered, and the scenes do follow some. That rule is
+derived in the test from what was delivered (order, resize, misses and the
+count of confirmations), not from the tracker's run state; whether a box
+belongs to the current run needs the measurement rule itself, so unit cases
+pin it. Unit cases cover the rule: one
 measurement does not confirm, a reversal, an axis change, a more than twofold
 speed change, a size change over a quarter, growth in place, a sub-pixel shift
 and a drift under the minimum move do not either, two workers' confirmations
-17 ms apart do not break a run, a restarted run follows only from where it restarted, and
-late detections, boxes from before a resize and frames after the last
-confirmation keep their hold.
+17 ms apart do not break a run, a restarted run follows only from where it
+restarted, a missed cycle keeps the full hold of every earlier box after the
+track is found again, a track that stood still for longer than the hold
+starts a new run, and late detections, boxes from before a resize and frames
+after the last confirmation keep their hold.
 
 ## Association and motion
 

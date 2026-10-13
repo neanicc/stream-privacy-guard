@@ -2124,6 +2124,17 @@ Template:
   resize, unconfirmed tracks and frames after the last confirmation keep the
   old hold. Retroactive rects and the SPG-12c trail are unchanged.
   `TrackMotion` also reports the track id.
+- Review fixes (Greptile P1, staff-review P2s on `43f30bd`): a cycle that
+  does not find a track (a missed scan) ends its run and makes every box it
+  held then unfollowable, so a later confirmation can no longer follow boxes
+  across the miss (before, an empty cycle at 500 ms followed by a find at
+  600 ms released the 0 and 200 ms boxes on the 500 ms frame). A track whose
+  confirmations have not moved `follow_min_move` for longer than the hold
+  ends its run, and the next run starts from that confirmation, so a stopped
+  track cannot carry a stale run into a takeover. The following-on property
+  test now derives misses and the confirmation count from what it delivered,
+  not from tracker state; removing the confirmation guard or the miss reset
+  each makes it fail. AGENTS.md wording: #82 (`needs-human`).
 - Rejected with evidence: measuring each confirmation against the previous
   one. The eval's two workers confirm frames 17 ms apart, where a chat line
   moves under 2 px and the box jitters 1-2 px, so almost every pair broke the
@@ -2140,7 +2151,9 @@ Template:
   - Local text: decoy 0.5092 -> 0.3797 (2370 -> 1767, still FAIL);
     watch-list pair 0.9992 (3996/3999), first-frame 51/53, PII pair 0.9990
     (4158/4162), leak 7/1919: identical, and the same (frame, instance)
-    pairs are covered; clean blur 0.0027 -> 0.0019.
+    pairs are covered; clean blur 0.0027 -> 0.0019. With the review fixes:
+    decoy 0.3842 (1788; 21 more pairs held across misses), everything else
+    identical; CI text unchanged at 0.3404 (304).
   - Local faces: identical (pair 0.9995, leak 1/1080, clean 0).
   - Realtime (dev Mac under heavy load from other processes, not reliable):
     fail-closed 0.9978 main vs 1.0000 head in the `run_eval` pair, then
@@ -2150,13 +2163,15 @@ Template:
     stage time.
 - Floor and what a threshold change would need: with this change and
   today's margin and retroactive rects, decoy is 0.3797 locally and 0.3404 in
-  CI. The rest is the newest box's own unmoved part and margin, and the
-  static retroactive rect of a moving line, which covers the line above
-  where the secret will be. Passing on this head needs
-  `decoy_blur_rate_max` of at least 0.38 (local) and 0.35 (CI), a human
+  CI (0.3842 locally with the review fixes). The rest is the newest box's
+  own unmoved part and margin, and the static retroactive rect of a moving
+  line, which covers the line above where the secret will be. Passing on
+  this head needs `decoy_blur_rate_max` of at least 0.39 (local) and 0.35
+  (CI), a human
   change to `eval/thresholds.toml` (option 2 on #75). Lower decoy without a
   threshold change needs a decision on the margin (policy default) or on
   retroactive rects for confirmed moving tracks; both measured above.
 - Open issues or follow-ups: AGENTS.md's "Temporal hold" bullet still says a
-  mask never shrinks early; a wording change goes in a separate
-  `needs-human` PR. Synthetic eval only; live OBS not tested.
+  mask never shrinks early; the wording change is #82 (`needs-human`).
+  `decoy_blur_rate` continues in SPG-12d #81. Synthetic eval only; live OBS
+  not tested.

@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -769,6 +771,79 @@ TEST_CASE("tracker: late detections and boxes from before a resize are never fol
   CHECK(covered(resized.masks(at_ms(1200)), required(scrolled(6).box.rect, config)));
 }
 
+TEST_CASE("tracker: a missed cycle ends the run and keeps the full hold", "[tracker]") {
+  // A 200 x 40 line scrolls up 20 px per 200 ms cycle and is confirmed
+  // moving; the cycle at 500 ms finds nothing; the line is found again at
+  // 600 ms. The boxes held before the miss keep their whole hold, also on the
+  // missed frame once the later confirmation arrives (default margins).
+  ManualClock clock;
+  const TrackerConfig config;
+  REQUIRE(config.follow_after == 2);
+  Tracker tracker(clock, config);
+  const auto line = [](float y) { return text(100.0F, y, 200.0F, 40.0F); };
+  const auto feed = [&](std::int64_t ms, const std::vector<Detection>& found) {
+    clock.set(at_ms(ms));
+    tracker.update(at_ms(ms), found);
+  };
+  const auto holds = [&](std::int64_t ms, float y) {
+    return covered(tracker.masks(at_ms(ms)), required(line(y).box.rect, config));
+  };
+  feed(0, {line(500.0F)});
+  feed(200, {line(480.0F)});
+  feed(400, {line(460.0F)});
+  REQUIRE_FALSE(holds(400, 500.0F));  // confirmed: box 0 follows
+  feed(500, {});                      // missed
+  feed(600, {line(440.0F)});
+  REQUIRE(tracker.tracks().size() == 1);
+  for (const std::int64_t ms : {400, 500, 600, 750}) {
+    INFO("frame " << ms);
+    CHECK(holds(ms, 500.0F));
+    CHECK(holds(ms, 480.0F));
+    CHECK(holds(ms, 460.0F));
+  }
+  CHECK(holds(600, 440.0F));
+
+  // A new run after the miss follows only the boxes found after it.
+  feed(800, {line(420.0F)});
+  feed(1000, {line(400.0F)});
+  CHECK(holds(1000, 460.0F));  // held before the miss: whole hold
+  CHECK(holds(1150, 460.0F));
+  // Found after the miss: follows once the box from 400 ms (whose prediction
+  // also covers it) has expired.
+  feed(1200, {line(380.0F)});
+  CHECK_FALSE(holds(1200, 440.0F));
+}
+
+TEST_CASE("tracker: a track that stops for longer than the hold ends its run", "[tracker]") {
+  // A tall box is confirmed moving up 20 px per 200 ms, then stays put
+  // (confirmations under follow_min_move are not measured) for longer than
+  // the hold. A box that then takes the track at a consistent speed from the
+  // last measured one does not continue the old run, so the boxes held where
+  // the track stood keep their hold.
+  ManualClock clock;
+  const TrackerConfig config = exact_follow_config();
+  Tracker tracker(clock, config);
+  const auto box = [](float y) { return text(100.0F, y, 200.0F, 300.0F); };
+  const auto feed = [&](std::int64_t ms, float y) {
+    clock.set(at_ms(ms));
+    tracker.update(at_ms(ms), std::vector<Detection>{box(y)});
+  };
+  const auto holds = [&](std::int64_t ms, float y) {
+    return covered(tracker.masks(at_ms(ms)), required(box(y).box.rect, config));
+  };
+  feed(0, 500.0F);
+  feed(200, 480.0F);
+  feed(400, 460.0F);
+  REQUIRE_FALSE(holds(400, 500.0F));  // confirmed moving
+  feed(800, 460.0F);                  // still: 400 ms since the last measurement
+  feed(1200, 460.0F);                 // still for 800 ms, past the 750 ms hold
+  // 80 px up in 1 s from the box measured at 400 ms would continue the old
+  // run (100 px/s, then 80 px/s); it is measured from the 1200 ms box instead.
+  feed(1400, 380.0F);
+  REQUIRE(tracker.tracks().size() == 1);
+  CHECK(holds(1400, 460.0F));  // the boxes from 800 and 1200 ms
+}
+
 // --- Property tests --------------------------------------------------------
 //
 // Seeded random scenes: several objects of both kinds moving at constant or
@@ -786,6 +861,10 @@ struct Fed {
   spg::TrackId track = 0;
   // Seen after every earlier detection of its track: taken in frame order.
   bool in_order = false;
+  // The update() call that delivered it (counted from 1), and whether it
+  // started its track (a new track: no motion measured).
+  std::size_t call = 0;
+  bool first = false;
 };
 
 struct Object {
@@ -864,13 +943,20 @@ std::vector<Region> expected_regions(const Fed& fed, double sx, double sy,
 // With `follow` false, following is off and the strict SPG-09 properties
 // hold: every detection is covered for its whole hold, updates only add and
 // masks only grow in frame time. With `follow` true (random follow_after,
-// speed ratio and minimum move), a detection may lose its own rect on frame t only when it
-// could be followed, which needs at least: taken in frame order, after any
-// resize, a later in-order detection of the same track seen in (seen, t], and
-// the track confirmed at or after t. Every other detection, including the
-// newest one of each track at or before t and every detection on frames after
-// its track's last confirmation (tracking loss), stays covered. Returns how
-// many times a detection was found followed (not covered).
+// speed ratio and minimum move), a detection may lose its own rect on frame t
+// only when it could be followed. Derived here from what was delivered, not
+// from the tracker's run state, that needs at least:
+//   * it was taken in frame order, after any resize;
+//   * no later update() missed its track (a cycle that did not find it);
+//   * a later in-order detection of the same track was seen in (seen, t];
+//   * the track was confirmed at or after t;
+//   * the track can be confirmed moving: at least follow_after in-order
+//     detections after any resize and after its last miss that did not start
+//     the track (each measures at most one step of the run).
+// Every other detection, including the newest one of each track at or before
+// t and every detection on frames after its track's last confirmation
+// (tracking loss), stays covered. Returns how many times a detection was
+// found followed (not covered).
 std::uint64_t run_hold_property(bool follow) {
   constexpr std::uint32_t kScenes = 2000;
   constexpr std::int64_t kFrameNs = 16'666'667;  // 60 fps
@@ -892,29 +978,57 @@ std::uint64_t run_hold_property(bool follow) {
     std::vector<Fed> fed;
     std::vector<std::pair<Timestamp, std::vector<Detection>>> late;
     std::vector<spg::TrackMotion> motions;
-    const auto record = [&fed](const Rect& box, Timestamp when, spg::TrackId track) {
-      bool in_order = true;
-      for (const Fed& f : fed) {
-        in_order = in_order && (f.track != track || f.seen < when);
+    std::size_t calls = 0;
+    // The last update() call that did not find each track seen before it.
+    std::map<spg::TrackId, std::size_t> last_miss;
+    // Records the detections of the update() just made with `batch`.
+    const auto record = [&](const std::vector<Detection>& batch, Timestamp when) {
+      REQUIRE(motions.size() == batch.size());
+      ++calls;
+      std::set<spg::TrackId> found;
+      for (std::size_t k = 0; k < batch.size(); ++k) {
+        const spg::TrackId track = motions[k].track;
+        found.insert(track);
+        bool in_order = true;
+        bool first = true;
+        for (const Fed& f : fed) {
+          if (f.track == track) {
+            first = false;
+            in_order = in_order && f.seen < when;
+          }
+        }
+        fed.push_back(Fed{batch[k].box.rect, when, false, track, in_order, calls, first});
       }
-      fed.push_back(Fed{box, when, false, track, in_order});
+      for (const Fed& f : fed) {
+        if (f.call < calls && found.count(f.track) == 0) {
+          last_miss[f.track] = calls;
+        }
+      }
     };
     // Whether the hold may let detection i go on frame t (see above).
-    const auto may_follow = [&fed, follow](std::size_t i, Timestamp t) {
+    const auto may_follow = [&fed, &last_miss, &config, follow](std::size_t i, Timestamp t) {
       const Fed& d = fed[i];
       if (!follow || d.before_resize || !d.in_order) {
         return false;
       }
+      const auto miss = last_miss.find(d.track);
+      const std::size_t missed = miss == last_miss.end() ? 0 : miss->second;
+      if (missed > d.call) {
+        return false;  // a cycle after it did not find its track
+      }
       bool later = false;
       bool updated = false;
+      std::size_t measured = 0;
       for (const Fed& f : fed) {
         if (f.track != d.track) {
           continue;
         }
-        later = later || (f.in_order && !f.before_resize && f.seen > d.seen && f.seen <= t);
+        const bool usable = f.in_order && !f.before_resize;
+        later = later || (usable && f.seen > d.seen && f.seen <= t);
         updated = updated || f.seen >= t;
+        measured += (usable && !f.first && f.call > missed) ? 1U : 0U;
       }
-      return later && updated;
+      return later && updated && measured >= config.follow_after;
     };
 
     const int frames = scene.uniform_int(60, 200);
@@ -941,9 +1055,7 @@ std::uint64_t run_hold_property(bool follow) {
         // before the resize (the scheduler owns what happens otherwise).
         for (const auto& [when, batch] : late) {
           tracker.update(when, batch, &motions);
-          for (std::size_t k = 0; k < batch.size(); ++k) {
-            record(batch[k].box.rect, when, motions[k].track);
-          }
+          record(batch, when);
         }
         late.clear();
         // Snapshot masks a lookahead's worth of frames back, resize, compare.
@@ -1028,11 +1140,8 @@ std::uint64_t run_hold_property(bool follow) {
           INFO("update at frame " << f << ", probe " << k);
           REQUIRE(no_shrink(before[k], tracker.masks(probes[k])));
         }
-        REQUIRE(motions.size() == batch.size());
-        for (std::size_t k = 0; k < batch.size(); ++k) {
-          record(batch[k].box.rect, when, motions[k].track);
-          fed_fresh = fed_fresh || when == frame_time;
-        }
+        record(batch, when);
+        fed_fresh = fed_fresh || (!batch.empty() && when == frame_time);
       }
 
       // Hold: every detection is covered, grown by the margin, on every frame

@@ -81,27 +81,34 @@ the box's smaller side, on every edge). The semantics since SPG-12b (#75):
    track's velocity (up to 500 ms ahead), as the hull of both.
 2. **Following a confirmed moving track.** A track's detections taken in
    frame order are measured once the box has moved at least 4 px from the
-   last measured box. When the last two measurements each moved the whole box
-   at least one pixel, on one axis, in one direction, at speeds within a
+   last measured box. When the last two measurements each moved the whole
+   box at least one pixel, on one axis, in one direction, at speeds within a
    factor of two of each other, with no change of width or height over a
-   quarter in between, the track is confirmed moving. An older detection of that run is then not
-   held where it was on a frame `t` once a newer detection of the run was
-   seen at or before `t`, provided the track was found again at or after `t`.
-   On that frame the track's newest detection at or before `t` (with its
-   prediction and margin) is what covers the text. This is what lets a
-   scrolling chat line's old rows clear while the line is still tracked.
-3. **Tracking loss, resize, uncertainty.** On frames after a track's last
-   detection, for late detections, for boxes from before a source resize and
-   for any track not confirmed moving, every box is held where it was for its
-   whole hold. These can extend a mask, never shrink it early.
+   quarter in between, the track is confirmed moving. An older detection of
+   that run is then not held where it was on a frame `t` once a newer
+   detection of the run was seen at or before `t`, provided the track was
+   found again at or after `t` and no scan cycle has missed it since that
+   older detection. On that frame the track's newest detection at or before
+   `t` (with its prediction and margin) is what covers the text. This is
+   what lets a scrolling chat line's old rows clear while the line is still
+   tracked. A track that has not moved 4 px for longer than `hold_ms` is no
+   longer confirmed.
+3. **Tracking loss, missed cycles, resize, uncertainty.** On frames after a
+   track's last detection, for every box a track held when a scan cycle
+   missed it, for late detections, for boxes from before a source resize and
+   for any track not confirmed moving, every box is held where it was for
+   its whole hold. Outside following (2), nothing shrinks a mask before its
+   hold ends; each of these can only extend one.
 4. **Retroactive masks are unchanged.** A detection still masks the buffered
    frames before it within `retro_ms` (its box, the box moved back along the
    velocity, and the SPG-12c trail to the frame edge), whatever the hold does
    ([scheduler.md](scheduler.md#masks)).
 
 `follow_after`, `follow_speed_ratio` and `follow_min_move` in `TrackerConfig`
-set the run length, speed factor and minimum move; `follow_after = 0` turns following off. They are not policy
-settings yet.
+set the run length, speed factor and minimum move; `follow_after = 0` turns
+following off. They are not policy settings yet. The AGENTS.md "Temporal
+hold" invariant still reads "never shrink it early"; its wording for (2) is
+proposed in #82 (`needs-human`).
 
 ## Secrecy
 
