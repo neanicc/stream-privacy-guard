@@ -42,6 +42,7 @@ struct FuzzyLimits {
 // numeric matching and margin defaults are starting points for SPG-08/09 to
 // tune against the eval.
 struct PolicyConfig {
+  // Never empty: validate() rejects a config that enables no category.
   CategorySet categories = CategorySet::all();
   std::vector<Secret> watchlist;
   FuzzyLimits fuzzy;
@@ -57,14 +58,28 @@ struct PolicyConfig {
   friend bool operator==(const PolicyConfig&, const PolicyConfig&) = default;
 };
 
-// Limits enforced by validate() and the JSON parser.
+// Limits enforced by validate() and the JSON parser (docs/contracts.md and the
+// SPG-08b entry in docs/agent-log.md give the reasons). A zero lookahead, hold
+// or margin would switch that protection off, so each has a floor; there is
+// no opt-out. Margin caps reject typos (40000 for 4.0) and keep mask
+// arithmetic bounded. Margin bounds are exact in binary, so a JSON value at a
+// bound survives narrowing to float unchanged.
+inline constexpr std::chrono::milliseconds kMinLookahead{100};
 inline constexpr std::chrono::milliseconds kMaxLookahead{5000};
+inline constexpr std::chrono::milliseconds kMinRetro{100};  // and at most lookahead
+inline constexpr std::chrono::milliseconds kMinHold{400};
 inline constexpr std::chrono::milliseconds kMaxHold{60000};
+inline constexpr double kMinMarginPx = 2.0;
+inline constexpr double kMaxMarginPx = 256.0;
+inline constexpr double kMinMarginRatio = 0.125;
+inline constexpr double kMaxMarginRatio = 4.0;
 
 // Throws ContractError naming the offending field (and the watch-list index,
-// never its text) when a value is out of range or a watch-list entry is empty
-// or blank: only Unicode White_Space characters and the zero-width characters
-// U+200B..U+200D, U+2060 and U+FEFF.
+// never its text) when no category is enabled, a value is outside the limits
+// above, or a watch-list entry is empty or blank: only Unicode White_Space
+// characters and the zero-width characters U+200B..U+200D, U+2060 and U+FEFF.
+// A caller that gets this error has no valid policy and must fail closed
+// (apply the blur_source fallback), never run with detection off.
 void validate(const PolicyConfig& config);
 
 }  // namespace spg

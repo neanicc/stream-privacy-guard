@@ -1443,19 +1443,23 @@ TEST_CASE("from_policy carries the policy's timing, fallback and margins", "[sch
   spg::PolicyConfig policy;
   policy.lookahead = 800ms;
   policy.retro = 300ms;
-  policy.hold = 0ms;
+  policy.hold = 1200ms;
   policy.fallback = FallbackMode::SolidFill;
   policy.mask_style = spg::MaskStyle::SolidFill;
   policy.margin_px = 7.0F;
   policy.categories = spg::CategorySet{};
+  policy.categories.insert(spg::Category::Face);
+  // A config spg::validate accepts (SPG-08b floors): no empty category set,
+  // no hold below kMinHold.
+  REQUIRE_NOTHROW(spg::validate(policy));
   const SchedulerConfig config = SchedulerConfig::from_policy(policy);
   CHECK(config.lookahead == 800ms);
   CHECK(config.retro == 300ms);
-  CHECK(config.tracker.hold == 0ms);
+  CHECK(config.tracker.hold == 1200ms);
   CHECK(config.fallback == FallbackMode::SolidFill);
   CHECK(config.mask_style == spg::MaskStyle::SolidFill);
   CHECK(config.tracker.margin_px == 7.0F);
-  CHECK(config.scan.categories.empty());
+  CHECK(config.scan.categories == policy.categories);
 }
 
 TEST_CASE("recognized text and stage errors never reach output streams", "[schedule]") {

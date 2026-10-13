@@ -1,0 +1,25 @@
+# Policy configs every reader must reject (docs/contracts.md, SPG-08b).
+# One case per line: the field the error must name, a tab, then the document.
+# Floors keep lookahead, retroactive masking, hold and margins switched on;
+# caps reject typos. A value just past a bound that would round onto it when
+# narrowed to float must still be rejected.
+categories	{"schema": 1, "categories": []}
+lookahead_ms	{"schema": 1, "lookahead_ms": 0}
+lookahead_ms	{"schema": 1, "lookahead_ms": 99}
+lookahead_ms	{"schema": 1, "lookahead_ms": 5001}
+retro_ms	{"schema": 1, "retro_ms": 0}
+retro_ms	{"schema": 1, "retro_ms": 99}
+retro_ms	{"schema": 1, "lookahead_ms": 100, "retro_ms": 101}
+hold_ms	{"schema": 1, "hold_ms": 0}
+hold_ms	{"schema": 1, "hold_ms": 399}
+hold_ms	{"schema": 1, "hold_ms": 60001}
+margin_px	{"schema": 1, "margin_px": 0}
+margin_px	{"schema": 1, "margin_px": 1.5}
+margin_px	{"schema": 1, "margin_px": 1.9999999999}
+margin_px	{"schema": 1, "margin_px": 256.00000001}
+margin_px	{"schema": 1, "margin_px": 4000}
+margin_ratio	{"schema": 1, "margin_ratio": 0}
+margin_ratio	{"schema": 1, "margin_ratio": 0.1}
+margin_ratio	{"schema": 1, "margin_ratio": 0.124999999}
+margin_ratio	{"schema": 1, "margin_ratio": 4.0000001}
+margin_ratio	{"schema": 1, "margin_ratio": 25}

@@ -124,9 +124,17 @@ TEST_CASE("lookahead and hold from a scene file are clamped to safe ranges", "[s
   CHECK(clamp_hold_ms(kDefaultHoldMs) == kDefaultHoldMs);
   CHECK(clamp_hold_ms(LLONG_MAX) == kMaxHoldMs);
 
-  // A floor of zero would let a scene file switch the protection off.
+  // A scene file saved under the old 250 ms hold floor is raised to spg-core's.
+  CHECK(clamp_hold_ms(250) == kMinHoldMs);
+  CHECK(clamp_hold_ms(kMinHoldMs - 1) == kMinHoldMs);
+  CHECK(clamp_lookahead_ms(kMinLookaheadMs - 1) == kMinLookaheadMs);
+
+  // A floor of zero would let a scene file switch the protection off, and a
+  // floor below spg-core's would build a config it rejects (fail closed).
   STATIC_REQUIRE(kMinLookaheadMs > 0);
   STATIC_REQUIRE(kMinHoldMs > 0);
+  STATIC_REQUIRE(kMinLookaheadMs == kMinLookahead.count());
+  STATIC_REQUIRE(kMinHoldMs == kMinHold.count());
   STATIC_REQUIRE(kMinLookaheadMs <= kDefaultLookaheadMs && kDefaultLookaheadMs <= kMaxLookaheadMs);
   STATIC_REQUIRE(kMinHoldMs <= kDefaultHoldMs && kDefaultHoldMs <= kMaxHoldMs);
 }
@@ -210,6 +218,24 @@ TEST_CASE("settings become a valid PolicyConfig", "[settings]") {
     REQUIRE(make_policy_config(settings, {}, config) == FilterIssue::None);
     CHECK(config->lookahead == std::chrono::milliseconds{kMinLookaheadMs});
     CHECK(config->hold == std::chrono::milliseconds{kMinHoldMs});
+  }
+  SECTION("every lookahead and hold a slider or scene file can give is valid for spg-core") {
+    // Slider ends, the old 250 ms hold floor, and values past both ends.
+    const long long lookaheads[] = {LLONG_MIN, 0, kMinLookaheadMs, kDefaultLookaheadMs, kMaxLookaheadMs, LLONG_MAX};
+    const long long holds[] = {LLONG_MIN, 0, 250, kMinHoldMs, kDefaultHoldMs, kMaxHoldMs, LLONG_MAX};
+    for (const long long lookahead : lookaheads) {
+      for (const long long hold : holds) {
+        RawFilterSettings raw;
+        raw.lookahead_ms = lookahead;
+        raw.hold_ms = hold;
+        REQUIRE(make_policy_config(sanitize(raw), {}, config) == FilterIssue::None);
+        REQUIRE(config.has_value());
+        CHECK_NOTHROW(validate(*config));
+        CHECK(config->hold >= kMinHold);
+        CHECK(config->retro == config->lookahead);
+        CHECK(config->retro >= kMinRetro);
+      }
+    }
   }
   SECTION("every category off fails closed") {
     settings.categories = CategorySet{};

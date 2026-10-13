@@ -20,13 +20,15 @@ namespace spg::plugin {
 // Plan section 4 defaults and the ranges the properties offer. Values read
 // from a scene file are clamped into these ranges, so a hand-edited or older
 // file cannot switch a protection off: a lookahead or hold below the floor is
-// raised to the floor. The ceilings bound VRAM (lookahead frames are kept as
-// full-resolution textures, plan section 7) and are themselves safe values.
+// raised to the floor. The floors are spg-core's (SPG-08b), so every value the
+// sliders offer or a scene file can hold becomes a config validate() accepts.
+// The ceilings bound VRAM (lookahead frames are kept as full-resolution
+// textures, plan section 7) and are themselves safe values.
 inline constexpr long long kDefaultLookaheadMs = 500;
-inline constexpr long long kMinLookaheadMs = 100;
+inline constexpr long long kMinLookaheadMs = kMinLookahead.count();
 inline constexpr long long kMaxLookaheadMs = 2000;
 inline constexpr long long kDefaultHoldMs = 750;
-inline constexpr long long kMinHoldMs = 250;
+inline constexpr long long kMinHoldMs = kMinHold.count();
 inline constexpr long long kMaxHoldMs = 10000;
 // VRAM the lookahead ring may hold, in MiB (plan section 7: "expose the
 // limit"; SPG-14c). The default holds the default 500 ms lookahead at 1080p60
@@ -37,8 +39,14 @@ inline constexpr long long kDefaultVramBudgetMb = 512;
 inline constexpr long long kMinVramBudgetMb = 64;
 inline constexpr long long kMaxVramBudgetMb = 16384;
 
-static_assert(kMaxLookaheadMs <= kMaxLookahead.count(), "plugin lookahead must stay valid for spg-core");
-static_assert(kMaxHoldMs <= kMaxHold.count(), "plugin hold must stay valid for spg-core");
+static_assert(kMinLookaheadMs >= kMinLookahead.count() && kMaxLookaheadMs <= kMaxLookahead.count(),
+              "plugin lookahead must stay valid for spg-core");
+// The retroactive window equals the lookahead, so its floor follows.
+static_assert(kMinLookaheadMs >= kMinRetro.count(), "plugin retro must stay valid for spg-core");
+static_assert(kMinHoldMs >= kMinHold.count() && kMaxHoldMs <= kMaxHold.count(),
+              "plugin hold must stay valid for spg-core");
+static_assert(kMinLookaheadMs <= kDefaultLookaheadMs && kDefaultLookaheadMs <= kMaxLookaheadMs);
+static_assert(kMinHoldMs <= kDefaultHoldMs && kDefaultHoldMs <= kMaxHoldMs);
 
 [[nodiscard]] long long clamp_lookahead_ms(long long value) noexcept;
 [[nodiscard]] long long clamp_hold_ms(long long value) noexcept;

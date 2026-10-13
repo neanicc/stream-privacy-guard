@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "range_text.hpp"
 #include "spg/error.hpp"
 
 namespace spg {
@@ -295,17 +296,20 @@ PolicyConfig parse_policy_config(std::string_view json) {
     config.fuzzy.min_partial_chars = static_cast<std::uint32_t>(
         f.integer_or("min_partial_chars", 1, kUint32Max, config.fuzzy.min_partial_chars));
   }
-  config.lookahead = std::chrono::milliseconds{
-      r.integer_or("lookahead_ms", 0, kMaxLookahead.count(), config.lookahead.count())};
+  // Floors and caps: spg/policy_config.hpp. validate() below also rejects
+  // an empty "categories" and a retro_ms above lookahead_ms.
+  config.lookahead = std::chrono::milliseconds{r.integer_or(
+      "lookahead_ms", kMinLookahead.count(), kMaxLookahead.count(), config.lookahead.count())};
   // The retroactive window defaults to the whole lookahead (plan section 4).
-  config.retro = std::chrono::milliseconds{
-      r.integer_or("retro_ms", 0, kMaxLookahead.count(), config.lookahead.count())};
-  config.hold =
-      std::chrono::milliseconds{r.integer_or("hold_ms", 0, kMaxHold.count(), config.hold.count())};
-  config.margin_px =
-      r.float_number_or("margin_px", 0.0, kFloatMax, kNonNegativeFloat, config.margin_px);
+  config.retro = std::chrono::milliseconds{r.integer_or(
+      "retro_ms", kMinRetro.count(), kMaxLookahead.count(), config.lookahead.count())};
+  config.hold = std::chrono::milliseconds{
+      r.integer_or("hold_ms", kMinHold.count(), kMaxHold.count(), config.hold.count())};
+  config.margin_px = r.float_number_or("margin_px", kMinMarginPx, kMaxMarginPx,
+                                       detail::range_text(kMinMarginPx, kMaxMarginPx), config.margin_px);
   config.margin_ratio =
-      r.float_number_or("margin_ratio", 0.0, kFloatMax, kNonNegativeFloat, config.margin_ratio);
+      r.float_number_or("margin_ratio", kMinMarginRatio, kMaxMarginRatio,
+                        detail::range_text(kMinMarginRatio, kMaxMarginRatio), config.margin_ratio);
   if (r.find("fallback") != nullptr) {
     const std::optional<FallbackMode> mode = parse_fallback_mode(r.string("fallback"));
     if (!mode) {

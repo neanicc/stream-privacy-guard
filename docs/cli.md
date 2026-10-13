@@ -1,7 +1,8 @@
 # spg-cli and the CPU compositor
 
 SPG-11. `spg-cli` runs the whole pipeline (detectors, recognizer, policy,
-tracker, scheduler) on PNG frame sequences, with no OBS. The eval
+tracker, scheduler) on PNG frame sequences, with no OBS. SPG-18 adds
+`scrub`, the leak check for recorded sessions ([below](#scrub)). The eval
 ([eval.md](eval.md)) scores what it writes. Code: `cli/src/`,
 `core/include/spg/compose.hpp`, `core/src/compose/`.
 
@@ -12,15 +13,18 @@ tracker, scheduler) on PNG frame sequences, with no OBS. The eval
 | `run --frames DIR --policy FILE --out FILE [--fps N] [--timing FILE] [--write-frames DIR]` | One sequence (the `*.png` files in DIR, by name) through the simulated feed; writes one mask plan per frame as JSON Lines. `--write-frames` is a debug switch, off by default, that writes every composed frame. |
 | `eval --suite DIR --plans DIR [--timing FILE]` | Every sequence of a generated suite (`suite.json`, its `policy.json` and fps); writes `DIR/<sequence>/mask_plans.jsonl`. `eval/run_eval.py` calls this and scores the plans. Scoring stays in Python (`eval/spg_eval/scoring.py`), so there is one scorer. |
 | `bench (--frames DIR --policy FILE [--fps N] \| --suite DIR [--resolution WxH]) [--realtime] [--out FILE \| --plans DIR] [--report FILE]` | Stage latency, detection latency and the fail-closed rate. Without `--realtime`: the simulated feed with each cycle taking its measured time, and the CPU compositor on every frame. With `--realtime`: the plugin's threaded scheduler on the wall clock. |
-| `scrub` | SPG-18; exits 2. |
+| `scrub --frames DIR --planted FILE [--fps N] [--report FILE] [--sensitivity normal\|high]` | Every frame of a recorded session (the `*.png` files in DIR, by name) through the text detector and recognizer; reports each region whose text matches a planted string. Exits 3 when any does. See [Scrub](#scrub). |
 
 Pipeline options: `--cache DIR` (models; default `$SPG_CACHE_DIR`, else
 `~/.cache/spg`), `--cpu` (CPU execution provider only; default is the
 platform order with CPU fallback, CoreML on macOS), `--readback-scale S`
-(default 1), `--workers N` (default 2), `--cycle-ms MS` (`run` and `eval`
-only, default 200). Exit codes: 0 done, 1 failed (a missing model, an
+(default 1; not `scrub`), `--workers N` (default 2; for `scrub` the frames
+scanned at once), `--cycle-ms MS` (`run` and `eval` only, default 200). Exit
+codes: 0 done (for `scrub`: no leak), 1 failed (a missing model, an
 unreadable frame, a suite whose frame count or frame size disagrees with
-`suite.json`), 2 usage. Output, plans and reports hold counts and timings
+`suite.json`, a policy file outside the limits in
+[contracts.md](contracts.md#policy-config), which writes no plans), 2 usage,
+3 `scrub` found a leak. Output, plans and reports hold counts and timings
 only; recognized text and watch-list entries are never printed, and parse
 errors name fields and offsets.
 
@@ -126,8 +130,61 @@ BGRA pixels. It is the reference the GPU effect (SPG-14) must match or exceed.
   `max_rects_per_track` (8, so eight tracks fit unmerged) are capped at the
   capacity by `driver_config()`.
 
-Whether a blur radius makes text unreadable to OCR is SPG-18's question
-(`spg-cli scrub`); nothing here measures it.
+Whether a blur radius makes text unreadable to OCR is measured by
+`spg-cli scrub` (below) on synthetic frames in
+`tests/integration/scrub_pipeline_test.cpp`, and on a real recording in
+[live-check.md](live-check.md) part F.
+
+## Scrub
+
+SPG-18. `scrub` answers one question about a recorded session: in which
+frames is a planted test string still readable? It is the automated half of
+the leak test in [live-check.md](live-check.md); a human still looks at every
+flagged frame and checks faces by eye. Code: `cli/src/scrub.cpp`.
+
+- **Inputs.** `--frames`: the recording as PNG frames (`ffmpeg -i rec.mkv -vf
+  fps=60 -start_number 0 DIR/%06d.png`), any size, sorted by file name; frame
+  `i` is at `i / fps` s (`--fps`, default 60). `--planted`: a UTF-8 file with
+  one planted string per line (LF or CR LF; blank lines skipped). Strings are
+  numbered from 1 in file order.
+- **Per frame**, at full resolution: the text detector, the recognizer on
+  every region, then each region's text against each planted string with a
+  `PolicyEngine` restricted to the watch-list category, one engine per
+  string, so a hit names the string by number. Matching is the policy
+  engine's own (normalization, OCR confusions, edit budget, partial reveals,
+  [policy.md](policy.md)), at the plugin's **High** sensitivity by default
+  (3 edits, ratio 0.3, partials from 5 characters); `--sensitivity normal`
+  uses spg-core's defaults. A leak check errs toward reporting: a false alarm
+  costs a look at one frame.
+- **Offline settings** (`StageOptions::thorough`): text detector tiles overlap
+  by half a tile (320 px instead of 64), so a line up to 320 px tall is never
+  cut by a tile edge, and candidate boxes are kept from a mean probability of
+  0.3 instead of 0.5. `run`, `eval` and `bench` keep the plugin's settings.
+- **Output.** One `leak: frame <i> (<file>, <s> s): planted #<n> at x y, WxH`
+  line per matching region, a line per planted string (frames, first and
+  last), the stage table, then `PASS: ...`, `LEAK: ...` or, when no
+  text region was read in any frame, `NOTHING CHECKED: ...` (exit 1: a wrong
+  folder or a detector that sees nothing is not a pass). `--report` writes
+  the same as JSON (`result`, `leak_frame_indices`, `leaks` with frame, file,
+  time, box, detector score and planted numbers, per-string counts, stage
+  timing). Progress goes to stderr every 100 frames.
+- **Secrecy.** Planted strings and recognized text are `Secret`s; the
+  planted file (at most 1 MiB) is read into one buffer of its exact size,
+  never reallocated, and wiped once split. Output, errors and the report
+  hold frame numbers, file names, times, boxes and planted numbers only; a
+  planted string that cannot be matched (no letters or digits) is named by
+  number. `scrub` writes no frames.
+- **Fail closed.** A frame that cannot be decoded, a stage that throws or a
+  recognizer that returns the wrong count stops the scrub with exit 1 and no
+  verdict: an unchecked frame never counts as clean. Frames are scanned on
+  `--workers` threads; the output is in frame order whatever the count.
+- **Limits.** Scrub finds what this OCR can read. Text the detector misses
+  (unusual fonts, very small text, strong perspective) is not reported, so the
+  live check includes a positive control (the same planted strings recorded
+  without the filter must all be flagged) and a by-eye pass. Faces are not
+  checked. The planted strings are compared one region at a time, as the
+  policy does; a string split across two detected regions is matched only
+  through the partial-reveal rule.
 
 ## Dependencies
 
@@ -150,4 +207,16 @@ through `run_cli()` with fake stages, including the watch-list sentinel never
 reaching output. `tests/integration/cli_pipeline_test.cpp`: `spg-cli run` on
 the pinned models over 36 drawn frames (watch-list line and card covered from
 their first frame, face covered, decoy not masked); skips without the models.
+`tests/unit/scrub_test.cpp` (`cli.*`, `[scrub]`): `scrub` with fake stages
+(leak frames, times, boxes and numbers; pass; no text read is exit 1, not a
+pass; same output with 1 and 4 workers; exit 1 on an unreadable frame or a
+short recognizer; a throwing progress callback is an error, not a
+terminate; planted-file parsing; neither planted string in any output).
+`tests/integration/scrub_pipeline_test.cpp`: `scrub` on the pinned models
+over nine drawn 1280x720 frames with three planted strings (20 px name line,
+20 px card whose mask overlaps the name's, 56 px line): flagged when sharp,
+not flagged under the CPU
+compositor's blur and pixelate, an emulation of the plugin's GPU effect
+(its own `mask_levels.cpp`, Smooth and Blocks, each mask sampled from the
+untouched frame) or either whole-source blur.
 Eval numbers are in [agent-log.md](agent-log.md) and the PR.
