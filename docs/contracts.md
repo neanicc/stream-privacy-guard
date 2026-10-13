@@ -118,11 +118,12 @@ A `ContractError` from the parser or `validate()` means there is no valid
 policy, and the caller must fail closed by applying `blur_source` to the
 whole source.
 
-These limits (SPG-08b) tightened schema 1 without a version bump: no reader
-or writer of policy documents had shipped (the plugin builds a `PolicyConfig`
-directly and the CLI takes no policy file), so no stored document could be
-broken. A document that relied on the old ranges, such as `"hold_ms": 250`,
-now fails closed with an error naming the field. A later change that rejects
+These limits (SPG-08b) tightened schema 1 without a version bump: no release
+had shipped, and every in-tree writer of policy documents (the eval suite
+generators, which write defaults plus a synthetic watch-list) stays inside
+them; the plugin builds a `PolicyConfig` directly. A document that relied on
+the old ranges, such as `"hold_ms": 250`, is refused with an error naming the
+field: `spg-cli` exits 1 and writes no mask plans. A later change that rejects
 documents a released reader accepted bumps `schema`.
 
 ```json
