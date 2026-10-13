@@ -272,10 +272,18 @@ bool ipv6_candidate(Text run) {
 }
 
 bool has_ip(Text t, Text d) {
-  for (const Text run : runs(d, [](char32_t c) { return is_digit(c) || c == U'.'; })) {
-    if (has_ipv4(run)) {
-      return true;
+  // The digit view, then the text as read: in the digit view a '|' or l next
+  // to an address ("ip|192.0.2.44|") reads as a 1 and spoils its end octets.
+  const auto ipv4_in = [](Text text) {
+    for (const Text run : runs(text, [](char32_t c) { return is_digit(c) || c == U'.'; })) {
+      if (has_ipv4(run)) {
+        return true;
+      }
     }
+    return false;
+  };
+  if (ipv4_in(d) || ipv4_in(t)) {
+    return true;
   }
   for (Text run : runs(t, [](char32_t c) { return is_hex(c) || c == U':' || c == U'.'; })) {
     while (!run.empty() && run.back() == U'.') {
@@ -435,11 +443,8 @@ std::size_t token_body(Text t, std::size_t begin, bool may_split) {
   return digit ? total : joined;
 }
 
-bool has_token(Text raw) {
-  // In a token, '|' can only be an OCR reading of l or I.
-  SecureU32String view(raw);
-  std::replace(view.begin(), view.end(), U'|', U'l');
-  const Text t(view);
+// The rules of has_token() on one view of the text.
+bool token_in(Text t) {
   for (const TokenFormat& format : kTokenFormats) {
     for (std::size_t at = t.find(format.prefix); at != Text::npos; at = t.find(format.prefix, at + 1)) {
       if (at > 0 && (is_alnum(t[at - 1]) || t[at - 1] == U'_')) {
@@ -461,6 +466,23 @@ bool has_token(Text raw) {
     }
   }
   return false;
+}
+
+// The text as read, then, if it holds a '|', again with every '|' read as l
+// (in a token it can only be an OCR reading of l or I). Checking the text as
+// read first keeps every match the rules found before: a '|' that separates a
+// prefix from what precedes it ("key|ghp_...") still starts a token there.
+// token_body() only ever lengthens a body, so the views only add matches.
+bool has_token(Text raw) {
+  if (token_in(raw)) {
+    return true;
+  }
+  if (raw.find(U'|') == Text::npos) {
+    return false;
+  }
+  SecureU32String view(raw);
+  std::replace(view.begin(), view.end(), U'|', U'l');
+  return token_in(Text(view));
 }
 
 constexpr Text kStreetSuffixes[] = {

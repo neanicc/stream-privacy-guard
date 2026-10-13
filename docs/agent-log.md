@@ -1816,7 +1816,17 @@ Template:
   into neighbouring lines. The policy flagged no decoy.
 - Decision / change: (1) PII tokens: `|` reads as `l`, and a body may join
   across up to two single spaces between runs of at least 6 characters when
-  it holds a digit (JWTs never join), [policy.md](policy.md). (2) IPv6: a run
+  it holds a digit (JWTs never join), [policy.md](policy.md). The `|` view is
+  checked only after the text as read: the first commit of this PR replaced
+  `|` in place, so a token after a `|` ("key|ghp_...") lost its word start.
+  A background review flagged it; a differential run of `find_pii()` against
+  main `c338c0c` on 200,000 synthetic damaged lines (tokens of every prefix,
+  IPv4, IPv6, JWTs, OCR noise) found that commit missing `PII_TOKEN` on 5,015
+  lines main caught, and the fixed head missing none (it adds a reason on
+  16,603). `tests/unit/policy_pii_test.cpp` now pins every prefix at its
+  minimum body, with a `|`, a space or words around it, and IPv4/IPv6 forms.
+  An IPv4 address is also looked for in the text as read, since the digit view
+  turns a `|` beside it into a 1. (2) IPv6: a run
   of 4 to 7 hex groups with no `::`, two of them 3 or more long, counts (OCR
   lost the `::`); times and MAC addresses do not. (3) Retroactive rects are
   also back-projected along the velocity of the track the detection joined

@@ -151,6 +151,46 @@ TEST_CASE("pii: tokens survive OCR misreads", "[policy][pii]") {
   CHECK_FALSE(found(Category::PiiToken, "ghp_SYNTH3 abcdef ghijkl mnopqrstuv"));
 }
 
+TEST_CASE("pii: the OCR-tolerant rules keep every match the strict rules had", "[policy][pii]") {
+  using spg::Category;
+  // Pins what the rules before SPG-12 detected, so a change that narrows them
+  // fails here. Each known prefix with a body of exactly its minimum length,
+  // as is, with words after it, with a '|' or a space before it, and in a
+  // table cell ("key|<token>|"). Bodies are synthetic.
+  struct Format {
+    const char* prefix;
+    std::size_t min_body;
+  };
+  constexpr Format kFormats[] = {
+      {"live_", 20},  {"oauth:", 20},   {"ghp_", 20},     {"gho_", 20},     {"ghu_", 20},  {"ghs_", 20},
+      {"ghr_", 20},   {"github_pat_", 20}, {"glpat-", 20}, {"xoxb-", 10},   {"xoxp-", 10}, {"xoxa-", 10},
+      {"xoxr-", 10},  {"xoxs-", 10},    {"xoxe-", 10},    {"sk_live_", 16}, {"rk_live_", 16},
+      {"sk_test_", 16}, {"rk_test_", 16}, {"sk-", 20},     {"AKIA", 16},     {"ASIA", 16},  {"AIza", 30},
+      {"npm_", 30},   {"hf_", 30},      {"eyJ", 20},
+  };
+  const std::string body_chars = "SYNTH0123456789abcdefghijklmnopqrstuvwxyz";
+  for (const Format& f : kFormats) {
+    const std::string token = std::string(f.prefix) + body_chars.substr(0, f.min_body);
+    CAPTURE(token);
+    CHECK(found(Category::PiiToken, token));
+    CHECK(found(Category::PiiToken, token + " then plain words follow"));  // digit-free piece after a space
+    CHECK(found(Category::PiiToken, token + " 0123 more"));
+    CHECK(found(Category::PiiToken, "key|" + token + "|"));
+    CHECK(found(Category::PiiToken, "|" + token));
+    CHECK(found(Category::PiiToken, "key: " + token));
+    // One character short stays below the rule, as before.
+    CHECK_FALSE(found(Category::PiiToken, std::string(f.prefix) + body_chars.substr(0, f.min_body - 1)));
+  }
+  // IPv4 and IPv6 forms the strict rules found, with a '|' or a space around.
+  for (const char* ip : {"192.0.2.44", "2001:db8:0:0:0:0:2:1", "2001:db8::2:1", "fe80::1ff:fe23:4567:890a",
+                         "::ffff:192.0.2.128", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", "2001:db8::"}) {
+    CAPTURE(ip);
+    CHECK(found(Category::PiiIp, ip));
+    CHECK(found(Category::PiiIp, std::string("server|") + ip + "|"));
+    CHECK(found(Category::PiiIp, std::string("ip ") + ip + " up"));
+  }
+}
+
 TEST_CASE("pii: only enabled categories are reported", "[policy][pii]") {
   const std::string text = "4111 1111 1111 1111 zq@example.com 192.0.2.44";
   CHECK(spg::find_pii(text, spg::CategorySet{}).empty());
