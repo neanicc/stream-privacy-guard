@@ -125,7 +125,7 @@ be in the new coordinates.
 | Setting | Default | Source |
 | --- | --- | --- |
 | `hold` | 750 ms | `PolicyConfig::hold` (plan section 4) |
-| `margin_px`, `margin_ratio` | 4 px, 0.25 | `PolicyConfig` placeholder from SPG-02 |
+| `margin_px`, `margin_ratio` | 4 px, 0.25 | `PolicyConfig` placeholder from SPG-02; kept by the SPG-12d sweep (#81, [agent log](agent-log.md)) |
 | `retain` | 500 ms | `PolicyConfig::lookahead` |
 | `iou_threshold` | 0.3 | SPG-09 starting point |
 | `velocity_smoothing` | 0.5 | SPG-09 starting point |
@@ -133,8 +133,12 @@ be in the new coordinates.
 | `max_rects_per_track` | 8 | SPG-09 starting point; capped at the compositor's rect capacity (`kMaskRectCapacity`, 64 per frame, [cli.md](cli.md)), so eight tracks fit a frame unmerged |
 
 `TrackerConfig::from_policy()` takes hold, margin and lookahead from the policy.
-The margin and the tracker numbers have no eval evidence yet; SPG-12 tunes
-them against the synthetic suites. Velocity is not bounded: two confirmations
+SPG-12d (#81) swept the margin between these defaults and the SPG-08b floors
+(2 px, 0.125) on the synthetic suites: no setting meets the text decoy limit,
+because most decoy blur comes from stale and swept positions of scrolling
+lines, not from the margin, and the smaller margins raise the faces leak rate.
+The defaults stay. The tracker numbers have no
+eval evidence yet; SPG-12 tunes them against the synthetic suites. Velocity is not bounded: two confirmations
 very close in frame time with a few pixels of jitter give a large velocity and
 a long predicted hull. That only over-blurs (it never removes coverage), so it
 is left for SPG-12 (#13) to bound against the clean-frame blur budget rather

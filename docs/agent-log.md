@@ -2190,3 +2190,79 @@ Template:
   cheaper text pass for sources below 1080p is #86. Live OBS not tested;
   the plugin uses the same defaults (two workers, fixed-shape text detector,
   1920 x 1088 tile, four recognizer runs).
+
+## 2026-10-13 — SPG-12d Decoy blur margin defaults (#81)
+
+- Decision / change: the margin defaults stay at `margin_px` 4 and
+  `margin_ratio` 0.25 (`PolicyConfig`, `TrackerConfig`). No setting between
+  them and the SPG-08b floors (2, 0.125) meets `decoy_blur_rate` <= 0.25 in
+  either mode. The floors are unchanged. This is a docs-only change: this
+  entry and the defaults note in docs/tracker.md. The plugin does not expose
+  the margin.
+- Method: main `827149c`, default seed. Each grid point was run with
+  `spg-cli eval` on the same generated suites (CI text profile `ci`, local
+  text and faces profile `full`), with `margin_px` and `margin_ratio` set in
+  the suite's `policy.json`, and scored with `eval/score.py`. The (4, 0.25)
+  points reproduce the main baseline exactly.
+- Sweep, text decoy blur (CI / local). Watch-list pair, first-frame, PII pair
+  and leak are identical to main at every point (CI 557/557, 15/15, 590/590,
+  0/285; local 3996/3999, 51/53, 4158/4162, 7/1919). Local clean blur goes
+  from 0.0027 to 0.0023 at the floor; CI clean blur is 0 everywhere.
+
+  | ratio \ px | 4 | 3 | 2 |
+  | --- | --- | --- | --- |
+  | 0.25 | 0.4211 / 0.5082 | 0.4043 / 0.4996 | 0.3819 / 0.4910 |
+  | 0.2 | 0.4031 / 0.4983 | 0.3830 / 0.4903 | 0.3595 / 0.4804 |
+  | 0.15 | 0.3785 / 0.4882 | 0.3539 / 0.4787 | 0.3303 / 0.4525 |
+  | 0.125 | 0.3639 / 0.4824 | 0.3471 / 0.4583 | 0.3191 / 0.4482 |
+
+- Sweep, local faces (pair recall, leak frames of 1080; clean blur 0 at
+  every point): (4, 0.25), (3, 0.25), (2, 0.25), (4, 0.2) and (3, 0.2) match
+  main at 2206/2207 and 1 leak. (2, 0.2) and (4, 0.15) give 2205 and 2.
+  (3, 0.15) and (4, 0.125) give 2204 and 3 (+0.19 pp leak). (2, 0.15),
+  (3, 0.125) and the floor (2, 0.125) give 2203 and 4, which is +0.28 pp
+  leak, past the merge gate's +0.2 pp. The face margin covers the box lag of
+  fast faces, so the floor costs faces leak before it gets near the decoy
+  limit.
+- Where decoy blur comes from at the floor. Mask rects carry no source tag,
+  so this is a ground-truth attribution (a scratch script, not committed).
+  Each rect over a covered decoy is matched to the sensitive box it fits best
+  within [-hold, +retro] frames. Every covered decoy is in the chat template,
+  whose lines scroll about one line pitch per hold.
+  - CI (285 covered): stale or swept positions of a scrolling secret (held
+    detections, per-track bucket hulls, prediction hulls) cover 153 without
+    their margin and 53 more with it. Retro rects cover 79. None are covered
+    by a mask at the secret's current position.
+  - Local (2086 covered): stale or swept positions 1037 without margin and
+    286 with it, retro rects 594, rects matching no sensitive box (the decoy
+    read as sensitive, or another source) 152, current position 17.
+  - At the defaults the split is CI 137 / 89 / 121 / 29 (stale / stale with
+    margin / retro / current with margin) and local 933 / 590 / 628 / 157
+    unmatched / 57 current. The margin accounts only for the
+    margin-dependent share: about 6 pp of local decoy blur between the
+    defaults and the floors.
+  - Ablations at the floor (CI, not candidate defaults): hold 400 ms (its
+    floor) gives 0.3035. Retro 100 ms leaks (first-frame 14/15, leak 8/285)
+    and raises decoy to 0.4972 through fail-closed frames.
+- Box jitter: on static sensitive lines (CI 16, local 51 instances) the
+  detection box, with the margin removed, moves a median of 0.8 px per edge
+  across frames. It sits 3 to 5 px (p10) beyond the glyph box at the top and
+  bottom, and its short side is about 30 px (min about 20). On such a box the
+  floor margin is about 6 px and the default about 11.5 px. On some frames
+  the detector box falls 13 to 35 px short of the glyph box on the left or
+  right (word splits, partial reveals); there the margin and the 0.90
+  coverage rule carry recall.
+- Threshold ask (human-owned `eval/thresholds.toml`, for Ali): at the
+  defaults kept here, `decoy_blur_rate_max` must be at least 0.5082 to pass
+  both modes (local 2365/4654; CI 0.4211), so 0.51 would pass. At the
+  smallest margin that keeps faces within the merge gate, (3, 0.15), it
+  would be 0.4787 (CI 0.3539). Even the floor needs 0.4482, and the floor
+  fails the faces leak gate.
+- Open issues or follow-ups: the decoy gap is structural. Masks stay at
+  stale or swept positions of scrolling lines, and retro rects are also
+  masked where they were found. Margin tuning cannot reach 0.25. The next
+  lever is moving a held box's margin-grown mask along a confirmed track
+  instead of leaving it at its old position (the step #80 suggested, without
+  dropping margin coverage), or bounding the retro "where found" rect for
+  tracks with a measured translation. Either needs the scrolling-chat leak
+  test (#71). Synthetic eval only; live OBS not tested.
