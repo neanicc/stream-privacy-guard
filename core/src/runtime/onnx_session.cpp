@@ -320,7 +320,8 @@ std::unique_ptr<Session::Impl> create_impl(Ort::Env& env, const fs::path& path,
   }
   for (const DimOverride& o : overrides) {
     ort_options.AddFreeDimensionOverrideByName(o.name.c_str(), o.value);
-  }  configure_provider(ort_options, provider);
+  }
+  configure_provider(ort_options, provider);
 
   auto impl = std::make_unique<Session::Impl>();
   impl->path = path;
