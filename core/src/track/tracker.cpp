@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <tuple>
 #include <utility>
@@ -263,29 +264,32 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
   });
   std::vector<bool> track_taken(tracks_.size(), false);
   std::vector<bool> detection_taken(detections.size(), false);
-  const auto join = [&](std::size_t ti, std::size_t di) {
+  const auto join = [&](std::size_t ti, std::size_t di, bool gated) {
     track_taken[ti] = true;
     detection_taken[di] = true;
     TrackState& state = tracks_[ti];
-    confirm(state, frame_time, detections[di].box.rect);
+    confirm(state, frame_time, detections[di].box.rect, gated);
     if (motions != nullptr) {
-      (*motions)[di] = state.has_velocity
-                           ? TrackMotion{state.track.velocity, state.first_seen, state.translating}
-                           : TrackMotion{Velocity{}, state.first_seen, false};
+      // See TrackMotion: the motion since the latest gate pairing once it
+      // has a measurement, so a wrong pairing cannot take away the motion
+      // the detections would have had on a track of their own.
+      const Motion& m = state.since_gate.has_velocity ? state.since_gate : state.motion;
+      (*motions)[di] = m.has_velocity ? TrackMotion{m.velocity, m.first_seen, m.translating}
+                                      : TrackMotion{Velocity{}, m.first_seen, false};
     }
   };
   for (const Candidate& c : candidates) {
     if (!track_taken[c.track] && !detection_taken[c.detection]) {
-      join(c.track, c.detection);
+      join(c.track, c.detection, false);
     }
   }
 
   // Motion gate (SPG-16b): the tracks and detections IoU left unpaired, when
   // the detection is where the track could have moved in the frame time
   // between them (see TrackerConfig::motion_gate_per_s). It runs after IoU so
-  // every pair IoU makes is kept. A detection joining the wrong track only
-  // changes that track's motion: every detection is held from its own frame
-  // whatever track it joins, so no hold is shortened.
+  // every pair IoU makes is kept. The pairing may be wrong (a new object near
+  // an old track), so confirm() also measures the detection as the track it
+  // would otherwise have started, and keeps that track's coverage.
   struct MotionCandidate {
     double cost;  // box sizes from the nearer of the last and predicted center
     std::size_t track;
@@ -331,7 +335,7 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
   });
   for (const MotionCandidate& c : moving) {
     if (!track_taken[c.track] && !detection_taken[c.detection]) {
-      join(c.track, c.detection);
+      join(c.track, c.detection, true);
     }
   }
 
@@ -346,7 +350,8 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     state.track.last_confirmed = frame_time;
     state.track.hold_until = frame_time + config_.hold;
     state.track.kind = detection.kind;
-    state.first_seen = frame_time;
+    state.motion = Motion{detection.box.rect, frame_time, frame_time, Velocity{}, false, false};
+    state.since_gate = state.motion;
     state.held.push_back(make_held(detection.box.rect, frame_time, Velocity{}));
     tracks_.push_back(std::move(state));
   }
@@ -354,49 +359,90 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
   prune();
 }
 
-void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) {
-  Track& track = state.track;
-  const bool earliest = frame_time < state.first_seen;
-  state.first_seen = std::min(state.first_seen, frame_time);
-  if (frame_time <= track.last_confirmed) {
-    // Late or same-frame detection: it holds, predicted at the track's
-    // current velocity, but does not move the track.
+bool Tracker::advance(Motion& motion, Timestamp frame_time, const Rect& box) const noexcept {
+  const bool earliest = frame_time < motion.first_seen;
+  motion.first_seen = std::min(motion.first_seen, frame_time);
+  if (frame_time <= motion.last) {
+    // Late or same-frame detection: it holds, predicted at the current
+    // velocity, but does not move the motion on.
     if (earliest) {
-      // Older than every detection the track has taken (cycles that finish
+      // Older than every detection the motion has taken (cycles that finish
       // out of order): its move to the latest box is motion no measurement
-      // has seen. The track takes that velocity when it has none, or when
+      // has seen. The motion takes that velocity when it has none, or when
       // the move translates the box but the velocity it has does not point
       // that way (measured near rest by results that landed first). The box
       // does not move.
-      const double dt = seconds(track.last_confirmed - frame_time);
-      const Velocity measured{to_velocity((center_x(track.box.rect) - center_x(box)) / dt),
-                              to_velocity((center_y(track.box.rect) - center_y(box)) / dt)};
-      if (!state.has_velocity || (!translated(box, track.box.rect, track.velocity) &&
-                                  translated(box, track.box.rect, measured))) {
-        track.velocity = measured;
-        state.has_velocity = true;
+      const double dt = seconds(motion.last - frame_time);
+      const Velocity measured{to_velocity((center_x(motion.box) - center_x(box)) / dt),
+                              to_velocity((center_y(motion.box) - center_y(box)) / dt)};
+      if (!motion.has_velocity || (!translated(box, motion.box, motion.velocity) &&
+                                   translated(box, motion.box, measured))) {
+        motion.velocity = measured;
+        motion.has_velocity = true;
       }
-      state.translating = state.translating || translated(box, track.box.rect, track.velocity);
+      motion.translating = motion.translating || translated(box, motion.box, motion.velocity);
     }
-    state.held.push_back(make_held(box, frame_time, track.velocity));
-    return;
+    return false;
   }
-  const double dt = seconds(frame_time - track.last_confirmed);
-  const double measured_x = (center_x(box) - center_x(track.box.rect)) / dt;
-  const double measured_y = (center_y(box) - center_y(track.box.rect)) / dt;
-  if (state.has_velocity) {
+  const double dt = seconds(frame_time - motion.last);
+  const double measured_x = (center_x(box) - center_x(motion.box)) / dt;
+  const double measured_y = (center_y(box) - center_y(motion.box)) / dt;
+  if (motion.has_velocity) {
     const double a = static_cast<double>(config_.velocity_smoothing);
-    track.velocity.dx_per_s =
-        to_velocity(a * measured_x + (1.0 - a) * static_cast<double>(track.velocity.dx_per_s));
-    track.velocity.dy_per_s =
-        to_velocity(a * measured_y + (1.0 - a) * static_cast<double>(track.velocity.dy_per_s));
+    motion.velocity.dx_per_s =
+        to_velocity(a * measured_x + (1.0 - a) * static_cast<double>(motion.velocity.dx_per_s));
+    motion.velocity.dy_per_s =
+        to_velocity(a * measured_y + (1.0 - a) * static_cast<double>(motion.velocity.dy_per_s));
   } else {
-    track.velocity = Velocity{to_velocity(measured_x), to_velocity(measured_y)};
-    state.has_velocity = true;
+    motion.velocity = Velocity{to_velocity(measured_x), to_velocity(measured_y)};
+    motion.has_velocity = true;
   }
   // Sticky: a later measurement at rest does not clear it, so a result that
   // lands late is judged the same whatever arrived before it.
-  state.translating = state.translating || translated(track.box.rect, box, track.velocity);
+  motion.translating = motion.translating || translated(motion.box, box, motion.velocity);
+  motion.box = box;
+  motion.last = frame_time;
+  return true;
+}
+
+void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box, bool gated) {
+  const Motion before = state.motion;
+  const Motion gate_before = state.since_gate;
+  const bool forward = advance(state.motion, frame_time, box);
+  if (forward) {
+    bridge(state, before.box, before.last, box);
+  }
+  // The track the latest gate pairing would otherwise have started bridges
+  // from its own last box, which differs from the track's after a late gate
+  // pairing.
+  if (frame_time > gate_before.last &&
+      !(forward && gate_before.box == before.box && gate_before.last == before.last)) {
+    bridge(state, gate_before.box, gate_before.last, box);
+  }
+  if (gated) {
+    // The detection may be a new object near this track. From here on it is
+    // also measured as the track it would have started (SPG-16b).
+    state.since_gate = Motion{box, frame_time, frame_time, Velocity{}, false, false};
+  } else {
+    advance(state.since_gate, frame_time, box);
+  }
+  Track& track = state.track;
+  track.velocity = state.motion.velocity;
+  if (forward) {
+    track.box = Box{box, Space::Source};
+    track.last_confirmed = frame_time;
+    track.hold_until = frame_time + config_.hold;
+  }
+  // Predicted over both velocities, so a wrong gate pairing still predicts
+  // where the detection's own track would have.
+  Held held = make_held(box, frame_time, state.motion.velocity);
+  const Velocity& other = state.since_gate.velocity;
+  held.low = Velocity{std::min(held.low.dx_per_s, other.dx_per_s), std::min(held.low.dy_per_s, other.dy_per_s)};
+  held.high = Velocity{std::max(held.high.dx_per_s, other.dx_per_s), std::max(held.high.dy_per_s, other.dy_per_s)};
+  state.held.push_back(held);
+}
+
+void Tracker::bridge(TrackState& state, const Rect& from, Timestamp since, const Rect& to) const {
   // Between two sightings the object went from the last box to this one.
   // Velocity covers that path only as far as constant motion would: a slide
   // that eases out is further along than the measurement says, and a track
@@ -404,23 +450,24 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
   // larger of their margins, is held from the last sighting. With one
   // detection cycle every ~200 ms this covers the frames between sightings
   // of a box that moves more than its size (SPG-16b).
-  const Rect& last = track.box.rect;
-  Held bridge = make_held(
-      narrow_rect(std::min(static_cast<double>(last.x), static_cast<double>(box.x)),
-                  std::min(static_cast<double>(last.y), static_cast<double>(box.y)),
-                  std::max(static_cast<double>(last.x) + static_cast<double>(last.width),
-                           static_cast<double>(box.x) + static_cast<double>(box.width)),
-                  std::max(static_cast<double>(last.y) + static_cast<double>(last.height),
-                           static_cast<double>(box.y) + static_cast<double>(box.height))),
-      track.last_confirmed, Velocity{});
-  const Held last_held = make_held(last, track.last_confirmed, Velocity{});
-  const Held this_held = make_held(box, frame_time, Velocity{});
-  bridge.margin_x = bridge.margin_y = std::max(last_held.margin_x, this_held.margin_x);
-  state.held.push_back(bridge);
-  track.box = Box{box, Space::Source};
-  track.last_confirmed = frame_time;
-  track.hold_until = frame_time + config_.hold;
-  state.held.push_back(make_held(box, frame_time, track.velocity));
+  //
+  // A box inside the last one (text at rest) adds nothing: the hull is the
+  // last box, whose own hold from `since` already covers it with a margin at
+  // least as large, so a static track holds one entry per detection.
+  if (contains(from, to)) {
+    return;
+  }
+  Held held = make_held(
+      narrow_rect(std::min(static_cast<double>(from.x), static_cast<double>(to.x)),
+                  std::min(static_cast<double>(from.y), static_cast<double>(to.y)),
+                  std::max(static_cast<double>(from.x) + static_cast<double>(from.width),
+                           static_cast<double>(to.x) + static_cast<double>(to.width)),
+                  std::max(static_cast<double>(from.y) + static_cast<double>(from.height),
+                           static_cast<double>(to.y) + static_cast<double>(to.height))),
+      since, Velocity{});
+  held.margin_x = held.margin_y =
+      std::max(make_held(from, since, Velocity{}).margin_x, make_held(to, since, Velocity{}).margin_x);
+  state.held.push_back(held);
 }
 
 Tracker::Held Tracker::make_held(const Rect& box, Timestamp seen,
@@ -560,8 +607,12 @@ void Tracker::rescale(Size from, Size to) {
           std::max(held.high.dy_per_s, velocity_up(static_cast<double>(held.high.dy_per_s) * sy))};
     }
     // The track itself continues in the new coordinates.
-    state.track.box = Box{scaled(state.track.box.rect), Space::Source};
-    state.track.velocity = scaled_velocity(state.track.velocity);
+    for (Motion* m : {&state.motion, &state.since_gate}) {
+      m->box = scaled(m->box);
+      m->velocity = scaled_velocity(m->velocity);
+    }
+    state.track.box = Box{state.motion.box, Space::Source};
+    state.track.velocity = state.motion.velocity;
   }
 }
 

@@ -73,17 +73,42 @@ chained resizes) and a 60 s hold with 600 held detections.
   of the last box. Pairs are assigned greedily, closest first; ties go by
   index. Because this pass runs after IoU, every pair IoU makes is kept. An
   unmatched detection starts a new track.
-- A wrong pairing only changes the motion of the track it joined: every
-  detection is held from its own frame for the whole hold, whatever track it
-  joins, so a pairing never ends a hold early. It can only add blur (a wrong
-  velocity predicts, back-projects or trails in the wrong place).
+- A gate pairing can be wrong: a new object can come within reach of an old
+  track, for example a face sliding in from the edge near where another face
+  was. Every detection is still held from its own frame for the whole hold,
+  so no hold ends early, but the motion matters too. Inherited from the old
+  track, the new object's `first_seen` would be too early and its velocity
+  would point the old object's way, so the scheduler would skip the trail to
+  the frame edge that the new object's own track would get, and the frames it
+  slid in on would air unblurred (Greptile on PR #88). So a gate pairing also
+  starts a second motion estimate on the track, `since_gate`, measured from
+  the gated detection on as the new track it would otherwise have started:
+  - `TrackMotion` reports that estimate once it has a velocity, and the whole
+    track's until then. The whole track's motion only adds to what a new
+    track reports before its first measurement (the static box).
+  - Each held detection predicts over both velocities (the hull of the box
+    moved at either).
+  - A later detection also bridges from that estimate's last box when it is
+    not the track's (after a late gate pairing).
+
+  This keeps the coverage of the new object's own track while later
+  detections pair with the track as they would have with that one, which is
+  the case when its box is where the new object is. It does not rebuild
+  every pairing the tracker would have made without the gate: two gate
+  pairings in a row with results out of order can still differ.
 - When a detection moves its track forward in time, the hull of the track's
   last box and the new box, with the larger of their margins, is also held
   from the last confirmation. An object that moves in one direction between
   two sightings stays inside that hull, whatever its speed profile. Velocity
   alone only covers the path constant motion would take: an ease-out slide
   is further along than the measurement says, and a track seen once has no
-  velocity yet.
+  velocity yet. The bridge is left out when the new box lies inside the last
+  one: the last box's own hold already covers that hull with a margin at
+  least as large, so a box at rest holds one entry per detection. A moving
+  box holds two. At the bound above (60 s hold, a detection every 100 ms),
+  `masks()` took about 11 us per call for a moving box (1199 entries) and
+  5 us for one at rest (600; 11 us before the bridge was left out), and the
+  slowest `update()` under 7 us (Apple M4, Release build).
 - Velocity is the motion of the box center between confirmations: the first
   measurement is taken as is, later ones are smoothed with weight
   `velocity_smoothing`. Box size follows the latest detection.

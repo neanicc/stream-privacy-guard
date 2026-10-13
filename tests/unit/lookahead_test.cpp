@@ -692,14 +692,17 @@ namespace {
 // (SPG-16b): every 10 ms a finished cycle is applied, then the frame is
 // pushed, a free worker takes it, and the frames due are released. A frame is
 // released on its deadline, so a result that lands later cannot help it.
-// Returns every frame pushed in [from_ms, to_ms], in order.
-std::vector<ReleasedFrame> one_worker(const SchedulerConfig& config, const std::function<Rect(std::int64_t)>& box_at,
-                                      std::int64_t from_ms, std::int64_t to_ms) {
+// Returns every frame pushed in [from_ms, to_ms], in order. `boxes_at` gives
+// the faces visible on a frame time; one of zero width is not there.
+using BoxesAt = std::function<std::vector<Rect>(std::int64_t)>;
+std::vector<ReleasedFrame> one_worker(const SchedulerConfig& config, const BoxesAt& boxes_at, std::int64_t from_ms,
+                                      std::int64_t to_ms) {
   Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
-                                    const Rect b = box_at(spg::to_ns(t) / 1'000'000);
                                     std::vector<Detection> out;
-                                    if (b.width > 0.0F) {
-                                      out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                    for (const Rect& b : boxes_at(spg::to_ns(t) / 1'000'000)) {
+                                      if (b.width > 0.0F) {
+                                        out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                      }
                                     }
                                     return out;
                                   }),
@@ -730,6 +733,11 @@ std::vector<ReleasedFrame> one_worker(const SchedulerConfig& config, const std::
   return released;
 }
 
+std::vector<ReleasedFrame> one_worker(const SchedulerConfig& config, const std::function<Rect(std::int64_t)>& box_at,
+                                      std::int64_t from_ms, std::int64_t to_ms) {
+  return one_worker(config, BoxesAt([&](std::int64_t t) { return std::vector<Rect>{box_at(t)}; }), from_ms, to_ms);
+}
+
 SchedulerConfig one_worker_config() {
   SchedulerConfig config = small_config();
   config.lookahead = 500ms;
@@ -743,17 +751,23 @@ SchedulerConfig one_worker_config() {
 
 // Frames in [from_ms, to_ms] whose box (when visible) no mask rect contains,
 // or that fell back.
-std::vector<std::int64_t> uncovered(const std::vector<ReleasedFrame>& frames,
-                                    const std::function<Rect(std::int64_t)>& box_at) {
+std::vector<std::int64_t> uncovered(const std::vector<ReleasedFrame>& frames, const BoxesAt& boxes_at) {
   std::vector<std::int64_t> out;
   for (const ReleasedFrame& r : frames) {
     const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
-    const Rect b = box_at(t);
-    if (r.action != FallbackAction::None || (b.width > 0.0F && !covered_by(r.plan, b))) {
+    const std::vector<Rect> boxes = boxes_at(t);
+    if (r.action != FallbackAction::None || std::any_of(boxes.begin(), boxes.end(), [&](const Rect& b) {
+          return b.width > 0.0F && !covered_by(r.plan, b);
+        })) {
       out.push_back(t);
     }
   }
   return out;
+}
+
+std::vector<std::int64_t> uncovered(const std::vector<ReleasedFrame>& frames,
+                                    const std::function<Rect(std::int64_t)>& box_at) {
+  return uncovered(frames, BoxesAt([&](std::int64_t t) { return std::vector<Rect>{box_at(t)}; }));
 }
 
 }  // namespace
@@ -795,6 +809,37 @@ TEST_CASE("one worker covers an ease-out slide-in from its first frame", "[sched
 
   config.tracker.motion_gate_per_s = 0.0F;
   CHECK_FALSE(uncovered(one_worker(config, box_at, 1000, 1800), box_at).empty());
+}
+
+TEST_CASE("one worker covers a new face the motion gate pairs with an old one", "[schedule]") {
+  // Face A (40 x 40) is on screen around 1000 only, at x = 900. Face B, a
+  // different face, slides in from the right edge of the 1280 px frame: at
+  // x = 1240 on 1180, 1000 on 1200, then easing to 980 by 1400. The cycle on
+  // 1200 sees B within the gate's reach of A's track (2.5 box sizes), so the
+  // gate pairs them. Without the gate B starts its own track, first seen on
+  // 1200 and moving left after 1400, and the trail back to the right edge
+  // covers 1180 and 1190; the pairing must keep that.
+  const auto boxes_at = [](std::int64_t t) {
+    std::vector<Rect> out;
+    if (t <= 1050) {
+      out.push_back(Rect{900.0F, 300.0F, 40.0F, 40.0F});
+    }
+    if (t >= 1180) {
+      double x = 980.0;
+      if (t < 1200) {
+        x = 1240.0 - 12.0 * static_cast<double>(t - 1180);
+      } else if (t < 1400) {
+        x = 1000.0 - 0.1 * static_cast<double>(t - 1200);
+      }
+      out.push_back(Rect{static_cast<float>(x), 300.0F, 40.0F, 40.0F});
+    }
+    return out;
+  };
+  SchedulerConfig config = one_worker_config();
+  CHECK(uncovered(one_worker(config, BoxesAt(boxes_at), 1000, 2000), BoxesAt(boxes_at)).empty());
+
+  config.tracker.motion_gate_per_s = 0.0F;
+  CHECK(uncovered(one_worker(config, BoxesAt(boxes_at), 1000, 2000), BoxesAt(boxes_at)).empty());
 }
 
 TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {

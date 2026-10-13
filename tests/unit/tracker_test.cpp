@@ -419,7 +419,10 @@ TEST_CASE("tracker: a small fast box keeps its track between sparse detections",
     const Rect b = box_at(ms);
     tracker.update(at_ms(ms), std::vector<Detection>{face(b.x, b.y, b.width, b.height)}, &motions);
     REQUIRE(motions.size() == 1);
-    CHECK(motions[0].first_seen == at_ms(0));
+    // The gate pairs the sighting on 200 (IoU pairs the later ones, at the
+    // predicted box). From 400 on, the detections since that pairing have a
+    // velocity of their own, which is reported (see TrackMotion).
+    CHECK(motions[0].first_seen == at_ms(ms <= 200 ? 0 : 200));
     if (ms > 0) {
       CHECK(std::abs(motions[0].velocity.dx_per_s - 490.0F) < 1.0F);
       CHECK(std::abs(motions[0].velocity.dy_per_s - 140.0F) < 1.0F);
@@ -592,6 +595,79 @@ TEST_CASE("tracker: a wrong motion pairing keeps every hold", "[tracker]") {
     if (ms >= 200) {
       CHECK(covered(masks, required(b, config)));
     }
+  }
+}
+
+TEST_CASE("tracker: a wrong motion pairing keeps the new object's own motion", "[tracker]") {
+  // Face A is seen once at x = 900. Face B, a different face sliding in
+  // from the right edge, is seen at x = 1000 200 ms later, within A's reach
+  // (2.5 box sizes), and then at x = 980. Without the gate B starts its own
+  // track: first seen on 1200, then moving left at 100 px/s, which the
+  // scheduler trails back to the right edge for the frames before 1200. The
+  // gate pairs B with A's track (first seen on 1000, moving right), so
+  // reporting that track's motion would lose the trail. Once B's own
+  // detections have a measurement, they are reported instead, and the masks
+  // still cover everything the gate-off tracker masks.
+  ManualClock clock;
+  TrackerConfig off;
+  off.motion_gate_per_s = 0.0F;
+  const TrackerConfig on;
+  Tracker gated(clock, on);
+  Tracker plain(clock, off);
+  std::vector<spg::TrackMotion> gm;
+  std::vector<spg::TrackMotion> pm;
+  const auto both = [&](std::int64_t ms, float x) {
+    clock.set(at_ms(ms));
+    const std::vector<Detection> d{face(x, 300.0F, 40.0F, 40.0F)};
+    gated.update(at_ms(ms), d, &gm);
+    plain.update(at_ms(ms), d, &pm);
+  };
+  both(1000, 900.0F);
+  both(1200, 1000.0F);
+  REQUIRE(gated.tracks().size() == 1);
+  REQUIRE(plain.tracks().size() == 2);
+  // Right after the pairing B's own motion has no measurement yet; the
+  // track's motion only adds to the static box the gate-off tracker reports.
+  CHECK(gm[0].first_seen == at_ms(1000));
+  CHECK(gm[0].velocity.dx_per_s == 500.0F);
+  CHECK(pm[0] == spg::TrackMotion{spg::Velocity{}, at_ms(1200), false});
+  both(1400, 980.0F);
+  CHECK(pm[0] == spg::TrackMotion{spg::Velocity{-100.0F, 0.0F}, at_ms(1200), true});
+  CHECK(gm[0] == pm[0]);
+  for (std::int64_t ms = 1000; ms <= 2400; ms += 10) {
+    INFO("frame " << ms);
+    CHECK(no_shrink(plain.masks(at_ms(ms)), gated.masks(at_ms(ms))));
+  }
+}
+
+TEST_CASE("tracker: a late motion pairing bridges from the new object's own box", "[tracker]") {
+  // Results land out of order. A face is seen at x = 900 on 1000 and 1400
+  // (its track's last box is on 1400). A late result for 1200 has a face at
+  // x = 1000: a new face near the old track, which the gate pairs with it.
+  // The next result, on 1600, has the new face at x = 1010. Without the gate
+  // the new face's own track bridges 1000 to 1010 from 1200; with it, that
+  // bridge is still held although the track's last box is A's.
+  ManualClock clock;
+  TrackerConfig off;
+  off.motion_gate_per_s = 0.0F;
+  const TrackerConfig on;
+  Tracker gated(clock, on);
+  Tracker plain(clock, off);
+  const auto both = [&](std::int64_t ms, float x) {
+    clock.set(at_ms(std::max<std::int64_t>(ms, 1400)));
+    const std::vector<Detection> d{face(x, 300.0F, 40.0F, 40.0F)};
+    gated.update(at_ms(ms), d);
+    plain.update(at_ms(ms), d);
+  };
+  both(1000, 900.0F);
+  both(1400, 900.0F);
+  both(1200, 1000.0F);
+  REQUIRE(gated.tracks().size() == 1);
+  REQUIRE(plain.tracks().size() == 2);
+  both(1600, 1010.0F);
+  for (std::int64_t ms = 1000; ms <= 2400; ms += 10) {
+    INFO("frame " << ms);
+    CHECK(no_shrink(plain.masks(at_ms(ms)), gated.masks(at_ms(ms))));
   }
 }
 

@@ -2261,6 +2261,37 @@ Template:
   needs a scheduler change. Rejected without building: growing a new
   track's box on those frames by the gate's reach, which would blur most of
   the frame for each new chat line.
+- Review follow-up (Greptile on PR #88). A gate pairing can join a new
+  object to an old track, such as a face sliding in from the right edge near
+  where another face was. The new face then inherited the old track's
+  `first_seen` and a velocity pointing the old face's way. The scheduler
+  skipped the trail to the edge that the face's own track gets, so the
+  frames it slid in on aired unblurred. A one-worker scheduler test
+  reproduced it on 23f703d; it passes with the gate off. The fix is in the
+  tracker only. A gate pairing starts a second motion estimate on the track,
+  measured from the gated detection on as the track it would otherwise have
+  started. `TrackMotion` reports that estimate once it has a velocity (the
+  whole track's until then). Held detections predict over both velocities.
+  After a late gate pairing, a later detection also bridges from that
+  estimate's last box. Limit: it does not rebuild every pairing the gate-off
+  tracker would make. Two gate pairings in a row with results out of order
+  can still differ. `docs/tracker.md` now says this instead of "a wrong
+  pairing only adds blur".
+- Staff review P2 (bridge entries). The bridge is now left out when the new
+  box lies inside the last one, whose own hold already covers it, so a box
+  at rest holds one entry per detection again. At the 60 s hold bound (600
+  detections), `masks()` took about 11 us per call for a moving box and 5 us
+  for one at rest (11 us before), Apple M4, Release build.
+- Eval after the follow-up, two workers, same seed. CI text: watch-list
+  557/557, first-frame 15/15, PII 590/590, leak 0/285, clean blur 0 (limit
+  0.03), decoy 0.4233 (main 0.4211, 23f703d 0.4076). Local text: watch-list
+  0.9992, first-frame 0.9623, PII 0.9990, leak 0.0036, clean blur 0.002682
+  (main 0.002681, limit 0.03), decoy 0.5090 (main 0.5082, 23f703d 0.5058).
+  Faces: recall 0.9995, leak 0.0009, clean blur 0. Recall and leak match
+  main on every suite. Decoy blur is 0.2 pp (CI) and 0.1 pp (local) above
+  main, because the second velocity adds blur where a pairing may be wrong.
+  Decoy blur already fails on main (#75, #81). One-worker runs were not
+  repeated.
 - Open issues or follow-ups: #84 stays open (this PR is part of it). A
   follow-up should cover frames before a new track's first sighting with
   one worker, or show that #85's cadence makes them coverable; #85 should
