@@ -544,6 +544,46 @@ TEST_CASE("retroactive masks follow a moving track back to the frames before it 
   }
 }
 
+TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {
+  // A static box whose detections jitter 12 px left and right each cycle: the
+  // track's velocity flips sign every 20 ms (an outlier-ridden estimate).
+  // Back-projection may put rects in the wrong place, but every static rect
+  // stays, and past max_retro_rects a frame's rects merge into one hull.
+  const auto box_at = [](std::int64_t t) {
+    return Rect{static_cast<float>((t / 20) % 2 == 0 ? 294 : 306), 200.0F, 80.0F, 16.0F};
+  };
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 100ms;
+  config.max_retro_rects = 6;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const Rect b = box_at(spg::to_ns(t) / 1'000'000);
+                                    return std::vector<Detection>{face_at(b.x, b.y, b.width, b.height)};
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  for (std::int64_t t = 1100; t <= 1400; t += 10) {
+    const bool scan = t % 20 == 0;
+    sim.push(t, scan);
+    if (scan) {
+      sim.scan_now();
+    }
+  }
+  const auto out = sim.release_at(2000);
+  REQUIRE(out.size() == 31);
+  for (const ReleasedFrame& r : out) {
+    const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+    INFO("frame " << t);
+    CHECK(r.action == FallbackAction::None);
+    // Retro rects merge past their cap; the tracker adds at most its own cap.
+    CHECK(r.plan.rects.size() <= config.max_retro_rects + config.tracker.max_rects_per_track);
+    for (std::int64_t ts = t; ts <= t + 100 && ts <= 1400; ts += 10) {
+      if (ts % 20 == 0) {
+        CHECK(covered_by(r.plan, box_at(ts)));  // where every cycle in reach saw it
+      }
+    }
+  }
+}
+
 TEST_CASE("a frame counts as scanned only by a cycle within retro after it", "[schedule]") {
   SchedulerConfig config = small_config();
   config.lookahead = 500ms;

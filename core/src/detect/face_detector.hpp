@@ -13,11 +13,12 @@
 // One fixed input for the whole frame scales a 1080p source by 1/3, and on the
 // faces suite that missed faces of 43 and 62 Source px outright (SPG-12). So
 // a frame larger than the input is also cut into input-sized tiles at scale 1
-// (tile_crops() from the text detector), each run through the model, and the
-// boxes of every pass are joined in Source space: a box overlapping a better
-// one by more than nms_iou_threshold merges into it as their hull. Faces
-// larger than the tile overlap that a tile edge cuts are left to the whole
-// frame pass, which sees them at a size YuNet handles.
+// (grid_crops() in detect/tiling.hpp, shared with the text detector), each
+// run through the model, and the boxes of every pass are joined in Source
+// space: a box overlapping a better one by more than nms_iou_threshold merges
+// into it as their hull. Faces larger than the tile overlap that a tile edge
+// cuts are left to the whole frame pass, which sees them at a size YuNet
+// handles.
 //
 // No OBS, no globals, no logging; nothing here touches the network or the disk
 // except opening the model file.

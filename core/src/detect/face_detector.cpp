@@ -9,7 +9,7 @@
 #include <utility>
 
 #include "detect/source_clip.hpp"
-#include "detect/text_detector.hpp"
+#include "detect/tiling.hpp"
 #include "spg/error.hpp"
 
 namespace spg::detect {
@@ -238,7 +238,7 @@ std::vector<Detection> FaceDetector::detect(const FrameView& frame, Size source)
     return found;
   }
   const std::uint32_t tile = std::min(input_.width, input_.height);
-  for (const Rect& crop : tile_crops(readback_size, tile, config_.tile_overlap)) {
+  for (const Rect& crop : grid_crops(readback_size, tile, config_.tile_overlap)) {
     std::vector<Detection> more = run(ModelInputMapping(crop, input_, Fit::LetterboxTopLeft));
     found.insert(found.end(), more.begin(), more.end());
   }

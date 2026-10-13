@@ -262,7 +262,9 @@ bool ipv6_lost_gap(Text run) {
     if (g.empty() || g.size() > 4 || !std::all_of(g.begin(), g.end(), is_hex)) {
       return false;
     }
-    long_groups += g.size() >= 3 ? 1 : 0;
+    if (g.size() >= 3) {
+      ++long_groups;
+    }
   }
   return long_groups >= 2;
 }

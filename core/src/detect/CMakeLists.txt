@@ -4,6 +4,7 @@
 add_library(spg-detect STATIC
   frame_image.cpp
   source_clip.cpp
+  tiling.cpp
   yunet.cpp
   face_detector.cpp
   db_postprocess.cpp
