@@ -59,19 +59,6 @@ const FaceDetector& detector(bool accelerated = false) {
   return fast;
 }
 
-// A CPU detector with `config`, for cases that need tiles on every call (the
-// default cadence spreads them over calls, so a shared detector's answer
-// would depend on how many calls came before).
-FaceDetector open_cpu(const FaceDetectorConfig& config) {
-  return FaceDetector::open(shared_env(), yunet_path(), config, cpu_only());
-}
-
-FaceDetectorConfig every_tile() {
-  FaceDetectorConfig config;
-  config.tile_cadence = 1;
-  return config;
-}
-
 #define SPG_REQUIRE_YUNET()                                                                   \
   do {                                                                                        \
     if (!fs::is_regular_file(yunet_path())) {                                                 \
@@ -102,11 +89,6 @@ TEST_CASE("FaceDetector rejects a bad config before opening anything", "[face][d
   CHECK_THROWS_AS(FaceDetector::open(shared_env(), "does-not-exist.onnx", config), FaceDetectorError);
   config = {};
   config.top_k = 0;
-  CHECK_THROWS_AS(FaceDetector::open(shared_env(), "does-not-exist.onnx", config), FaceDetectorError);
-  config = {};
-  config.tile_cadence = 0;
-  CHECK_THROWS_AS(FaceDetector::open(shared_env(), "does-not-exist.onnx", config), FaceDetectorError);
-  config.tile_cadence = 9;
   CHECK_THROWS_AS(FaceDetector::open(shared_env(), "does-not-exist.onnx", config), FaceDetectorError);
 }
 
@@ -284,8 +266,7 @@ TEST_CASE("FaceDetector finds small faces in a large frame through scale-1 tiles
   Canvas canvas(source.width, source.height, {200, 200, 200});
   canvas.face(cx, cy, size);
   const auto frame = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
-  static const FaceDetector tiled = open_cpu(every_tile());
-  const auto found = tiled.detect(frame.view, source);
+  const auto found = detector().detect(frame.view, source);
   // Exactly one box: the passes that see it agree after suppression.
   REQUIRE(found.size() == 1);
   const spg::Rect& r = found[0].box.rect;
@@ -294,40 +275,6 @@ TEST_CASE("FaceDetector finds small faces in a large frame through scale-1 tiles
   CHECK(r.x + r.width > cx + 0.3 * size);
   CHECK(r.y < cy - 0.18 * size);
   CHECK(r.y + r.height > cy);
-}
-
-TEST_CASE("FaceDetector runs every tile once in tile_cadence calls", "[face][detector][model]") {
-  SPG_REQUIRE_YUNET();
-  // The same small faces as above, which only the tiles find: with the
-  // tiles spread over `cadence` calls, a face is found in at least one of
-  // any `cadence` consecutive calls.
-  const Size source{1920, 1080};
-  const std::uint32_t cadence = GENERATE(2U, 3U);
-  const double size = GENERATE(40.0, 56.0);
-  const double cx = GENERATE(300.0, 600.0, 1700.0);
-  const double cy = GENERATE(200.0, 560.0, 950.0);
-  CAPTURE(cadence, size, cx, cy);
-  Canvas canvas(source.width, source.height, {200, 200, 200});
-  canvas.face(cx, cy, size);
-  const auto frame = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
-  FaceDetectorConfig config;
-  config.tile_cadence = cadence;
-  const FaceDetector spread = open_cpu(config);
-  std::string seen;  // one character per call: '+' found, '-' not
-  for (std::uint32_t call = 0; call < 2 * cadence; ++call) {
-    seen += spread.detect(frame.view, source).empty() ? '-' : '+';
-  }
-  CAPTURE(seen);
-  for (std::size_t first = 0; first + cadence <= seen.size(); ++first) {
-    CHECK(seen.find('+', first) < first + cadence);
-  }
-  // Every call keeps the whole-frame pass: a face it sees is found each time.
-  Canvas big(source.width, source.height, {200, 200, 200});
-  big.face(960, 540, 300);
-  const auto big_frame = spg::test::to_frame(big, spg::PixelFormat::BGRA);
-  for (std::uint32_t call = 0; call < cadence; ++call) {
-    CHECK(spread.detect(big_frame.view, source).size() == 1);
-  }
 }
 
 TEST_CASE("FaceDetector rejects a tile overlap that is not below the input side", "[face][detector][model]") {
@@ -344,14 +291,12 @@ TEST_CASE("FaceDetector gives the same answer from several threads", "[face][det
   Canvas canvas(960, 540, {200, 200, 200});
   canvas.face(480, 270, 120);
   const auto frame = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
-  // Every tile on every call, so each call computes the same answer.
-  static const FaceDetector shared = open_cpu(every_tile());
-  const auto expected = shared.detect(frame.view, {1920, 1080});
+  const auto expected = detector().detect(frame.view, {1920, 1080});
   REQUIRE(expected.size() == 1);
   std::vector<std::vector<spg::Detection>> results(4);
   std::vector<std::thread> threads;
   for (auto& result : results) {
-    threads.emplace_back([&] { result = shared.detect(frame.view, {1920, 1080}); });
+    threads.emplace_back([&] { result = detector().detect(frame.view, {1920, 1080}); });
   }
   for (auto& thread : threads) {
     thread.join();

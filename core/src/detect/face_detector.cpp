@@ -38,9 +38,6 @@ void check_config(const FaceDetectorConfig& config) {
   if (config.top_k == 0) {
     throw FaceDetectorError("face detector: top_k must be at least 1");
   }
-  if (config.tile_cadence < 1 || config.tile_cadence > 8) {
-    throw FaceDetectorError("face detector: tile_cadence must be in [1, 8]");
-  }
 }
 
 // The float length from `origin` that reaches at least `far`.
@@ -241,13 +238,8 @@ std::vector<Detection> FaceDetector::detect(const FrameView& frame, Size source)
     return found;
   }
   const std::uint32_t tile = std::min(input_.width, input_.height);
-  const std::vector<Rect> crops = grid_crops(readback_size, tile, config_.tile_overlap);
-  const std::uint64_t share = tile_calls_->fetch_add(1, std::memory_order_relaxed) % config_.tile_cadence;
-  for (std::size_t i = 0; i < crops.size(); ++i) {
-    if (i % config_.tile_cadence != share) {
-      continue;
-    }
-    std::vector<Detection> more = run(ModelInputMapping(crops[i], input_, Fit::LetterboxTopLeft));
+  for (const Rect& crop : grid_crops(readback_size, tile, config_.tile_overlap)) {
+    std::vector<Detection> more = run(ModelInputMapping(crop, input_, Fit::LetterboxTopLeft));
     found.insert(found.end(), more.begin(), more.end());
   }
   return merge_passes(std::move(found), config_.nms_iou_threshold);
