@@ -93,7 +93,7 @@ struct LoadResult {
 };
 
 // locate_models(), then opens and warms up each model. Slow (hundreds of
-// milliseconds to seconds): never call it on the render, video or UI thread.
+// milliseconds to seconds): never call it on the graphics or UI thread.
 // Throws only std::bad_alloc.
 [[nodiscard]] LoadResult load_models(std::span<const std::filesystem::path> dirs, const LoadOptions& options = {});
 

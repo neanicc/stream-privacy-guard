@@ -1658,3 +1658,82 @@ Template:
 - Open issues or follow-ups: no live OBS install from a package has been
   done; the live check should install from the CI artifact rather than the
   build tree.
+
+## 2026-10-12 — SPG-14d Build schedulers off the graphics thread (#67)
+
+- Decision / change: OBS runs a filter's `update` and `video_tick` on the
+  graphics thread, which also runs `video_render`, so neither may construct a
+  `ThreadedScheduler` (worker threads, stages around the loaded models).
+  `publish` (settings), `tick` (VRAM refit) and the models' hand-over now only
+  record a request and post the build to a per-filter `TaskThread`, started
+  when the filter is created so asking never starts a thread. The rules live
+  in `GenerationBuilder` (`plugin/src/pipeline/builder.{hpp,cpp}`, no OBS):
+  (1) a settings change covers every frame (`Cover::SettingsChanged`, via a
+  new `PipelineHost::fail(Cover)`) from the request until its generation is
+  offered, since the running one scans with the old settings; (2) a rebuild of
+  the same settings (refit, models ready) keeps the running generation until
+  the new one is offered; (3) only the latest request is offered: one
+  superseded before it starts is never built, one superseded while building
+  goes to the reaper; (4) a failed build covers (`NoDetection`), a failed
+  rebuild (always of the current settings) is asked for again every
+  `kRefitRetryNs` (`RefitSchedule::failed` now forgets a fit marked done
+  when it was asked for), a failed settings change is not retried.
+  The build copies everything it needs and runs without the settings lock;
+  the build thread takes that lock only to hand the generation to
+  `PipelineHost` and log. `tick` only try-locks it. The filter's destructor
+  stops the build thread (a build in progress finishes, queued ones are
+  dropped). Review items from SPG-14c: the `&policy != &published_` guard is
+  gone, replaced by copies (`request_locked` takes the policy by value and
+  `tick`/`models_changed` pass a copy of `requested_`); `tick` has no catch
+  that logs any more, and the shared `log_not_started()` is `noexcept` with a
+  `static_assert` that `log` is `noexcept` (it formats into a stack buffer and
+  calls `blogva`, so it cannot throw or allocate in C++). Comments and docs
+  now say "graphics thread" for `video_tick`/`update` (`docs/plugin-render.md`
+  "Building generations", `docs/settings.md`, headers). Hold clamping is
+  untouched (SPG-08b changes it in parallel).
+- Evidence: 8 new `[build]` pipeline cases (all OSes): a settings change is
+  solid until its build runs and masks after; a rebuild keeps masking while
+  pending; superseded requests are never built or are retired, never offered;
+  failed builds cover and only rebuilds are retried, once per failure; a post
+  or prepare failure fails closed; `TaskThread` order and stop (the stop case
+  waits for `post` to refuse instead of sleeping); a build through a real
+  `TaskThread` records the thread it ran on, which is the build thread and
+  not the caller, with frames solid until the hand-over; 150 builds racing
+  with frames never draw a `Masked` frame from failing scans and never leave
+  more than two generations live. `RefitSchedule` gains a case for a fit
+  marked done whose build then failed. `plugin.loads` now waits for both
+  filters' "scanning with the detection models" lines, which the build thread
+  writes. Mutations: dropping the `SettingsChanged` cover failed 3 of the 8
+  `[build]` cases (35 assertions); building on the caller and handing over on
+  the executor failed the off-thread case (`built_on == thread.id()`). Dev
+  Mac (Apple M4): `scripts/ci/run.sh build` and `test` passed, 334/334,
+  on `main` at `79dd38b`; the `[build]` cases passed 8 repeated runs.
+- Eval delta: not affected. The core pipeline is unchanged (plugin-only);
+  `scripts/ci/run.sh eval` was not run.
+- Review follow-up (staff review and Greptile on the first push): requests
+  now wait in one slot in `GenerationBuilder` and at most one build task is
+  queued behind the running one, so repeated settings changes during a slow
+  build free the superseded copies of the settings at once instead of
+  queuing them (new case: 51 requests leave one task and free the first
+  request's copy; removing the one-task rule failed it). `tick` no longer
+  records a failed rebuild itself; `take_retry()` alone times the retry. The
+  off-thread case now holds the build behind a gate while it checks frames
+  (it could see a hand-over between its check and the frame), and a new case
+  constructs a `ThreadedScheduler` and a stage inside the build on a real
+  `TaskThread` with `SteadyClock` and checks both were made on the build
+  thread. `main` at `33203c0` merged (agent-log conflict only); `build`
+  and `test` passed, 337/337, and the 10 `[build]` cases passed 10 runs.
+- Second review round: a rebuild that superseded a settings change still
+  building (a resize meanwhile) and then failed was not retried, leaving the
+  source covered until the next settings change; any failed rebuild is now
+  retried, since it is always of the current settings (new assertions in
+  "a failed build covers, and only a rebuild is retried"). `PipelineHost::fail`
+  now stores the cover reason under the hand-off lock, so `frame()` never
+  pairs a failure with another call's reason. `build` and `test` passed
+  again after these changes (numbers in the PR).
+- Open issues or follow-ups: every settings change, including one that
+  cannot weaken detection (a longer hold, a wider margin), covers the source
+  until its generation is built; the staff review suggests covering only
+  when the new settings can scan less. Measure the cover time in the live
+  check first. Live check (OBS on a real source) of the solid frames during
+  a settings change: not done.

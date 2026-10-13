@@ -56,7 +56,7 @@ for open question 4, entries never go into filter settings:
   copy gets a new reference and its own copy of the file.
 - The file is read when a filter is created (on the thread that creates it)
   and when `update` sees a different reference in the settings. libobs runs a
-  video filter's `update` deferred on the video thread, so a reference changed
+  video filter's `update` deferred on the graphics thread, so a reference changed
   from outside (a script, obs-websocket) is read there: one file of at most
   about 128 KiB, plus a synced copy when that reference is held by another
   filter. OBS's own image source reads its file the same way. The render

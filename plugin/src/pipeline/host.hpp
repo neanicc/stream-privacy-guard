@@ -39,9 +39,11 @@ class PipelineHost {
   // Any thread. Hands over a generation for the next frame and clears a
   // failure; a generation offered earlier and not yet taken is retired.
   void offer(std::unique_ptr<PipelineSpec> spec) noexcept;
-  // Any thread. No generation could be built for the current settings:
-  // every frame is covered with a solid fill until the next offer().
-  void fail() noexcept;
+  // Any thread. No generation could be built for the current settings, or
+  // the one for new settings is still being built (GenerationBuilder): every
+  // frame is covered with a solid fill, reported as `cover`, until the next
+  // offer(). A generation offered earlier and not yet taken is retired.
+  void fail(Cover cover = Cover::NoDetection) noexcept;
 
   // Render thread: the plan for frame time `t` with the target at `source`.
   [[nodiscard]] const DrawPlan& frame(Timestamp t, Size source) noexcept;
@@ -61,11 +63,13 @@ class PipelineHost {
   std::mutex handoff_mutex_;  // held only to swap pending_
   std::unique_ptr<PipelineSpec> pending_;
   std::atomic<bool> failed_{false};
+  std::atomic<std::uint8_t> fail_cover_{static_cast<std::uint8_t>(Cover::NoDetection)};
   std::atomic<bool> has_news_{false};
 
   // Render thread only.
   std::unique_ptr<PipelineSpec> waiting_;  // taken but not adopted yet
   bool cover_all_ = false;
+  Cover cover_all_reason_ = Cover::NoDetection;
   std::optional<Timestamp> failed_tick_;
   DrawPlan solid_;
 
