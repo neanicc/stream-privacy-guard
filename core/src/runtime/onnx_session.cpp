@@ -239,29 +239,109 @@ struct Session::Impl {
 
 namespace {
 
+// A named dynamic dimension and the value SessionOptions::fixed_shapes gives it.
+struct DimOverride {
+  std::string name;
+  std::int64_t value = 0;
+};
+
+Ort::Session load(Ort::Env& env, const fs::path& path, const std::optional<std::span<const std::byte>>& bytes,
+                  const Ort::SessionOptions& options) {
+  return bytes ? Ort::Session(env, bytes->data(), bytes->size(), options)
+               : Ort::Session(env, path.c_str(), options);
+}
+
+// The free dimension overrides that turn every model input into its shape in
+// `fixed`, read from a CPU session built without graph optimization (only the
+// input declarations are needed). Throws RuntimeError InvalidInput when a shape
+// does not fit its input or a dynamic dimension cannot be fixed, and lets
+// Ort::Exception through for a model ONNX Runtime cannot load.
+std::vector<DimOverride> dim_overrides(Ort::Env& env, const fs::path& path,
+                                       const std::optional<std::span<const std::byte>>& bytes,
+                                       const std::vector<std::vector<std::int64_t>>& fixed) {
+  const std::string label = "spg runtime: " + path_text(path) + ": ";
+  Ort::SessionOptions plain;
+  plain.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
+  const Ort::Session session = load(env, path, bytes, plain);
+  const std::size_t count = session.GetInputCount();
+  if (fixed.size() != count) {
+    throw RuntimeError(ErrorCode::InvalidInput, label + "expected " + std::to_string(count) +
+                                                    " fixed shape(s), got " + std::to_string(fixed.size()));
+  }
+  const Ort::AllocatorWithDefaultOptions allocator;
+  std::vector<DimOverride> overrides;
+  for (std::size_t i = 0; i < count; ++i) {
+    const std::string name = session.GetInputNameAllocated(i, allocator).get();
+    const Ort::TypeInfo type = session.GetInputTypeInfo(i);
+    if (type.GetONNXType() != ONNX_TYPE_TENSOR) {
+      throw RuntimeError(ErrorCode::InvalidInput, label + "input '" + name + "' is not a tensor");
+    }
+    const auto info = type.GetTensorTypeAndShapeInfo();
+    const std::vector<std::int64_t> spec = info.GetShape();
+    std::vector<const char*> symbols(spec.size(), nullptr);
+    info.GetSymbolicDimensions(symbols.data(), symbols.size());
+    const std::vector<std::int64_t>& want = fixed[i];
+    const auto misfit = [&](const std::string& why) {
+      throw RuntimeError(ErrorCode::InvalidInput, label + "fixed shape " + shape_text(want) + " for input '" + name +
+                                                      "' " + why + " (model: " + shape_text(spec) + ")");
+    };
+    if (!fitted_count(want, spec)) {
+      misfit("does not fit the model");
+    }
+    for (std::size_t d = 0; d < spec.size(); ++d) {
+      if (spec[d] >= 0) {
+        continue;
+      }
+      const std::string symbol = symbols[d] != nullptr ? symbols[d] : "";
+      if (symbol.empty()) {
+        misfit("cannot be applied: dimension " + std::to_string(d) + " has no name to fix");
+      }
+      const auto same = std::find_if(overrides.begin(), overrides.end(),
+                                     [&](const DimOverride& o) { return o.name == symbol; });
+      if (same == overrides.end()) {
+        overrides.push_back({symbol, want[d]});
+      } else if (same->value != want[d]) {
+        misfit("gives dimension '" + symbol + "' two values (" + std::to_string(same->value) + " and " +
+               std::to_string(want[d]) + ")");
+      }
+    }
+  }
+  return overrides;
+}
+
 // `bytes`, when set, is the model; `path` then only names it.
 std::unique_ptr<Session::Impl> create_impl(Ort::Env& env, const fs::path& path,
                                            const std::optional<std::span<const std::byte>>& bytes, Provider provider,
-                                           const SessionOptions& options) {
+                                           const SessionOptions& options, const std::vector<DimOverride>& overrides) {
   Ort::SessionOptions ort_options;
   ort_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
   if (options.intra_op_threads > 0) {
     ort_options.SetIntraOpNumThreads(options.intra_op_threads);
   }
-  configure_provider(ort_options, provider);
+  for (const DimOverride& o : overrides) {
+    ort_options.AddFreeDimensionOverrideByName(o.name.c_str(), o.value);
+  }  configure_provider(ort_options, provider);
 
   auto impl = std::make_unique<Session::Impl>();
   impl->path = path;
   impl->path_label = path_text(path);
   impl->provider = provider;
-  impl->session = bytes ? Ort::Session(env, bytes->data(), bytes->size(), ort_options)
-                        : Ort::Session(env, path.c_str(), ort_options);
+  impl->session = load(env, path, bytes, ort_options);
 
   const Ort::AllocatorWithDefaultOptions allocator;
   const std::size_t input_count = impl->session.GetInputCount();
   for (std::size_t i = 0; i < input_count; ++i) {
     const std::string name = impl->session.GetInputNameAllocated(i, allocator).get();
     impl->inputs.push_back(describe(name, impl->session.GetInputTypeInfo(i)));
+  }
+  // dim_overrides() checked the count; this catches an override ONNX Runtime
+  // did not apply, which would leave the input dynamic.
+  for (std::size_t i = 0; i < options.fixed_shapes.size() && i < input_count; ++i) {
+    if (impl->inputs[i].shape != options.fixed_shapes[i]) {
+      impl->fail(ErrorCode::InvalidInput, "input '" + impl->inputs[i].name + "' is " +
+                                              shape_text(impl->inputs[i].shape) + " after fixing it to " +
+                                              shape_text(options.fixed_shapes[i]));
+    }
   }
   const std::size_t output_count = impl->session.GetOutputCount();
   for (std::size_t i = 0; i < output_count; ++i) {
@@ -327,6 +407,16 @@ Session Session::open_from(Environment& env, const std::filesystem::path& model,
   }
   const std::vector<Provider> available = available_providers();
 
+  std::vector<DimOverride> overrides;
+  if (!options.fixed_shapes.empty()) {
+    try {
+      overrides = dim_overrides(env.impl_->env, model, bytes, options.fixed_shapes);
+    } catch (const Ort::Exception& error) {
+      throw RuntimeError(ErrorCode::ModelLoadFailed,
+                         "spg runtime: " + label + ": ONNX Runtime could not load the model\n  " + error.what());
+    }
+  }
+
   std::vector<ProviderAttempt> attempts;
   bool model_error = false;
   // Set when CPU itself failed: the model, not an accelerator, is the problem.
@@ -339,7 +429,7 @@ Session Session::open_from(Environment& env, const std::filesystem::path& model,
     }
     ErrorCode code = ErrorCode::ModelLoadFailed;
     try {
-      auto impl = create_impl(env.impl_->env, model, bytes, provider, options);
+      auto impl = create_impl(env.impl_->env, model, bytes, provider, options, overrides);
       Session session(std::move(impl));
       if (options.warmup_runs > 0) {
         session.warmup(options.warmup_shapes, options.warmup_runs);

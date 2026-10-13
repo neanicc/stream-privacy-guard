@@ -126,6 +126,7 @@ if(SPG_WITH_DEPS)
   set(_spg_runtime_fixture_script "${CMAKE_CURRENT_SOURCE_DIR}/integration/make_runtime_fixtures.py")
   add_custom_command(
     OUTPUT "${_spg_runtime_fixtures}/scale_static.onnx" "${_spg_runtime_fixtures}/scale_dynamic.onnx"
+           "${_spg_runtime_fixtures}/scale_square.onnx" "${_spg_runtime_fixtures}/scale_unnamed.onnx"
            "${_spg_runtime_fixtures}/not_a_model.onnx" "${_spg_runtime_fixtures}/models.txt"
            "${_spg_runtime_fixtures}/text_wrong_shape.onnx" "${_spg_runtime_fixtures}/text_sqrt.onnx"
            "${_spg_runtime_fixtures}/rec_softmax.onnx" "${_spg_runtime_fixtures}/rec_sqrt.onnx"

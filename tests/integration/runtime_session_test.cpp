@@ -311,6 +311,83 @@ TEST_CASE("Dynamic inputs need explicit warmup shapes", "[runtime]") {
   }
 }
 
+TEST_CASE("Fixed shapes make dynamic inputs static", "[runtime]") {
+  SessionOptions options = cpu_only();
+
+  SECTION("the input reports and accepts only the fixed shape") {
+    options.fixed_shapes = {{3, 4}};
+    // No warmup shape needed: the input is static now.
+    const Session session = Session::open(shared_env(), fixture("scale_dynamic.onnx"), options);
+    CHECK(session.inputs()[0].shape == std::vector<std::int64_t>{3, 4});
+    const std::vector<float> input{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    CHECK(doubled(session, input, {3, 4}) == times_two(input));
+    const std::vector<float> two_rows{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<std::int64_t> other{2, 4};
+    const TensorView view{two_rows, other};
+    error_of(ErrorCode::InvalidInput, [&] { static_cast<void>(session.run({&view, 1})); });
+  }
+  SECTION("from bytes, on the default providers") {
+    SessionOptions accelerated;
+    accelerated.fixed_shapes = {{1, 4}};
+    std::ifstream in(fixture("scale_dynamic.onnx"), std::ios::binary);
+    const std::vector<char> raw{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    std::vector<std::byte> bytes(raw.size());
+    std::transform(raw.begin(), raw.end(), bytes.begin(), [](char c) { return static_cast<std::byte>(c); });
+    const Session session =
+        Session::open(shared_env(), spg::runtime::ModelBytes{fixture("scale_dynamic.onnx"), bytes}, accelerated);
+    CHECK(session.inputs()[0].shape == std::vector<std::int64_t>{1, 4});
+    const std::vector<float> input{1, 2, 3, 4};
+    CHECK(doubled(session, input, {1, 4}) == times_two(input));
+  }
+  SECTION("a static model takes its own shape") {
+    options.fixed_shapes = {{2, 3}};
+    const Session session = Session::open(shared_env(), fixture("scale_static.onnx"), options);
+    CHECK(session.inputs()[0].shape == std::vector<std::int64_t>{2, 3});
+  }
+  SECTION("a shape that contradicts a fixed dimension is rejected") {
+    options.fixed_shapes = {{3, 5}};
+    const std::string message = error_of(ErrorCode::InvalidInput, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("scale_dynamic.onnx"), options));
+    });
+    CHECK_THAT(message, ContainsSubstring("[3, 5]") && ContainsSubstring("'x'"));
+  }
+  SECTION("the wrong number of shapes is rejected") {
+    options.fixed_shapes = {{1, 4}, {1, 4}};
+    error_of(ErrorCode::InvalidInput, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("scale_dynamic.onnx"), options));
+    });
+  }
+  SECTION("a non-positive dimension is rejected") {
+    options.fixed_shapes = {{0, 4}};
+    error_of(ErrorCode::InvalidInput, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("scale_dynamic.onnx"), options));
+    });
+  }
+  SECTION("one dimension name cannot take two values") {
+    options.fixed_shapes = {{2, 3}};
+    const std::string message = error_of(ErrorCode::InvalidInput, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("scale_square.onnx"), options));
+    });
+    CHECK_THAT(message, ContainsSubstring("'n'"));
+    options.fixed_shapes = {{3, 3}};
+    const Session session = Session::open(shared_env(), fixture("scale_square.onnx"), options);
+    CHECK(session.inputs()[0].shape == std::vector<std::int64_t>{3, 3});
+  }
+  SECTION("an unnamed dynamic dimension cannot be fixed") {
+    options.fixed_shapes = {{1, 4}};
+    const std::string message = error_of(ErrorCode::InvalidInput, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("scale_unnamed.onnx"), options));
+    });
+    CHECK_THAT(message, ContainsSubstring("no name"));
+  }
+  SECTION("a file that is not a model is still ModelLoadFailed") {
+    options.fixed_shapes = {{1, 4}};
+    error_of(ErrorCode::ModelLoadFailed, [&] {
+      static_cast<void>(Session::open(shared_env(), fixture("not_a_model.onnx"), options));
+    });
+  }
+}
+
 TEST_CASE("A moved-from Environment is an InvalidInput error, not a crash", "[runtime]") {
   Environment source(Environment::LogLevel::Error);
   const Environment target = std::move(source);
