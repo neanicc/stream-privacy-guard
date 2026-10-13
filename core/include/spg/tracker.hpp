@@ -124,7 +124,10 @@ struct TrackMotion {
 //        run, it lies on the axis and in the direction of the measurement
 //        before it, at a speed along that axis within follow_speed_ratio of
 //        that one's. A consistent measurement extends the run; a translation
-//        that does not continue it starts a new run.
+//        that does not continue it starts a new run. A run starts at the box
+//        it was measured from, except one that replaces a broken run: that
+//        starts at the box measured to, since the box measured from ended
+//        the old run and may be another line's.
 //     3. End of a run. The run ends on a measurement that is not a
 //        translation, a confirmation whose width or height differs by more
 //        than a quarter from the last measured box, a skipped confirmation
@@ -137,10 +140,14 @@ struct TrackMotion {
 //        track is followed on frame time t when all of these hold: it was
 //        taken in frame order, after the last resize, at or after the
 //        confirmation the run started from; no update() since it missed the
-//        track; a later detection of the run was seen in (td, t]; and the
-//        track was confirmed at or after t. Its coverage on t is then the
-//        mask of the newest detection of the run seen at or before t, which
-//        is held as above.
+//        track; a later detection of the run was seen in (td, t]; the track
+//        was confirmed at or after t; and the newest detection of the run
+//        seen at or before t, grown by its margin, contains this one's box
+//        moved to its frame time at every velocity between the run's lowest
+//        and highest measurement (per axis). Its coverage on t is then the
+//        mask of that newest detection, which is held as above. A newer
+//        detection that found only part of the text so never releases one
+//        that covered all of it.
 //     6. Never followed. A late detection, a detection taken before a resize
 //        or a missed cycle, any detection of a track that is not confirmed
 //        moving, and anything on a frame time after the track's last
@@ -231,10 +238,13 @@ class Tracker {
     Timestamp first_seen{};     // earliest frame time of a detection it took
     bool translating = false;   // see TrackMotion::translating
     // Following: consistent measurements in the current run, the frame time
-    // of the confirmation the run started from, the latest measurement, and
+    // of the confirmation the run started from, the lowest and highest
+    // measured velocity of the run (per axis), the latest measurement, and
     // the box (and its frame time) the next measurement is taken from.
     std::size_t run = 0;
     Timestamp run_from{};
+    Velocity run_low;
+    Velocity run_high;
     Velocity measured;
     Rect anchor;
     Timestamp anchor_time{};

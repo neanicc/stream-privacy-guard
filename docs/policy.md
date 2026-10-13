@@ -87,9 +87,14 @@ the box's smaller side, on every edge). The semantics since SPG-12b (#75):
    quarter in between, the track is confirmed moving. An older detection of
    that run is then not held where it was on a frame `t` once a newer
    detection of the run was seen at or before `t`, provided the track was
-   found again at or after `t` and no scan cycle has missed it since that
-   older detection. On that frame the track's newest detection at or before
-   `t` (with its prediction and margin) is what covers the text. This is
+   found again at or after `t`, no scan cycle has missed it since that
+   older detection, and the newest detection at or before `t`, grown by its
+   margin, contains the older box moved along every speed the run measured.
+   On that frame that newest detection (with its prediction and margin) is
+   what covers the text; a newer detection that found only part of the line
+   never releases an older box that covered all of it. A run that replaces
+   a broken one starts with its own first measured box, so a line moving the
+   other way never takes over the box the old run ended on. This is
    what lets a scrolling chat line's old rows clear while the line is still
    tracked. A track that has not moved 4 px for longer than `hold_ms` is no
    longer confirmed.
@@ -107,8 +112,7 @@ the box's smaller side, on every edge). The semantics since SPG-12b (#75):
 `follow_after`, `follow_speed_ratio` and `follow_min_move` in `TrackerConfig`
 set the run length, speed factor and minimum move; `follow_after = 0` turns
 following off. They are not policy settings yet. The AGENTS.md "Temporal
-hold" invariant still reads "never shrink it early"; its wording for (2) is
-proposed in #82 (`needs-human`).
+hold" invariant names (2) as its one exception (#82).
 
 ## Secrecy
 

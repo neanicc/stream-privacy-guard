@@ -2144,6 +2144,39 @@ Template:
   speed checks of the run fails it on seed 1062; without that condition the
   property test passed the same mutation. AGENTS.md wording: #82
   (`needs-human`).
+- Babysit cycle 2 (staff review on `ba8e8e0`, coordinator safety check):
+  - A newer detection that found only part of a scrolling line (clipped on
+    one side within the quarter size tolerance, so the run went on) released
+    the older full boxes: with default margins a 30 px clip of a 200 x 40
+    line left the line's far edge uncovered from the clipped detection to the
+    next one. An older box is now followed only if the newest box of the run
+    at or before `t`, grown by its margin, contains it moved to the newest
+    one's frame time at every velocity between the run's lowest and highest
+    measurement. A check with the latest measurement alone was not enough: a
+    20 px left clip shifts the center, so the measurement taken to the
+    clipped box carried the older box along with it. New unit case: clips
+    of 0 to 25% on each side, on cycles 2 to 4, cover the line's full extent
+    on every frame; it fails with the check removed or with the latest
+    measurement alone.
+  - A run that replaces a broken one (another axis, direction or speed) now
+    starts with the box measured to, not from. Before, a same-size line that
+    took over a missed line's track moving the other way released that
+    line's last box after two measurements. Starting every run with the box
+    measured to (also the track's first run) was measured too and removed
+    all of the CI gain (decoy back to 0.4054), so only the broken-run case
+    changed.
+  - The accepted risk is pinned in a unit case: a same-size line that
+    continues a missed line's run (same axis, direction and speed) takes its
+    hold; a taller line, a reversed one and following off keep it.
+    `docs/tracker.md` gains a state diagram of `measure_run` and a
+    "Remaining risk" section.
+  - Eval, pre-merge (base `974b882`, same seed): CI text decoy 0.3404 (304,
+    unchanged), every other CI metric identical. Local text decoy 0.3954
+    (1840 of 4654; 52 more pairs held than `ba8e8e0`, main 0.5092); watch-list
+    pair 3996/3999, first-frame 51/53, PII pair 4158/4162, leak 7/1919, clean
+    0.0019: identical. Local faces identical (pair 2206/2207, leak 1/1080,
+    clean 0). Realtime (loaded machine, unreliable): fail-closed 0.9956,
+    p95 857 ms, both FAIL as on main.
 - Rejected with evidence: measuring each confirmation against the previous
   one. The eval's two workers confirm frames 17 ms apart, where a chat line
   moves under 2 px and the box jitters 1-2 px, so almost every pair broke the
@@ -2180,7 +2213,7 @@ Template:
   change to `eval/thresholds.toml` (option 2 on #75). Lower decoy without a
   threshold change needs a decision on the margin (policy default) or on
   retroactive rects for confirmed moving tracks; both measured above.
-- Open issues or follow-ups: AGENTS.md's "Temporal hold" bullet still says a
-  mask never shrinks early; the wording change is #82 (`needs-human`).
+- Open issues or follow-ups: AGENTS.md's "Temporal hold" bullet now names
+  following as its one exception (#82, merged by the owner).
   `decoy_blur_rate` continues in SPG-12d #81. Synthetic eval only; live OBS
   not tested.

@@ -681,8 +681,13 @@ TEST_CASE("tracker: only a consistent run of translations confirms a moving trac
   CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 492, 200, 60}}, config), 400, r0));
   // Speed changes more than twofold (20 px, then 45 px).
   CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 435, 200, 60}}, config), 400, r0));
-  // Within the ratio (20 px, then 35 px) it is consistent.
-  CHECK_FALSE(still_held(*run({r0, {100, 480, 200, 60}, {100, 445, 200, 60}}, config), 400, r0));
+  // Within the ratio (20 px, then 35 px) it is consistent. An older box
+  // follows only if the newest box grown by its margin contains it moved at
+  // every speed between the run's measurements (100 to 175 px/s): with the
+  // default margins (19 px) box 0 does; with zero margins it still holds.
+  const std::vector<Rect> faster{r0, {100, 480, 200, 60}, {100, 445, 200, 60}};
+  CHECK_FALSE(still_held(*run(faster, TrackerConfig{}), 400, r0));
+  CHECK(still_held(*run(faster, config), 400, r0));
   // Axis change: up, then left.
   CHECK(still_held(*run({r0, {100, 480, 200, 60}, {80, 480, 200, 60}}, config), 400, r0));
   // The box changed size by more than a quarter (another line took the track).
@@ -697,16 +702,17 @@ TEST_CASE("tracker: only a consistent run of translations confirms a moving trac
                    r0));
 
   // A run that restarts only follows from where it restarted: after the
-  // reversal the track moves down steadily, so box 1 (where the new run
-  // starts) and later boxes follow, but box 0 stays held for its whole hold
-  // (1.5 s here).
+  // reversal the track moves down steadily, so box 2 (the first box measured
+  // into the new run, where box 0 also is) and later boxes follow. Box 1,
+  // which ended the old run and which the new run was measured from, and
+  // box 0 stay held for their whole hold (1.5 s here).
   TrackerConfig long_hold = config;
   long_hold.hold = milliseconds{1500};
   const auto restarted = run({r0, {100, 480, 200, 60}, {100, 500, 200, 60}, {100, 520, 200, 60},
                               {100, 540, 200, 60}},
                              long_hold);
   CHECK(still_held(*restarted, 800, r0));                          // box 0
-  CHECK_FALSE(still_held(*restarted, 800, {100, 480, 200, 60}));  // box 1
+  CHECK(still_held(*restarted, 800, {100, 480, 200, 60}));        // box 1
   CHECK_FALSE(still_held(*restarted, 800, {100, 520, 200, 60}));  // box 3
   CHECK(still_held(*restarted, 800, {100, 540, 200, 60}));        // newest
 }
@@ -715,8 +721,10 @@ TEST_CASE("tracker: two workers' close confirmations do not break the run", "[tr
   // Two workers scan frames 17 ms apart, then 200 ms later again. Over 17 ms
   // the line moves under 2 px, less than the box jitters, so those
   // confirmations are not measured; the 200 ms moves are, and confirm it.
+  // Default margins: the newest box's margin absorbs the jitter, so the
+  // older boxes moved along the measured motion fit in it and follow.
   ManualClock clock;
-  const TrackerConfig config = exact_follow_config();
+  const TrackerConfig config;
   Tracker tracker(clock, config);
   const std::vector<std::pair<std::int64_t, Rect>> cycles{
       {0, {100.0F, 500.0F, 200.0F, 60.0F}},   {17, {100.0F, 499.0F, 200.0F, 62.0F}},
@@ -896,6 +904,125 @@ TEST_CASE("tracker: a track that stops for longer than the hold ends its run", "
   feed(1400, 380.0F);
   REQUIRE(tracker.tracks().size() == 1);
   CHECK(holds(1400, 460.0F));  // the boxes from 800 and 1200 ms
+}
+
+TEST_CASE("tracker: a clipped re-detection never releases a box that covered all the text",
+          "[tracker]") {
+  // A 200 x 40 line scrolls up at 100 px/s (y = 500 - 0.1 t, t in ms) and is
+  // detected every 200 ms. On one cycle the detector finds only part of it:
+  // the box is clipped on one side by up to a quarter of that dimension, the
+  // size tolerance, so the run goes on. On every frame from 200 ms (when the
+  // velocity is known) to the last detection, queried once the update that
+  // releases it has run, the masks still cover the line's whole extent
+  // (default margins). Following must keep the older full boxes there.
+  enum class Side { Left, Right, Top, Bottom };
+  const auto truth = [](std::int64_t ms) {
+    const double y = 500.0 - 0.1 * static_cast<double>(ms);
+    return Region{100.0, y, 300.0, y + 40.0};
+  };
+  const auto detected = [](int i, Side side, float clip) {
+    const float y = 500.0F - 20.0F * static_cast<float>(i);
+    switch (side) {
+      case Side::Left:
+        return text(100.0F + clip, y, 200.0F - clip, 40.0F);
+      case Side::Right:
+        return text(100.0F, y, 200.0F - clip, 40.0F);
+      case Side::Top:
+        return text(100.0F, y + clip, 200.0F, 40.0F - clip);
+      case Side::Bottom:
+        return text(100.0F, y, 200.0F, 40.0F - clip);
+    }
+    return text(100.0F, y, 200.0F, 40.0F);
+  };
+  const TrackerConfig config;
+  REQUIRE(config.follow_after == 2);
+  for (const Side side : {Side::Left, Side::Right, Side::Top, Side::Bottom}) {
+    const bool across = side == Side::Left || side == Side::Right;
+    for (const float fraction : {0.0F, 0.1F, 0.15F, 0.2F, 0.25F}) {
+      const float clip = fraction * (across ? 200.0F : 40.0F);
+      for (const int clipped : {2, 3, 4}) {
+        INFO("side " << static_cast<int>(side) << ", clipped by " << clip << " px on cycle "
+                     << clipped);
+        ManualClock clock;
+        Tracker tracker(clock, config);
+        for (int i = 0; i <= 6; ++i) {
+          const std::int64_t now = 200 * static_cast<std::int64_t>(i);
+          const Detection d = detected(i, side, i == clipped ? clip : 0.0F);
+          clock.set(at_ms(now));
+          tracker.update(at_ms(now), std::vector<Detection>{d});
+          REQUIRE(tracker.tracks().size() == 1);
+          for (std::int64_t t = std::max<std::int64_t>(200, now - 175); t <= now; t += 25) {
+            INFO("frame " << t);
+            CHECK(covered(tracker.masks(at_ms(t)), truth(t)));
+          }
+        }
+        if (fraction == 0.0F && clipped == 2) {
+          // Not vacuous: unclipped, the track follows, so the first row is
+          // clear by 600 ms.
+          CHECK_FALSE(covered(tracker.masks(at_ms(600)), truth(0)));
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("tracker: a same-size line that continues a missed line's run takes its hold",
+          "[tracker]") {
+  // The accepted residual risk of following, pinned. Line A (200 x 40)
+  // scrolls up 20 px per 200 ms cycle and is confirmed moving, then stops at
+  // y = 460 and is missed from 600 ms on, while still on screen. Line B, of
+  // the same size, appears where A would have been and goes on at A's
+  // speed, so it takes A's track and continues its run. A's last box is then
+  // followed: on frames from B's first detection it is not covered. Only
+  // following off, or a takeover that does not continue the run (another
+  // size, or another direction), keeps A's box for its whole hold.
+  const auto line = [](float y) { return text(100.0F, y, 200.0F, 40.0F); };
+  const Region a = region_of(line(460.0F).box.rect);
+  const auto scene = [&](const TrackerConfig& config, const std::vector<Detection>& b) {
+    ManualClock clock;
+    auto tracker = std::make_unique<Tracker>(clock, config);
+    const std::vector<Detection> a_found{line(500.0F), line(480.0F), line(460.0F)};
+    for (std::size_t i = 0; i < a_found.size() + b.size(); ++i) {
+      const Detection& d = i < a_found.size() ? a_found[i] : b[i - a_found.size()];
+      const std::int64_t now = 200 * static_cast<std::int64_t>(i);
+      clock.set(at_ms(now));
+      tracker->update(at_ms(now), std::vector<Detection>{d});
+    }
+    REQUIRE(tracker->tracks().size() == 1);
+    return tracker;
+  };
+  const auto held_until_hold_ends = [&](const Tracker& tracker) {
+    for (std::int64_t t = 400; t <= 1150; t += 25) {
+      INFO("frame " << t);
+      CHECK(covered(tracker.masks(at_ms(t)), a));
+    }
+  };
+  const TrackerConfig config;
+  const std::vector<Detection> continues{line(440.0F), line(420.0F), line(400.0F)};
+
+  // The risk: B continues the run, and A's box is released early.
+  const auto taken = scene(config, continues);
+  CHECK(covered(taken->masks(at_ms(400)), a));
+  CHECK(covered(taken->masks(at_ms(575)), a));
+  CHECK_FALSE(covered(taken->masks(at_ms(600)), a));
+  CHECK_FALSE(covered(taken->masks(at_ms(800)), a));
+  CHECK_FALSE(covered(taken->masks(at_ms(1000)), a));
+  // After the last confirmation nothing is followed.
+  CHECK(covered(taken->masks(at_ms(1025)), a));
+
+  SECTION("following off") {
+    TrackerConfig off = config;
+    off.follow_after = 0;
+    held_until_hold_ends(*scene(off, continues));
+  }
+  SECTION("a taller line (by more than a quarter) ends the run") {
+    held_until_hold_ends(*scene(config, {text(100.0F, 434.0F, 200.0F, 52.0F),
+                                         text(100.0F, 414.0F, 200.0F, 52.0F),
+                                         text(100.0F, 394.0F, 200.0F, 52.0F)}));
+  }
+  SECTION("a line moving the other way starts a run without A's box") {
+    held_until_hold_ends(*scene(config, {line(480.0F), line(500.0F), line(520.0F)}));
+  }
 }
 
 // --- Property tests --------------------------------------------------------

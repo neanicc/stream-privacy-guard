@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -407,13 +406,21 @@ void Tracker::measure_run(TrackState& state, Timestamp frame_time, const Rect& b
     if (along_x == before_x && now * before > 0.0 && std::abs(now) <= ratio * std::abs(before) &&
         std::abs(before) <= ratio * std::abs(now)) {
       state.run = std::min(state.run + 1, kMaxFollowAfter);
+      state.run_low = Velocity{std::min(state.run_low.dx_per_s, measured.dx_per_s),
+                               std::min(state.run_low.dy_per_s, measured.dy_per_s)};
+      state.run_high = Velocity{std::max(state.run_high.dx_per_s, measured.dx_per_s),
+                                std::max(state.run_high.dy_per_s, measured.dy_per_s)};
       return;
     }
   }
-  // A translation that does not continue the run starts a new one from the
-  // box it was measured from.
+  // A translation that does not continue the run starts a new one: from the
+  // box it was measured from, except after a broken run. There that box
+  // ended the old run moving another way and may be another line's, one this
+  // box took the track over from, so the new run starts with this box.
+  state.run_from = state.run > 0 ? frame_time : from_time;
   state.run = 1;
-  state.run_from = from_time;
+  state.run_low = measured;
+  state.run_high = measured;
 }
 
 Tracker::Held Tracker::make_held(const Rect& box, Timestamp seen, Velocity velocity,
@@ -465,25 +472,50 @@ void Tracker::masks(Timestamp t, std::vector<Box>& out) const {
   for (const TrackState& state : tracks_) {
     // Following: on a frame time the track has been confirmed at or after,
     // a confirmed moving track's run detections older than the newest one
-    // seen at or before t are covered by that one's mask instead.
-    std::optional<Timestamp> newest;
+    // seen at or before t are covered by that one's mask instead, each only
+    // if the newest box grown by its margin contains it moved to the newest
+    // one's frame time at every velocity between the run's lowest and
+    // highest measurement. A newer detection that found only part of the
+    // text (clipped within the size tolerance) so never releases a box that
+    // covered all of it: the part it missed lies outside it, and the
+    // measurement it biased only widens the range.
+    const Held* newest = nullptr;
     if (config_.follow_after > 0 && state.run >= config_.follow_after &&
         t <= state.track.last_confirmed) {
       for (const Held& held : state.held) {
         if (held.followable && held.seen >= state.run_from && held.seen <= t &&
-            (!newest.has_value() || held.seen > *newest)) {
-          newest = held.seen;
+            (newest == nullptr || held.seen > newest->seen)) {
+          newest = &held;
         }
       }
     }
+    const auto followed = [&](const Held& held) {
+      if (newest == nullptr || !held.followable || held.seen < state.run_from ||
+          held.seen >= newest->seen) {
+        return false;
+      }
+      const double dt = seconds(newest->seen - held.seen);
+      const Rect& n = newest->box;
+      const Rect& b = held.box;
+      const double x0 = static_cast<double>(b.x) + static_cast<double>(state.run_low.dx_per_s) * dt;
+      const double y0 = static_cast<double>(b.y) + static_cast<double>(state.run_low.dy_per_s) * dt;
+      const double x1 = static_cast<double>(b.x) + static_cast<double>(b.width) +
+                        static_cast<double>(state.run_high.dx_per_s) * dt;
+      const double y1 = static_cast<double>(b.y) + static_cast<double>(b.height) +
+                        static_cast<double>(state.run_high.dy_per_s) * dt;
+      return static_cast<double>(n.x) - newest->margin_x <= x0 &&
+             static_cast<double>(n.y) - newest->margin_y <= y0 &&
+             x1 <= static_cast<double>(n.x) + static_cast<double>(n.width) + newest->margin_x &&
+             y1 <= static_cast<double>(n.y) + static_cast<double>(n.height) + newest->margin_y;
+    };
     const std::size_t start = out.size();
     out.resize(start + slots, Box{kNoRect, Space::Source});
     for (const Held& held : state.held) {
       if (t < held.seen || t > held.seen + config_.hold) {
         continue;
       }
-      if (newest.has_value() && held.followable && held.seen >= state.run_from && held.seen < *newest) {
-        continue;  // followed
+      if (followed(held)) {
+        continue;
       }
       const std::int64_t bucket =
           slots > 1 ? floor_div(held.seen.time_since_epoch().count(), width) - first : 0;

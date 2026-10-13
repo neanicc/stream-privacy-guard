@@ -5,10 +5,11 @@ SPG-09) turns detections into the Source-space rects to mask on each frame. It
 implements the temporal-hold invariant from [AGENTS.md](../AGENTS.md): a blurred
 region stays blurred for at least the hold after its last detection, with
 margin, and tracking loss, a dropped frame or a source resize can extend a mask
-but never shrink it early. Since SPG-12b (#75) the hold of a **confirmed moving
-track** follows the track while the track is still being updated, instead of
-keeping a box where the text was ([Following](#following)); the owner chose
-this on #75.
+but never shrink it early, with one exception: since SPG-12b (#75) the hold of
+a **confirmed moving track** follows the track while the track is still being
+updated, instead of keeping a box where the text was
+([Following](#following)). The owner chose this on #75 and added the
+exception to the invariant in #82.
 
 ## Model
 
@@ -59,8 +60,11 @@ text is.
   unless it starts a run, it lies on the same axis and in the same direction
   as the measurement before it, at a speed along that axis within
   `follow_speed_ratio` (default 2) of that one's. A translation that fails
-  (2) starts a new run from the box it was measured from; one that fails (1)
-  ends the run. A confirmation whose width or height differs by more than a
+  (2) starts a new run with the box it was measured to: the box it was
+  measured from ended the old run moving another way, and it may be another
+  line's, one this box took the track over from. One that fails (1) ends the
+  run. A run that starts with no run before it (the track's first, or after
+  a run ended) starts from the box it was measured from. A confirmation whose width or height differs by more than a
   quarter from the last measured box also ends the run (another line that
   takes over the track usually has another size), and so does a confirmation
   that is not measured more than `hold` after the last measurement (the
@@ -78,11 +82,14 @@ text is.
   frame time `t` when it was taken in frame order at or after the
   confirmation the run started from, no cycle has missed the track since it
   was taken, a later detection of the same run was
-  seen in `(seen, t]`, and the track was confirmed at or after `t` (it is
-  still being updated: a later scan found it again). A followed detection adds
-  no rect on `t`; the track's coverage there is the mask of the newest
-  detection of the run seen at or before `t`, which holds as usual (its box,
-  its prediction hull and margin).
+  seen in `(seen, t]`, the track was confirmed at or after `t` (it is
+  still being updated: a later scan found it again), and the **newest
+  detection of the run seen at or before `t`, grown by its margin, contains
+  this detection's box moved to the newest one's frame time at every
+  velocity between the run's lowest and highest measurement** (per axis). A
+  followed detection adds no rect on `t`; the track's coverage there is the
+  mask of that newest detection, which holds as usual (its box, its
+  prediction hull and margin).
 - **Never followed:** a late detection (its place in the run was not
   measured), a detection taken before a `rescale()` (a resize also ends the
   run) or before a missed cycle, any detection of a track that is not
@@ -95,10 +102,63 @@ text is.
 Why it does not uncover the text: on frame `t` the newest detection at or
 before `t` found the text at its box, and the run says the text kept moving
 the same way since the run began, so it does not return to the rows older
-detections saw. That newest detection's mask (unmoved box, hull to its
+detections saw. The containment check covers a newest detection that found
+only part of the text: a re-detection clipped on one side, by up to the
+quarter the size check allows, keeps the run going, but the older full box
+moved along the run's motion sticks out of it, so the older box keeps its
+hold. The check uses the whole range of the run's measurements, not the
+latest one alone, because the clipped box also biases the measurement taken
+to it (its center moved by half the clip). That newest detection's mask (unmoved box, hull to its
 prediction) and the retroactive rects of the later confirmation (static and
 moved back, [scheduler.md](scheduler.md#masks)) still cover `t`, as before.
 Following does not touch retroactive rects or the SPG-12c trail.
+
+### Run state
+
+`measure_run()` runs on each in-order confirmation. `anchor` is the last
+measured box (and `anchor_time` its frame time), `run` the count of
+consistent measurements, `run_from` the frame time of the first box the run
+may follow, and `run_low` and `run_high` the per-axis range of its measured
+velocities. A missed cycle, a `rescale()` and a late detection act outside
+it: a miss or a resize sets `run` to 0 and makes every box held so far
+unfollowable (a resize also re-anchors in the new coordinates), and a late
+detection is held unfollowable and never measured.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> NoRun: track created (anchor = first box)
+    NoRun --> NoRun: size changed over a quarter / not a translation (re-anchor)
+    NoRun --> NoRun: under min move, still past the hold (re-anchor)
+    NoRun --> Run: translation (run 1, run_from = anchor time)
+    Run --> Run: consistent (run + 1, widen velocity range)
+    Run --> Run: translation on another axis, direction or speed (run 1, run_from = this box)
+    Run --> NoRun: size changed over a quarter / not a translation
+    Run --> NoRun: under min move, still past the hold (re-anchor)
+    Run --> NoRun: missed cycle or resize
+    Run --> Run: under min move (not measured, no change)
+```
+
+`Run` with `run >= follow_after` is "confirmed moving". Every arrow that
+measures (a move of at least `follow_min_move` from the anchor) also moves
+the anchor to the new box. The size check runs first, then the minimum move,
+then the translation and consistency checks.
+
+### Remaining risk
+
+Following trusts that a track is one line. A different line of the same size
+(within a quarter) that takes over a track and **continues its run** (same
+axis and direction, speed within `follow_speed_ratio`) while the first line
+is still on screen but missed by every scan releases that line's older boxes
+early: from the new line's first detection, only the new line's mask covers
+the track. The unit case "a same-size line that continues a missed line's
+run takes its hold" pins this. A takeover by a line of another size, one
+moving another way (its run starts with its own box), a missed cycle in
+between, or following off keeps the first line's boxes for their whole hold;
+the same case checks each. It was not observed in the synthetic suites,
+whose covered sensitive pairs match `main`. The live-OBS scrolling-chat leak
+test in [live-check.md](live-check.md) is what can show it does not happen
+in practice.
 
 ## Properties
 
@@ -143,8 +203,10 @@ and a drift under the minimum move do not either, two workers' confirmations
 restarted, a missed cycle keeps the full hold of every earlier box after the
 track is found again, a track that stood still for longer than the hold
 starts a new run, a static line keeps its hold while a same-size line
-scrolls through it (even when it is missed while they overlap), and late
-detections, boxes from before a resize and frames after the last
+scrolls through it (even when it is missed while they overlap), a
+re-detection clipped on any side by up to a quarter never uncovers the
+line's full extent, the takeover risk above (and the guards that stop it),
+and late detections, boxes from before a resize and frames after the last
 confirmation keep their hold.
 
 ## Association and motion
