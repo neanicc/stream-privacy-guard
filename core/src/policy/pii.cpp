@@ -443,46 +443,43 @@ std::size_t token_body(Text t, std::size_t begin, bool may_split) {
   return digit ? total : joined;
 }
 
-// The rules of has_token() on one view of the text.
-bool token_in(Text t) {
+// Known prefixes, JWTs and PEM headers. OCR reads l or I as '|', so prefixes
+// and bodies are read in a view where every '|' is an l, at the same offsets as
+// the text; whether a prefix starts a word is decided on the text as read,
+// where a '|' is a separator ("key|ghp_..."). So a '|' can be a misread letter
+// and a separator on one line, every match on the text as read is still one
+// here (prefixes hold no '|', and a body in the view is never shorter), and
+// token_body() only ever lengthens a body.
+bool has_token(Text raw) {
+  SecureU32String repaired;
+  Text view = raw;
+  if (raw.find(U'|') != Text::npos) {
+    repaired.assign(raw.begin(), raw.end());
+    std::replace(repaired.begin(), repaired.end(), U'|', U'l');
+    view = Text(repaired);
+  }
   for (const TokenFormat& format : kTokenFormats) {
-    for (std::size_t at = t.find(format.prefix); at != Text::npos; at = t.find(format.prefix, at + 1)) {
-      if (at > 0 && (is_alnum(t[at - 1]) || t[at - 1] == U'_')) {
+    for (std::size_t at = view.find(format.prefix); at != Text::npos; at = view.find(format.prefix, at + 1)) {
+      if (at > 0 && (is_alnum(raw[at - 1]) || raw[at - 1] == U'_')) {
         continue;
       }
-      if (token_body(t, at + format.prefix.size(), format.prefix != U"eyj") >= format.min_body) {
+      if (token_body(view, at + format.prefix.size(), format.prefix != U"eyj") >= format.min_body) {
         return true;
       }
     }
   }
-  if (has_jwt(t)) {
+  if (has_jwt(raw) || has_jwt(view)) {
     return true;
   }
   // A PEM private key header ("-----BEGIN OPENSSH PRIVATE KEY-----").
-  for (std::size_t at = t.find(U"begin"); at != Text::npos; at = t.find(U"begin", at + 1)) {
-    const bool after_dash = at > 0 && (t[at - 1] == U'-' || (at > 1 && t[at - 1] == U' ' && t[at - 2] == U'-'));
-    if (after_dash && t.find(U"private key", at) != Text::npos) {
+  for (std::size_t at = raw.find(U"begin"); at != Text::npos; at = raw.find(U"begin", at + 1)) {
+    const bool after_dash =
+        at > 0 && (raw[at - 1] == U'-' || (at > 1 && raw[at - 1] == U' ' && raw[at - 2] == U'-'));
+    if (after_dash && raw.find(U"private key", at) != Text::npos) {
       return true;
     }
   }
   return false;
-}
-
-// The text as read, then, if it holds a '|', again with every '|' read as l
-// (in a token it can only be an OCR reading of l or I). Checking the text as
-// read first keeps every match the rules found before: a '|' that separates a
-// prefix from what precedes it ("key|ghp_...") still starts a token there.
-// token_body() only ever lengthens a body, so the views only add matches.
-bool has_token(Text raw) {
-  if (token_in(raw)) {
-    return true;
-  }
-  if (raw.find(U'|') == Text::npos) {
-    return false;
-  }
-  SecureU32String view(raw);
-  std::replace(view.begin(), view.end(), U'|', U'l');
-  return token_in(Text(view));
 }
 
 constexpr Text kStreetSuffixes[] = {

@@ -141,6 +141,10 @@ TEST_CASE("pii: tokens survive OCR misreads", "[policy][pii]") {
   // stray space (SPG-12); the '|' ended the body after 16 characters.
   CHECK(found(Category::PiiToken, "ghp_SYNTHETIC0123456|SYNTHETIC0123456789"));
   CHECK(found(Category::PiiToken, "|ive_123456789_SYNTHETICabcdefghij"));  // l of live_ read as '|'
+  // A '|' as a separator and a '|' as a misread letter on one line.
+  CHECK(found(Category::PiiToken, "key|ghp_SYNTHETIC0123456|SYNTHETIC0123456789"));
+  CHECK(found(Category::PiiToken, "key||ive_123456789_SYNTHETICabcdefghij|"));
+  CHECK_FALSE(found(Category::PiiToken, "x|ive_123456789_SYNTHETICabcdefghij"));  // "xlive_" starts no word
   CHECK(found(Category::PiiToken, "ghp_SYNTHETIC0 123456SYNTHETIC0123456789"));
   CHECK(found(Category::PiiToken, "ghp_SYNTH3TIC xyzw0123 SYNTHETIC"));  // needs both splits
   // A split needs runs of at least six characters on both sides and a digit

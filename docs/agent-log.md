@@ -1947,7 +1947,11 @@ Template:
   main `c338c0c` on 200,000 synthetic damaged lines (tokens of every prefix,
   IPv4, IPv6, JWTs, OCR noise) found that commit missing `PII_TOKEN` on 5,015
   lines main caught, and the fixed head missing none (it adds a reason on
-  16,603). `tests/unit/policy_pii_test.cpp` now pins every prefix at its
+  16,603). Greptile then found a line with both kinds of `|`
+  (`key|ghp_<16 chars>|<20 chars>`) that neither view caught; prefixes and
+  bodies are now read in the repaired view with word starts decided on the
+  text as read, and the differential run again shows nothing main caught is
+  missed (17,031 lines gain a reason). `tests/unit/policy_pii_test.cpp` now pins every prefix at its
   minimum body, with a `|`, a space or words around it, and IPv4/IPv6 forms.
   An IPv4 address is also looked for in the text as read, since the digit view
   turns a `|` beside it into a 1. (2) IPv6: a run
