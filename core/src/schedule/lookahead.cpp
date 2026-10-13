@@ -284,14 +284,20 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
   const Timestamp from = job.frame_time - config_.retro;
   const bool same_size = job.size_epoch == current;
   // Every frame released so far is older than every buffered one, so only
-  // buffered frames can bound a trail.
+  // buffered frames can bound a trail. Scanned frames are few, so they are
+  // gathered once, newest first, rather than walking the buffer per box.
+  std::vector<Timestamp> scanned_times;
+  for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
+    if (it->scanned) {
+      scanned_times.push_back(it->t);
+    }
+  }
   std::vector<std::optional<Timestamp>> last_scan(result.detections.size());
   for (std::size_t i = 0; i < result.detections.size(); ++i) {
-    for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
-      if (it->scanned && it->t < motions[i].first_seen) {
-        last_scan[i] = it->t;
-        break;
-      }
+    const auto it = std::find_if(scanned_times.begin(), scanned_times.end(),
+                                 [&](Timestamp t) { return t < motions[i].first_seen; });
+    if (it != scanned_times.end()) {
+      last_scan[i] = *it;
     }
   }
   for (FrameRecord& frame : frames_) {
