@@ -2083,3 +2083,80 @@ Template:
   entry, or skip instances with no legible height in a sequence's last
   frames, is a human scorer decision (docs/eval.md). Synthetic eval only;
   live OBS not tested.
+
+## 2026-10-13 — SPG-12b Decoy blur on scrolling text (#75)
+
+- Decision (owner, issue #75): option 1. For a confirmed moving track that is
+  still being updated, the hold follows the track instead of keeping the
+  stale rect. Tracking loss, a resize and anything not confirmed keep the old
+  hold. Parameters below are this PR's choices; nobody was asked.
+- Measured first (main `974b882`, text suite, temporary switches in a scratch
+  build that were not committed). Every covered decoy is in the chat template
+  (CI 362 of 362; local 2366 of 2370, the other 4 in a window), so
+  `decoy_blur_rate` is scrolling chat. Covered decoy pairs, local (4654 pairs,
+  2370 covered, 0.5092) and CI (893 pairs, 362, 0.4054):
+
+  | Change (alone unless noted) | Local | CI | Recall / leak |
+  | --- | --- | --- | --- |
+  | Drop every held box of a translating track that a newer detection of the track at or before the frame superseded (upper bound of option 1) | 1666 (0.358) | 264 (0.296) | unchanged |
+  | Same, any track | 1665 (0.358) | 264 | unchanged |
+  | Margin 0 (`margin_px` and `margin_ratio`) | 1813 (0.390) | 200 (0.224) | unchanged |
+  | Drop the newest held box's unmoved part too (moved box only) | not run | 234 (0.262) | CI leak 0 -> 3 frames, watch-list pair 557 -> 554 |
+  | No static retro rect for a moving track | not run | 300 (0.336) | unchanged in CI |
+  | Superseded drop + no static retro | 1089 (0.234) | 202 (0.226) | local first-frame 51 -> 50 (FAIL), leak 7 -> 13, watch-list pair 3996 -> 3990 |
+  | Superseded drop + margin 0 | not run | 24 (0.027) | unchanged in CI |
+
+  So stale held rects of moving tracks are about 30% of covered decoys
+  (704 of 2370 local, 98 of 362 CI), margin about a quarter, and the static
+  retroactive rect of a moving track (placed where the line will be) most of
+  the rest; the newest box's own unmoved part is not safe to drop.
+- Change: `Tracker` follows confirmed moving tracks (docs/tracker.md,
+  "Following"; docs/policy.md, "Temporal hold"). In-order confirmations are
+  measured against the last measured box once the center moved at least
+  `follow_min_move` (4 px); a measurement is consistent when both edges
+  translated at least 1 px along the larger velocity axis and, after the
+  first, the axis and direction match and the speed is within
+  `follow_speed_ratio` (2) of the previous one; a size change over a quarter
+  ends the run. Two measurements in a run (`follow_after` 2, three
+  detections) confirm the track. A held box of the run is then left out on a
+  frame once a newer detection of the run is at or before that frame and the
+  track was confirmed at or after it. Late detections, boxes from before a
+  resize, unconfirmed tracks and frames after the last confirmation keep the
+  old hold. Retroactive rects and the SPG-12c trail are unchanged.
+  `TrackMotion` also reports the track id.
+- Rejected with evidence: measuring each confirmation against the previous
+  one. The eval's two workers confirm frames 17 ms apart, where a chat line
+  moves under 2 px and the box jitters 1-2 px, so almost every pair broke the
+  run: CI decoy stayed at 362 (no change). The minimum move fixed it.
+  Dropping the static retroactive rect of a moving track reaches 0.234 locally
+  but loses recall (table), and it is a retroactive mask, outside the
+  decision. Margin is a policy default, also outside it.
+- Eval, head vs main on the same generated suites (default seed). Main is
+  `974b882` logic (the scratch build with the switches unset; text numbers
+  match the SPG-12c entry exactly).
+  - CI text: decoy 0.4054 -> 0.3404 (362 -> 304 pairs, still FAIL);
+    watch-list pair 1.0000, first-frame 15/15, PII pair 1.0000, leak 0/285,
+    clean blur 0: all identical.
+  - Local text: decoy 0.5092 -> 0.3797 (2370 -> 1767, still FAIL);
+    watch-list pair 0.9992 (3996/3999), first-frame 51/53, PII pair 0.9990
+    (4158/4162), leak 7/1919: identical, and the same (frame, instance)
+    pairs are covered; clean blur 0.0027 -> 0.0019.
+  - Local faces: identical (pair 0.9995, leak 1/1080, clean 0).
+  - Realtime (dev Mac under heavy load from other processes, not reliable):
+    fail-closed 0.9978 main vs 1.0000 head in the `run_eval` pair, then
+    0.9948 / 0.9933 and 0.9993 / 1.0000 (main / head) in two interleaved
+    pairs; p95 latency 802-981 ms on both. Both FAIL as on main; SPG-16 owns
+    it. Following runs in `masks()` on the scheduler thread and adds no
+    stage time.
+- Floor and what a threshold change would need: with this change and
+  today's margin and retroactive rects, decoy is 0.3797 locally and 0.3404 in
+  CI. The rest is the newest box's own unmoved part and margin, and the
+  static retroactive rect of a moving line, which covers the line above
+  where the secret will be. Passing on this head needs
+  `decoy_blur_rate_max` of at least 0.38 (local) and 0.35 (CI), a human
+  change to `eval/thresholds.toml` (option 2 on #75). Lower decoy without a
+  threshold change needs a decision on the margin (policy default) or on
+  retroactive rects for confirmed moving tracks; both measured above.
+- Open issues or follow-ups: AGENTS.md's "Temporal hold" bullet still says a
+  mask never shrinks early; a wording change goes in a separate
+  `needs-human` PR. Synthetic eval only; live OBS not tested.

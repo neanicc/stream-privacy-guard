@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -149,6 +150,12 @@ TEST_CASE("tracker: config comes from the policy and is validated", "[tracker]")
   rejects([](TrackerConfig& c) { c.velocity_smoothing = std::nanf(""); });
   rejects([](TrackerConfig& c) { c.max_rects_per_track = 0; });
   rejects([](TrackerConfig& c) { c.max_rects_per_track = 65; });
+  rejects([](TrackerConfig& c) { c.follow_after = 65; });
+  rejects([](TrackerConfig& c) { c.follow_speed_ratio = 0.5F; });
+  rejects([](TrackerConfig& c) { c.follow_speed_ratio = std::nanf(""); });
+  rejects([](TrackerConfig& c) { c.follow_speed_ratio = INFINITY; });
+  rejects([](TrackerConfig& c) { c.follow_min_move = 0.5F; });
+  rejects([](TrackerConfig& c) { c.follow_min_move = std::nanf(""); });
 
   // Zero hold and margin are accepted here (a floor is #28).
   TrackerConfig zero;
@@ -156,6 +163,11 @@ TEST_CASE("tracker: config comes from the policy and is validated", "[tracker]")
   zero.margin_px = 0.0F;
   zero.margin_ratio = 0.0F;
   CHECK_NOTHROW(spg::validate(zero));
+  // Following off, and the tightest speed ratio, are accepted.
+  TrackerConfig strict;
+  strict.follow_after = 0;
+  strict.follow_speed_ratio = 1.0F;
+  CHECK_NOTHROW(spg::validate(strict));
 }
 
 TEST_CASE("tracker: a detection holds with its margin for exactly the hold", "[tracker]") {
@@ -225,17 +237,18 @@ TEST_CASE("tracker: update reports the motion of the track each detection joined
   // A new track has no motion measurement yet: zero, first seen now.
   tracker.update(at_ms(0), std::vector<Detection>{face(100.0F, 100.0F, 50.0F, 50.0F)}, &motions);
   REQUIRE(motions.size() == 1);
-  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(0)});
+  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(0), false, 1});
   // The second confirmation measures 200 px/s right; a far box starts a track.
   tracker.update(at_ms(100),
                  std::vector<Detection>{face(600.0F, 600.0F, 50.0F, 50.0F), face(120.0F, 100.0F, 50.0F, 50.0F)},
                  &motions);
   REQUIRE(motions.size() == 2);
-  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(100)});
+  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(100), false, 2});
   CHECK(std::abs(motions[1].velocity.dx_per_s - 200.0F) < 0.01F);
   CHECK(motions[1].velocity.dy_per_s == 0.0F);
   CHECK(motions[1].first_seen == at_ms(0));  // the track's first detection
   CHECK(motions[1].translating);             // both x edges moved right
+  CHECK(motions[1].track == 1);
   // A late detection of the moving track, from before its first one, moves
   // first_seen back but not the track.
   tracker.update(at_ms(-50), std::vector<Detection>{face(110.0F, 100.0F, 50.0F, 50.0F)}, &motions);
@@ -255,7 +268,7 @@ TEST_CASE("tracker: an older detection that arrives last measures the motion it 
   // older one shows the box came from 6 px to the right 30 ms before.
   tracker.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
   REQUIRE(motions.size() == 1);
-  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(280)});
+  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(280), false, 1});
   tracker.update(at_ms(250), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
   REQUIRE(motions.size() == 1);
   CHECK(motions[0].first_seen == at_ms(250));
@@ -270,7 +283,7 @@ TEST_CASE("tracker: an older detection that arrives last measures the motion it 
   Tracker same(clock, TrackerConfig{});
   same.update(at_ms(280), std::vector<Detection>{face(900.0F, 100.0F, 200.0F, 20.0F)}, &motions);
   same.update(at_ms(280), std::vector<Detection>{face(906.0F, 100.0F, 200.0F, 20.0F)}, &motions);
-  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(280)});
+  CHECK(motions[0] == spg::TrackMotion{spg::Velocity{}, at_ms(280), false, 1});
 
   // A track that already has a velocity keeps it, but an earliest detection
   // that shows the box sliding the same way marks it translating.
@@ -514,9 +527,11 @@ TEST_CASE("tracker: an upscale keeps the scaled margin and rounding", "[tracker]
 
 TEST_CASE("tracker: a long hold stays within the rect cap and keeps coverage", "[tracker]") {
   // 60 s hold, detected at 10 Hz while moving 150 px/s: 600 held detections
-  // whose masks do not contain each other.
+  // whose masks do not contain each other. Following is off, so every one of
+  // them holds where it was found (following is tested below).
   ManualClock clock;
   TrackerConfig config;
+  config.follow_after = 0;
   config.hold = milliseconds{60'000};
   config.margin_px = 0.0F;
   config.margin_ratio = 0.0F;
@@ -556,6 +571,204 @@ TEST_CASE("tracker: a long hold stays within the rect cap and keeps coverage", "
   CHECK(covered(one, {0.0, 0.0, 45.0, 30.0}));
 }
 
+// --- Following (SPG-12b, #75) ----------------------------------------------
+
+namespace {
+
+// A chat line 200 x 40 px scrolling up 20 px per 200 ms cycle (100 px/s):
+// the box on cycle i (frame time 200 i ms).
+Detection scrolled(int i) {
+  return text(100.0F, 500.0F - 20.0F * static_cast<float>(i), 200.0F, 40.0F);
+}
+
+TrackerConfig exact_follow_config() {
+  TrackerConfig config;  // follow_after 2, follow_speed_ratio 2
+  config.margin_px = 0.0F;
+  config.margin_ratio = 0.0F;
+  return config;
+}
+
+}  // namespace
+
+TEST_CASE("tracker: a confirmed moving track's hold follows it while it is updated", "[tracker]") {
+  ManualClock clock;
+  const TrackerConfig config = exact_follow_config();
+  REQUIRE(config.follow_after == 2);
+  Tracker tracker(clock, config);
+  const auto feed = [&](int i) {
+    clock.set(at_ms(200 * i));
+    tracker.update(at_ms(200 * i), std::vector<Detection>{scrolled(i)});
+  };
+  const auto holds = [&](std::int64_t ms, int i) {
+    return covered(tracker.masks(at_ms(ms)), required(scrolled(i).box.rect, config));
+  };
+
+  feed(0);
+  feed(1);
+  // One measurement does not confirm the track: the first box still holds
+  // where it was.
+  CHECK(holds(200, 0));
+  CHECK(holds(200, 1));
+
+  feed(2);
+  // Two consistent measurements confirm it. On frames the track has been
+  // confirmed at or after, the older boxes follow the track: only the newest
+  // box seen at or before the frame holds (with its prediction), so the rows
+  // the line scrolled away from are clear.
+  CHECK(holds(400, 2));
+  CHECK_FALSE(holds(400, 0));
+  CHECK_FALSE(holds(400, 1));
+  // Between confirmations the newest earlier box holds, moved along the
+  // velocity: at 300 ms box 1 and its 10 px prediction, not box 0.
+  CHECK(holds(300, 1));
+  CHECK(covered(tracker.masks(at_ms(300)), {100.0, 470.0, 300.0, 520.0}));
+  CHECK_FALSE(holds(300, 0));
+  // Each frame's own detection holds on that frame.
+  CHECK(holds(0, 0));
+  CHECK(holds(200, 1));
+
+  // Past the last confirmation the track may be lost: every box holds where
+  // it was for its whole hold again.
+  CHECK(holds(401, 0));
+  CHECK(holds(401, 1));
+  CHECK(holds(401, 2));
+  CHECK(holds(750, 0));
+  CHECK_FALSE(holds(751, 0));  // its hold has ended
+
+  // The next confirmation follows those frames too.
+  feed(3);
+  CHECK_FALSE(holds(500, 0));
+  CHECK_FALSE(holds(500, 1));
+  CHECK(holds(500, 2));
+  CHECK(holds(600, 3));
+}
+
+TEST_CASE("tracker: only a consistent run of translations confirms a moving track", "[tracker]") {
+  ManualClock clock;
+  const TrackerConfig config = exact_follow_config();
+  const auto run = [&](const std::vector<Rect>& boxes, TrackerConfig c) {
+    auto tracker = std::make_unique<Tracker>(clock, c);
+    for (std::size_t i = 0; i < boxes.size(); ++i) {
+      const Rect& b = boxes[i];
+      tracker->update(at_ms(200 * static_cast<std::int64_t>(i)),
+                      std::vector<Detection>{text(b.x, b.y, b.width, b.height)});
+    }
+    REQUIRE(tracker->tracks().size() == 1);
+    return tracker;
+  };
+  const Rect r0{100.0F, 500.0F, 200.0F, 60.0F};
+  const auto still_held = [&](const Tracker& t, std::int64_t ms, const Rect& b) {
+    return covered(t.masks(at_ms(ms)), required(b, config));
+  };
+
+  // Steady: confirmed, the first box follows.
+  CHECK_FALSE(still_held(*run({r0, {100, 480, 200, 60}, {100, 460, 200, 60}}, config), 400, r0));
+  // Following off: every box holds.
+  TrackerConfig off = config;
+  off.follow_after = 0;
+  CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 460, 200, 60}}, off), 400, r0));
+  // follow_after 3 needs a third measurement.
+  TrackerConfig three = config;
+  three.follow_after = 3;
+  CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 460, 200, 60}}, three), 400, r0));
+  CHECK_FALSE(still_held(*run({r0, {100, 480, 200, 60}, {100, 460, 200, 60}, {100, 440, 200, 60}}, three),
+                         600, r0));
+
+  // Reversal: up, then down.
+  CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 492, 200, 60}}, config), 400, r0));
+  // Speed changes more than twofold (20 px, then 45 px).
+  CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 435, 200, 60}}, config), 400, r0));
+  // Within the ratio (20 px, then 35 px) it is consistent.
+  CHECK_FALSE(still_held(*run({r0, {100, 480, 200, 60}, {100, 445, 200, 60}}, config), 400, r0));
+  // Axis change: up, then left.
+  CHECK(still_held(*run({r0, {100, 480, 200, 60}, {80, 480, 200, 60}}, config), 400, r0));
+  // The box changed size by more than a quarter (another line took the track).
+  CHECK(still_held(*run({r0, {100, 480, 200, 60}, {100, 460, 140, 60}}, config), 400, r0));
+  // Growing in place (typed) or shifting by less than a pixel is not a
+  // translation.
+  CHECK(still_held(*run({r0, {100, 500, 230, 60}, {100, 500, 260, 60}}, config), 400, r0));
+  CHECK(still_held(*run({r0, {100, 499.5F, 200, 60}, {100, 499.0F, 200, 60}}, config), 400, r0));
+  // A box that moves less than follow_min_move (4 px) from the last measured
+  // one is not measured, so a slow drift never confirms.
+  CHECK(still_held(*run({r0, {100, 497, 200, 60}, {100, 494, 200, 60}, {100, 497, 200, 60}}, config), 600,
+                   r0));
+
+  // A run that restarts only follows from where it restarted: after the
+  // reversal the track moves down steadily, so box 1 (where the new run
+  // starts) and later boxes follow, but box 0 stays held for its whole hold
+  // (1.5 s here).
+  TrackerConfig long_hold = config;
+  long_hold.hold = milliseconds{1500};
+  const auto restarted = run({r0, {100, 480, 200, 60}, {100, 500, 200, 60}, {100, 520, 200, 60},
+                              {100, 540, 200, 60}},
+                             long_hold);
+  CHECK(still_held(*restarted, 800, r0));                          // box 0
+  CHECK_FALSE(still_held(*restarted, 800, {100, 480, 200, 60}));  // box 1
+  CHECK_FALSE(still_held(*restarted, 800, {100, 520, 200, 60}));  // box 3
+  CHECK(still_held(*restarted, 800, {100, 540, 200, 60}));        // newest
+}
+
+TEST_CASE("tracker: two workers' close confirmations do not break the run", "[tracker]") {
+  // Two workers scan frames 17 ms apart, then 200 ms later again. Over 17 ms
+  // the line moves under 2 px, less than the box jitters, so those
+  // confirmations are not measured; the 200 ms moves are, and confirm it.
+  ManualClock clock;
+  const TrackerConfig config = exact_follow_config();
+  Tracker tracker(clock, config);
+  const std::vector<std::pair<std::int64_t, Rect>> cycles{
+      {0, {100.0F, 500.0F, 200.0F, 60.0F}},   {17, {100.0F, 499.0F, 200.0F, 62.0F}},
+      {200, {100.0F, 480.0F, 200.0F, 60.0F}}, {217, {100.0F, 479.5F, 200.0F, 59.0F}},
+      {400, {100.0F, 460.0F, 200.0F, 60.0F}}, {417, {100.0F, 458.0F, 200.0F, 61.0F}}};
+  for (const auto& [ms, box] : cycles) {
+    tracker.update(at_ms(ms), std::vector<Detection>{text(box.x, box.y, box.width, box.height)});
+  }
+  REQUIRE(tracker.tracks().size() == 1);
+  const std::vector<Box> masks = tracker.masks(at_ms(417));
+  CHECK_FALSE(covered(masks, required(cycles[0].second, config)));
+  CHECK_FALSE(covered(masks, required(cycles[2].second, config)));
+  CHECK(covered(masks, required(cycles[5].second, config)));
+}
+
+TEST_CASE("tracker: late detections and boxes from before a resize are never followed", "[tracker]") {
+  ManualClock clock;
+  const TrackerConfig config = exact_follow_config();
+
+  // A line scrolling up 6 px per cycle; a late result for 100 ms lands after
+  // the track was confirmed moving. It holds; box 0 follows.
+  Tracker tracker(clock, config);
+  const auto slow = [](int i) { return text(100.0F, 500.0F - 6.0F * static_cast<float>(i), 200.0F, 20.0F); };
+  for (int i = 0; i < 3; ++i) {
+    tracker.update(at_ms(200 * i), std::vector<Detection>{slow(i)});
+  }
+  const Detection late = text(100.0F, 497.0F, 200.0F, 20.0F);
+  tracker.update(at_ms(100), std::vector<Detection>{late});
+  REQUIRE(tracker.tracks().size() == 1);
+  CHECK(covered(tracker.masks(at_ms(400)), required(late.box.rect, config)));
+  CHECK_FALSE(covered(tracker.masks(at_ms(400)), required(slow(0).box.rect, config)));
+
+  // A resize: every box held before it keeps its hold where it was (and
+  // scaled), even after the track is confirmed moving again.
+  Tracker resized(clock, config);
+  for (int i = 0; i < 3; ++i) {
+    resized.update(at_ms(200 * i), std::vector<Detection>{scrolled(i)});
+  }
+  const std::vector<Box> before = resized.masks(at_ms(400));
+  resized.rescale(Size{1920, 1080}, Size{1920, 1080});
+  CHECK(no_shrink(before, resized.masks(at_ms(400))));
+  for (int i = 3; i < 8; ++i) {
+    resized.update(at_ms(200 * i), std::vector<Detection>{scrolled(i)});
+  }
+  REQUIRE(resized.tracks().size() == 1);
+  for (int i = 0; i < 3; ++i) {
+    INFO("box " << i);
+    CHECK(covered(resized.masks(at_ms(750)), required(scrolled(i).box.rect, config)));
+  }
+  // Boxes after the resize follow again once a new run is confirmed (the
+  // boxes from before it have expired by 1200 ms).
+  CHECK_FALSE(covered(resized.masks(at_ms(1200)), required(scrolled(3).box.rect, config)));
+  CHECK(covered(resized.masks(at_ms(1200)), required(scrolled(6).box.rect, config)));
+}
+
 // --- Property tests --------------------------------------------------------
 //
 // Seeded random scenes: several objects of both kinds moving at constant or
@@ -570,6 +783,9 @@ struct Fed {
   Rect box;
   Timestamp seen;
   bool before_resize = false;
+  spg::TrackId track = 0;
+  // Seen after every earlier detection of its track: taken in frame order.
+  bool in_order = false;
 };
 
 struct Object {
@@ -645,20 +861,61 @@ std::vector<Region> expected_regions(const Fed& fed, double sx, double sy,
   return out;
 }
 
-}  // namespace
-
-TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker][property]") {
+// With `follow` false, following is off and the strict SPG-09 properties
+// hold: every detection is covered for its whole hold, updates only add and
+// masks only grow in frame time. With `follow` true (random follow_after,
+// speed ratio and minimum move), a detection may lose its own rect on frame t only when it
+// could be followed, which needs at least: taken in frame order, after any
+// resize, a later in-order detection of the same track seen in (seen, t], and
+// the track confirmed at or after t. Every other detection, including the
+// newest one of each track at or before t and every detection on frames after
+// its track's last confirmation (tracking loss), stays covered. Returns how
+// many times a detection was found followed (not covered).
+std::uint64_t run_hold_property(bool follow) {
   constexpr std::uint32_t kScenes = 2000;
   constexpr std::int64_t kFrameNs = 16'666'667;  // 60 fps
+  std::uint64_t followed = 0;
   for (std::uint32_t seed = 1; seed <= kScenes; ++seed) {
-    INFO("seed " << seed);
+    INFO("seed " << seed << (follow ? " (following)" : ""));
     Scene scene(seed);
-    const TrackerConfig config = scene.config();
+    TrackerConfig config = scene.config();
+    if (follow) {
+      config.follow_after = static_cast<std::size_t>(scene.uniform_int(1, 3));
+      config.follow_speed_ratio = static_cast<float>(scene.uniform(1.0, 3.0));
+      config.follow_min_move = static_cast<float>(scene.uniform(1.0, 8.0));
+    } else {
+      config.follow_after = 0;
+    }
     std::vector<Object> objects = scene.objects();
     ManualClock clock;
     Tracker tracker(clock, config);
     std::vector<Fed> fed;
     std::vector<std::pair<Timestamp, std::vector<Detection>>> late;
+    std::vector<spg::TrackMotion> motions;
+    const auto record = [&fed](const Rect& box, Timestamp when, spg::TrackId track) {
+      bool in_order = true;
+      for (const Fed& f : fed) {
+        in_order = in_order && (f.track != track || f.seen < when);
+      }
+      fed.push_back(Fed{box, when, false, track, in_order});
+    };
+    // Whether the hold may let detection i go on frame t (see above).
+    const auto may_follow = [&fed, follow](std::size_t i, Timestamp t) {
+      const Fed& d = fed[i];
+      if (!follow || d.before_resize || !d.in_order) {
+        return false;
+      }
+      bool later = false;
+      bool updated = false;
+      for (const Fed& f : fed) {
+        if (f.track != d.track) {
+          continue;
+        }
+        later = later || (f.in_order && !f.before_resize && f.seen > d.seen && f.seen <= t);
+        updated = updated || f.seen >= t;
+      }
+      return later && updated;
+    };
 
     const int frames = scene.uniform_int(60, 200);
     const int resize_frame = scene.chance(0.3) ? scene.uniform_int(10, frames - 10) : -1;
@@ -683,9 +940,9 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
         // Results still in flight are in the old coordinates; deliver them
         // before the resize (the scheduler owns what happens otherwise).
         for (const auto& [when, batch] : late) {
-          tracker.update(when, batch);
-          for (const Detection& d : batch) {
-            fed.push_back(Fed{d.box.rect, when});
+          tracker.update(when, batch, &motions);
+          for (std::size_t k = 0; k < batch.size(); ++k) {
+            record(batch[k].box.rect, when, motions[k].track);
           }
         }
         late.clear();
@@ -756,7 +1013,8 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
       for (const auto& [when, batch] : batches) {
         // Detection latency: the clock is ahead of the frame time.
         clock.set(std::max(clock.now(), frame_time + milliseconds{scene.uniform_int(5, 120)}));
-        // Updates only add: snapshot masks for frames still in the buffer.
+        // Updates only add (without following): snapshot masks for frames
+        // still in the buffer.
         std::vector<Timestamp> probes;
         for (int k = 0; k < 4; ++k) {
           probes.push_back(clock.now() - config.retain + scene.within(config.retain + config.hold));
@@ -765,20 +1023,22 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
         for (Timestamp p : probes) {
           before.push_back(tracker.masks(p));
         }
-        tracker.update(when, batch);
-        for (std::size_t k = 0; k < probes.size(); ++k) {
+        tracker.update(when, batch, &motions);
+        for (std::size_t k = 0; k < probes.size() && !follow; ++k) {
           INFO("update at frame " << f << ", probe " << k);
           REQUIRE(no_shrink(before[k], tracker.masks(probes[k])));
         }
-        for (const Detection& d : batch) {
-          fed.push_back(Fed{d.box.rect, when});
+        REQUIRE(motions.size() == batch.size());
+        for (std::size_t k = 0; k < batch.size(); ++k) {
+          record(batch[k].box.rect, when, motions[k].track);
           fed_fresh = fed_fresh || when == frame_time;
         }
       }
 
       // Hold: every detection is covered, grown by the margin, on every frame
-      // time in [seen, seen + hold] that is still within the retention.
-      // Frames are sampled (some are never queried, like dropped frames).
+      // time in [seen, seen + hold] that is still within the retention,
+      // unless it may be followed there. Frames are sampled (some are never
+      // queried, like dropped frames).
       const Timestamp oldest = clock.now() - config.retain;
       for (int k = 0; k < 6; ++k) {
         const Timestamp t = oldest + scene.within(config.retain + config.hold);
@@ -789,9 +1049,14 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
           if (t < fed[i].seen || t > fed[i].seen + config.hold) {
             continue;
           }
+          const bool optional = may_follow(i, t);
           for (const Region& g : expected_regions(fed[i], sx, sy, config)) {
             INFO("frame " << f << ", detection " << i);
-            REQUIRE(covered(masks, g));
+            if (optional) {
+              followed += covered(masks, g) ? 0U : 1U;
+            } else {
+              REQUIRE(covered(masks, g));
+            }
           }
         }
       }
@@ -800,8 +1065,9 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
       // detection the window can see (nothing seen + hold >= oldest has been
       // pruned): from a t inside a retained detection's hold to a t2 before
       // any detection active at t expires, masks only grow.
+      // Without following only.
       std::vector<std::size_t> live;
-      for (std::size_t i = 0; i < fed.size(); ++i) {
+      for (std::size_t i = 0; i < fed.size() && !follow; ++i) {
         if (fed[i].seen + config.hold >= oldest) {
           live.push_back(i);
         }
@@ -828,8 +1094,21 @@ TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker
 
     // A positive retention window saw at least one detection delivered on
     // its own frame, so the monotone check above compared real masks.
-    if (fed_fresh && config.hold + config.retain >= milliseconds{120}) {
+    if (!follow && fed_fresh && config.hold + config.retain >= milliseconds{120}) {
       REQUIRE(monotone_checks > 0);
     }
   }
+  return followed;
+}
+
+}  // namespace
+
+TEST_CASE("tracker: masks never shrink before hold expiry (property)", "[tracker][property]") {
+  CHECK(run_hold_property(false) == 0);
+}
+
+TEST_CASE("tracker: following only lets a held box go behind a newer one (property)",
+          "[tracker][property]") {
+  // The scenes do confirm moving tracks: some detections were followed.
+  CHECK(run_hold_property(true) > 0);
 }

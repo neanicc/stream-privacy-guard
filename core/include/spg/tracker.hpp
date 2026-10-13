@@ -42,6 +42,23 @@ struct TrackerConfig {
   // yields the hull of its masks. Merging only adds coverage. 1 merges a
   // track into one rect.
   std::size_t max_rects_per_track = 8;
+  // Following (SPG-12b, #75). A track is confirmed moving once this many
+  // motion measurements in a row (each between two measured confirmations
+  // taken in frame order) were consistent: see Tracker for the rule. While a
+  // confirmed track is still being updated, the hold of an older detection
+  // follows the track instead of keeping the box where it was. 0 turns
+  // following off:
+  // every detection then holds where it was found, as before SPG-12b.
+  std::size_t follow_after = 2;
+  // A consistent measurement moves at a speed, along the axis and in the
+  // direction of the one before it, within this factor of that one's speed
+  // (each way). At least 1.
+  float follow_speed_ratio = 2.0F;
+  // A confirmation is measured only once its box center has moved at least
+  // this far (Source pixels, along either axis) from the last measured box;
+  // closer ones (two workers can scan frames a few ms apart, where detection
+  // jitter outweighs motion) neither extend nor break the run. At least 1.
+  float follow_min_move = 4.0F;
 
   // Hold, margin and retention (lookahead) from `policy`; the rest default.
   [[nodiscard]] static TrackerConfig from_policy(const PolicyConfig& policy);
@@ -51,8 +68,9 @@ struct TrackerConfig {
 
 // Throws ContractError naming the field when a value is out of range: a
 // negative duration, a negative or non-finite margin, an IoU threshold
-// outside (0, 1], a smoothing weight outside (0, 1] or a
-// max_rects_per_track outside [1, 64]. A zero hold or margin
+// outside (0, 1], a smoothing weight outside (0, 1], a
+// max_rects_per_track outside [1, 64], a follow_after above 64, or a
+// follow_speed_ratio or follow_min_move below 1 or not finite. A zero hold or margin
 // is accepted here; whether to impose a floor is #28 (SPG-08b).
 void validate(const TrackerConfig& config);
 
@@ -74,6 +92,8 @@ struct TrackMotion {
   // same answer. False with no measurement yet. A late detection older than
   // all the track's others also counts its move to the latest box.
   bool translating = false;
+  // The track's id (Track::id).
+  TrackId track = 0;
 
   friend bool operator==(const TrackMotion&, const TrackMotion&) = default;
 };
@@ -83,13 +103,40 @@ struct TrackMotion {
 //
 // Guarantees, all in Source pixels and frame time:
 //   * Hold: a detection with box b on frame time td is covered, grown by the
-//     margin, on every frame time t in [td, td + hold]. Later detections,
-//     tracking loss, missed cycles and resizes never remove that coverage.
+//     margin, on every frame time t in [td, td + hold] on which it is not
+//     followed (below). Tracking loss, missed cycles and resizes never remove
+//     that coverage.
 //   * Prediction: on frame times after td the mask also covers b moved at the
 //     track's estimated velocity for min(t - td, max_prediction), as the hull
 //     of b and the moved box, so between detection cycles the mask only grows.
+//   * Following (SPG-12b): the hold of a confirmed moving track follows the
+//     track while the track is still being updated. Confirmations taken in
+//     frame order are measured: once a box's center is at least
+//     follow_min_move from the last measured box, its move from that box is
+//     a measurement (closer ones are skipped). A measurement is consistent
+//     when both edges of the box moved at least one pixel along the axis the
+//     measured velocity is larger on (x on a tie), in its direction; and,
+//     unless it starts a run, it lies on the same axis and in the same
+//     direction as the measurement before it, at a speed along that axis
+//     within follow_speed_ratio of that one's. A confirmation whose width or
+//     height differs by more than a quarter from the last measured box ends
+//     the run, as does an inconsistent measurement that is not a translation;
+//     a translation that does not continue the run starts a new one. A
+//     track whose last follow_after measurements form one consistent run is
+//     confirmed moving. A detection
+//     of such a track is followed on frame time t when all of these hold:
+//     it was taken in frame order at or after the confirmation the run
+//     started from; a later detection of the same run was seen in (td, t];
+//     and the track was confirmed at or after t. Its coverage on t is then the
+//     track's: the mask of the newest detection of the run seen at or before
+//     t, which is held as above. Nothing is followed on frame times after the
+//     track's last confirmation (tracking lost, or not updated yet), and a
+//     late detection, a detection taken before a resize and any detection of
+//     a track that is not confirmed moving are never followed. With
+//     follow_after 0 nothing is ever followed.
 //   * Updates only add: masks(t) after update() contains every rect masks(t)
-//     returned before, for any t the retention still covers.
+//     returned before, for any t the retention still covers, except the rects
+//     of detections the update made followed on t.
 //   * Resize: after rescale(from, to), masks(t) contains every rect masks(t)
 //     returned before, both as it was and scaled to the new size (rounded
 //     outward), so content blurred before a resize stays blurred after it.
@@ -158,6 +205,8 @@ class Tracker {
   struct Held {
     Rect box;
     Timestamp seen{};
+    // Taken in frame order (not late) since the last resize: may be followed.
+    bool followable = false;
     Velocity low;
     Velocity high;
     double margin_x = 0.0;
@@ -169,11 +218,23 @@ class Tracker {
     bool has_velocity = false;  // a motion measurement has been taken
     Timestamp first_seen{};     // earliest frame time of a detection it took
     bool translating = false;   // see TrackMotion::translating
+    // Following: consistent measurements in the current run, the frame time
+    // of the confirmation the run started from, the latest measurement, and
+    // the box (and its frame time) the next measurement is taken from.
+    std::size_t run = 0;
+    Timestamp run_from{};
+    Velocity measured;
+    Rect anchor;
+    Timestamp anchor_time{};
   };
 
   [[nodiscard]] Rect predicted(const Track& track, Timestamp t) const noexcept;
   void confirm(TrackState& state, Timestamp frame_time, const Rect& box);
-  [[nodiscard]] Held make_held(const Rect& box, Timestamp seen, Velocity velocity) const noexcept;
+  [[nodiscard]] Held make_held(const Rect& box, Timestamp seen, Velocity velocity,
+                               bool followable) const noexcept;
+  // Updates the run of consistent measurements for an in-order confirmation
+  // with `box` on `frame_time` (see "Following" above).
+  void measure_run(TrackState& state, Timestamp frame_time, const Rect& box) const noexcept;
   [[nodiscard]] Rect mask_rect(const Held& held, Timestamp t) const noexcept;
 
   const Clock* clock_;

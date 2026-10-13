@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -95,6 +96,14 @@ bool translated(const Rect& from, const Rect& to, Velocity velocity) noexcept {
   return (v > 0.0 && lo >= 1.0 && hi >= 1.0) || (v < 0.0 && lo <= -1.0 && hi <= -1.0);
 }
 
+// Width and height each changed by at most a quarter from `from` to `to`.
+bool same_size(const Rect& from, const Rect& to) noexcept {
+  const auto close = [](float a, float b) {
+    return std::abs(static_cast<double>(b) - static_cast<double>(a)) <= 0.25 * static_cast<double>(a);
+  };
+  return close(from.width, to.width) && close(from.height, to.height);
+}
+
 double center_x(const Rect& r) noexcept {
   return static_cast<double>(r.x) + static_cast<double>(r.width) / 2.0;
 }
@@ -151,6 +160,7 @@ std::int64_t floor_div(std::int64_t a, std::int64_t b) noexcept {
 }
 
 constexpr std::size_t kMaxRectsPerTrackLimit = 64;
+constexpr std::size_t kMaxFollowAfter = 64;
 
 }  // namespace
 
@@ -188,6 +198,15 @@ void validate(const TrackerConfig& config) {
   if (config.max_rects_per_track < 1 || config.max_rects_per_track > kMaxRectsPerTrackLimit) {
     throw ContractError("tracker config: max_rects_per_track must be in [1, 64]");
   }
+  if (config.follow_after > kMaxFollowAfter) {
+    throw ContractError("tracker config: follow_after must be at most 64");
+  }
+  if (!std::isfinite(config.follow_speed_ratio) || config.follow_speed_ratio < 1.0F) {
+    throw ContractError("tracker config: follow_speed_ratio must be finite and at least 1");
+  }
+  if (!std::isfinite(config.follow_min_move) || config.follow_min_move < 1.0F) {
+    throw ContractError("tracker config: follow_min_move must be finite and at least 1");
+  }
 }
 
 Tracker::Tracker(const Clock& clock, TrackerConfig config) : clock_(&clock), config_(config) {
@@ -206,7 +225,7 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     validate(detection);
   }
   if (motions != nullptr) {
-    motions->assign(detections.size(), TrackMotion{Velocity{}, frame_time});
+    motions->assign(detections.size(), TrackMotion{Velocity{}, frame_time, false, 0});
   }
 
   // Candidate (track, detection) pairs of the same kind whose IoU clears the
@@ -250,9 +269,10 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     TrackState& state = tracks_[c.track];
     confirm(state, frame_time, detections[c.detection].box.rect);
     if (motions != nullptr) {
-      (*motions)[c.detection] = state.has_velocity
-                                    ? TrackMotion{state.track.velocity, state.first_seen, state.translating}
-                                    : TrackMotion{Velocity{}, state.first_seen, false};
+      (*motions)[c.detection] =
+          state.has_velocity
+              ? TrackMotion{state.track.velocity, state.first_seen, state.translating, state.track.id}
+              : TrackMotion{Velocity{}, state.first_seen, false, state.track.id};
     }
   }
 
@@ -268,7 +288,12 @@ void Tracker::update(Timestamp frame_time, std::span<const Detection> detections
     state.track.hold_until = frame_time + config_.hold;
     state.track.kind = detection.kind;
     state.first_seen = frame_time;
-    state.held.push_back(make_held(detection.box.rect, frame_time, Velocity{}));
+    state.anchor = detection.box.rect;
+    state.anchor_time = frame_time;
+    state.held.push_back(make_held(detection.box.rect, frame_time, Velocity{}, true));
+    if (motions != nullptr) {
+      (*motions)[di].track = state.track.id;
+    }
     tracks_.push_back(std::move(state));
   }
 
@@ -299,12 +324,14 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
       }
       state.translating = state.translating || translated(box, track.box.rect, track.velocity);
     }
-    state.held.push_back(make_held(box, frame_time, track.velocity));
+    // Never followed: its place in the run was not measured.
+    state.held.push_back(make_held(box, frame_time, track.velocity, false));
     return;
   }
   const double dt = seconds(frame_time - track.last_confirmed);
   const double measured_x = (center_x(box) - center_x(track.box.rect)) / dt;
   const double measured_y = (center_y(box) - center_y(track.box.rect)) / dt;
+  measure_run(state, frame_time, box);
   if (state.has_velocity) {
     const double a = static_cast<double>(config_.velocity_smoothing);
     track.velocity.dx_per_s =
@@ -321,16 +348,61 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
   track.box = Box{box, Space::Source};
   track.last_confirmed = frame_time;
   track.hold_until = frame_time + config_.hold;
-  state.held.push_back(make_held(box, frame_time, track.velocity));
+  state.held.push_back(make_held(box, frame_time, track.velocity, true));
 }
 
-Tracker::Held Tracker::make_held(const Rect& box, Timestamp seen,
-                                 Velocity velocity) const noexcept {
+void Tracker::measure_run(TrackState& state, Timestamp frame_time, const Rect& box) const noexcept {
+  const Rect from = state.anchor;
+  if (!same_size(from, box)) {
+    // Another size: likely another line took the track. The run ends.
+    state.run = 0;
+    state.anchor = box;
+    state.anchor_time = frame_time;
+    return;
+  }
+  const double dx = center_x(box) - center_x(from);
+  const double dy = center_y(box) - center_y(from);
+  if (std::max(std::abs(dx), std::abs(dy)) < static_cast<double>(config_.follow_min_move)) {
+    // Too close to the last measured box to tell motion from detection
+    // jitter (two workers can scan frames a few ms apart): not measured yet.
+    return;
+  }
+  const double dt = seconds(frame_time - state.anchor_time);
+  const Velocity measured{to_velocity(dx / dt), to_velocity(dy / dt)};
+  const Velocity previous = state.measured;
+  state.measured = measured;
+  state.anchor = box;
+  const Timestamp from_time = state.anchor_time;
+  state.anchor_time = frame_time;
+  if (!translated(from, box, measured)) {
+    state.run = 0;
+    return;
+  }
+  if (state.run > 0) {
+    const bool along_x = std::abs(measured.dx_per_s) >= std::abs(measured.dy_per_s);
+    const bool before_x = std::abs(previous.dx_per_s) >= std::abs(previous.dy_per_s);
+    const double now = static_cast<double>(along_x ? measured.dx_per_s : measured.dy_per_s);
+    const double before = static_cast<double>(before_x ? previous.dx_per_s : previous.dy_per_s);
+    const double ratio = static_cast<double>(config_.follow_speed_ratio);
+    if (along_x == before_x && now * before > 0.0 && std::abs(now) <= ratio * std::abs(before) &&
+        std::abs(before) <= ratio * std::abs(now)) {
+      state.run = std::min(state.run + 1, kMaxFollowAfter);
+      return;
+    }
+  }
+  // A translation that does not continue the run starts a new one from the
+  // box it was measured from.
+  state.run = 1;
+  state.run_from = from_time;
+}
+
+Tracker::Held Tracker::make_held(const Rect& box, Timestamp seen, Velocity velocity,
+                                 bool followable) const noexcept {
   const double margin =
       static_cast<double>(config_.margin_px) +
       static_cast<double>(config_.margin_ratio) *
           std::min(static_cast<double>(box.width), static_cast<double>(box.height));
-  return Held{box, seen, velocity, velocity, margin, margin};
+  return Held{box, seen, followable, velocity, velocity, margin, margin};
 }
 
 Rect Tracker::mask_rect(const Held& held, Timestamp t) const noexcept {
@@ -371,11 +443,27 @@ void Tracker::masks(Timestamp t, std::vector<Box>& out) const {
       slots > 1 ? floor_div((t - config_.hold).time_since_epoch().count(), width) : 0;
 
   for (const TrackState& state : tracks_) {
+    // Following: on a frame time the track has been confirmed at or after,
+    // a confirmed moving track's run detections older than the newest one
+    // seen at or before t are covered by that one's mask instead.
+    std::optional<Timestamp> newest;
+    if (config_.follow_after > 0 && state.run >= config_.follow_after &&
+        t <= state.track.last_confirmed) {
+      for (const Held& held : state.held) {
+        if (held.followable && held.seen >= state.run_from && held.seen <= t &&
+            (!newest.has_value() || held.seen > *newest)) {
+          newest = held.seen;
+        }
+      }
+    }
     const std::size_t start = out.size();
     out.resize(start + slots, Box{kNoRect, Space::Source});
     for (const Held& held : state.held) {
       if (t < held.seen || t > held.seen + config_.hold) {
         continue;
+      }
+      if (newest.has_value() && held.followable && held.seen >= state.run_from && held.seen < *newest) {
+        continue;  // followed
       }
       const std::int64_t bucket =
           slots > 1 ? floor_div(held.seen.time_since_epoch().count(), width) - first : 0;
@@ -431,7 +519,11 @@ void Tracker::rescale(Size from, Size to) {
   const double margin_px = static_cast<double>(config_.margin_px);
   const double margin_ratio = static_cast<double>(config_.margin_ratio);
   for (TrackState& state : tracks_) {
+    // Nothing from before the resize is followed, and the next measurement
+    // starts a new run (from the track's box in the new coordinates, below).
+    state.run = 0;
     for (Held& held : state.held) {
+      held.followable = false;
       // One held box covering both the old and the scaled box, predicted
       // over both velocity ranges, so nothing it covered before is lost.
       // The old mask, scaled, is the scaled box grown by the scaled margin
@@ -463,6 +555,8 @@ void Tracker::rescale(Size from, Size to) {
     // The track itself continues in the new coordinates.
     state.track.box = Box{scaled(state.track.box.rect), Space::Source};
     state.track.velocity = scaled_velocity(state.track.velocity);
+    state.anchor = state.track.box.rect;
+    state.anchor_time = state.track.last_confirmed;
   }
 }
 

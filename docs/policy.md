@@ -68,6 +68,41 @@ expected, `o` reads as `0` and `l`, `i`, `|` as `1` next to a real digit.
 | `PII_ADDRESS` | A house number (1-6 digits, optional letter), one to four words with a letter, then a street suffix from the list in `pii.cpp` (`street`, `st`, `avenue`, `rd`, `ln`, ...); or `po box N` / `p o box N`. No postcode rules. |
 | `PII_TOKEN` | A known prefix at a word start followed by enough `[a-z0-9_-]` characters: Twitch stream keys (`live_`) and `oauth:` tokens, GitHub (`ghp_`, `github_pat_`, ...), GitLab, Slack (`xox?-`), Stripe, `sk-` keys, AWS key ids (`akia`, `asia`), Google API keys (`aiza`), npm, Hugging Face, JWTs (`eyj`). A JWT whose parts are each shorter also counts: a header of at least 18 characters starting `eyj`, a dot, and a payload of at least 3. Also a PEM `-----BEGIN ... PRIVATE KEY` header. OCR misreads (SPG-12): prefixes and bodies are read with every `\|` as `l` (an OCR reading of `l` or `I`), while whether a prefix starts a word is decided on the text as read, where `\|` separates (`key\|ghp_...`), so a match on the text as read is never lost; the body may continue past up to two single spaces between runs of at least 6 characters when the joined body holds a digit, so a stray OCR space does not cut a key in two while words after a prefix-like word (`live_streaming starting tomorrow`) do not count. A JWT never joins across a space. |
 
+## Temporal hold
+
+A verdict becomes a detection box, and the tracker holds it
+([tracker.md](tracker.md)). The policy settings that shape the hold are
+`hold_ms` (default 750) and the margin (`margin_px` 4, `margin_ratio` 0.25 of
+the box's smaller side, on every edge). The semantics since SPG-12b (#75):
+
+1. **Hold.** A detected box stays masked, grown by the margin, on every frame
+   from the one it was found on to `hold_ms` after it, unless it is followed
+   (2). Between detection cycles the mask also covers the box moved along the
+   track's velocity (up to 500 ms ahead), as the hull of both.
+2. **Following a confirmed moving track.** A track's detections taken in
+   frame order are measured once the box has moved at least 4 px from the
+   last measured box. When the last two measurements each moved the whole box
+   at least one pixel, on one axis, in one direction, at speeds within a
+   factor of two of each other, with no change of width or height over a
+   quarter in between, the track is confirmed moving. An older detection of that run is then not
+   held where it was on a frame `t` once a newer detection of the run was
+   seen at or before `t`, provided the track was found again at or after `t`.
+   On that frame the track's newest detection at or before `t` (with its
+   prediction and margin) is what covers the text. This is what lets a
+   scrolling chat line's old rows clear while the line is still tracked.
+3. **Tracking loss, resize, uncertainty.** On frames after a track's last
+   detection, for late detections, for boxes from before a source resize and
+   for any track not confirmed moving, every box is held where it was for its
+   whole hold. These can extend a mask, never shrink it early.
+4. **Retroactive masks are unchanged.** A detection still masks the buffered
+   frames before it within `retro_ms` (its box, the box moved back along the
+   velocity, and the SPG-12c trail to the frame edge), whatever the hold does
+   ([scheduler.md](scheduler.md#masks)).
+
+`follow_after`, `follow_speed_ratio` and `follow_min_move` in `TrackerConfig`
+set the run length, speed factor and minimum move; `follow_after = 0` turns following off. They are not policy
+settings yet.
+
 ## Secrecy
 
 Watch-list entries, their matching forms and recognized text are `Secret`s or

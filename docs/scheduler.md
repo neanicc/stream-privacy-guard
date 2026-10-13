@@ -154,7 +154,10 @@ instead of holding the partial list.
 `MaskPlan.rects` for a frame at `t` is the union of:
 
 - `Tracker::masks(t)`: every detection seen in `[t - hold, t]`, with margin and
-  constant-velocity prediction ([tracker.md](tracker.md));
+  constant-velocity prediction ([tracker.md](tracker.md)), except detections
+  a confirmed moving track follows on `t` (since SPG-12b,
+  [tracker.md](tracker.md#following)): those are covered by the track's newest
+  detection at or before `t`;
 - **retroactive rects**: each box of a cycle (complete, or partial) at `ts` in `(t, t + retro]`
   that finished while the frame was buffered, grown by the same margin and
   rounded outward to whole pixels. The tracker only covers frames at or after
