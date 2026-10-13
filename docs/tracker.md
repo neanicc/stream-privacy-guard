@@ -205,7 +205,9 @@ track is found again, a track that stood still for longer than the hold
 starts a new run, a static line keeps its hold while a same-size line
 scrolls through it (even when it is missed while they overlap), a
 re-detection clipped on any side by up to a quarter never uncovers the
-line's full extent, the takeover risk above (and the guards that stop it),
+line's full extent, a line scrolling at an uneven speed (accelerating,
+decelerating, easing in and out, stopping and starting) stays covered on
+every frame while it is followed, the takeover risk above (and the guards that stop it),
 and late detections, boxes from before a resize and frames after the last
 confirmation keep their hold.
 

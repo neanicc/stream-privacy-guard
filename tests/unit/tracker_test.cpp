@@ -966,6 +966,70 @@ TEST_CASE("tracker: a clipped re-detection never releases a box that covered all
   }
 }
 
+TEST_CASE("tracker: a line scrolling at an uneven speed stays covered while it is followed",
+          "[tracker]") {
+  // A 200 x 40 line scrolls up with an easing curve instead of a constant
+  // speed: accelerating, decelerating, easing in and out, and stopping and
+  // starting again. It is detected every 200 ms, or by two workers 17 ms
+  // apart. On every frame from 200 ms (when a velocity is known) to the last
+  // detection, queried once the update that releases it has run, the masks
+  // cover the line's whole extent (default margins). The scenes also follow:
+  // a row the line left is clear on some frame.
+  struct Profile {
+    const char* name;
+    double (*offset)(double);  // px moved up after s seconds
+  };
+  const std::vector<Profile> profiles{
+      {"accelerating 40 to 100 px/s", [](double s) { return 40.0 * s + 25.0 * s * s; }},
+      {"decelerating 100 to 40 px/s", [](double s) { return 100.0 * s - 25.0 * s * s; }},
+      {"ease in and out, peak 112 px/s",
+       [](double s) {
+         const double u = std::clamp(s / 1.2, 0.0, 1.0);
+         return 90.0 * (u * u * (3.0 - 2.0 * u));
+       }},
+      {"stop and go",
+       [](double s) {
+         // 100 px/s, still from 0.5 to 0.9 s, then 100 px/s again.
+         return 100.0 * std::min(s, 0.5) + 100.0 * std::max(0.0, s - 0.9);
+       }},
+  };
+  const TrackerConfig config;
+  for (const Profile& profile : profiles) {
+    for (const bool two_workers : {false, true}) {
+      INFO(profile.name << (two_workers ? ", two workers" : ", one worker"));
+      const auto top = [&](std::int64_t ms) {
+        return 500.0 - profile.offset(static_cast<double>(ms) / 1000.0);
+      };
+      ManualClock clock;
+      Tracker tracker(clock, config);
+      std::vector<std::int64_t> times;
+      for (std::int64_t c = 0; c <= 1200; c += 200) {
+        times.push_back(c);
+        if (two_workers) {
+          times.push_back(c + 17);
+        }
+      }
+      bool followed = false;
+      std::int64_t queried = 199;  // frames up to here were already checked
+      for (const std::int64_t now : times) {
+        // Detected boxes snap to whole pixels, as a detector's do.
+        const float y = static_cast<float>(std::round(top(now)));
+        clock.set(at_ms(now));
+        tracker.update(at_ms(now), std::vector<Detection>{text(100.0F, y, 200.0F, 40.0F)});
+        REQUIRE(tracker.tracks().size() == 1);
+        for (std::int64_t t = queried + 1; t <= now; ++t) {
+          INFO("frame " << t);
+          const std::vector<Box> masks = tracker.masks(at_ms(t));
+          CHECK(covered(masks, Region{100.0, top(t), 300.0, top(t) + 40.0}));
+          followed = followed || !covered(masks, Region{100.0, top(0), 300.0, top(0) + 40.0});
+        }
+        queried = std::max(queried, now);
+      }
+      CHECK(followed);
+    }
+  }
+}
+
 TEST_CASE("tracker: a same-size line that continues a missed line's run takes its hold",
           "[tracker]") {
   // The accepted residual risk of following, pinned. Line A (200 x 40)

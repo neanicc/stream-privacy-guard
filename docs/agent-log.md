@@ -2277,6 +2277,13 @@ Template:
     hold; a taller line, a reversed one and following off keep it.
     `docs/tracker.md` gains a state diagram of `measure_run` and a
     "Remaining risk" section.
+  - Staff review on `5e7b393` (uneven scroll speed): a unit case scrolls a
+    line accelerating, decelerating, easing in and out, and stopping and
+    starting, with one or two workers; its whole extent stays covered on
+    every frame while the track is followed. It also passes with the
+    containment check removed (the newest box's prediction hull covers it),
+    so it is evidence for the scenario, not a guard. `measure_run` gets a
+    state-machine comment.
   - Eval, pre-merge (base `974b882`, same seed): CI text decoy 0.3404 (304,
     unchanged), every other CI metric identical. Local text decoy 0.3954
     (1840 of 4654; 52 more pairs held than `ba8e8e0`, main 0.5092); watch-list

@@ -362,6 +362,16 @@ void Tracker::confirm(TrackState& state, Timestamp frame_time, const Rect& box) 
   state.held.push_back(make_held(box, frame_time, track.velocity, true));
 }
 
+// Run state machine (docs/tracker.md, "Run state"), in check order:
+//   size changed over a quarter        -> no run, re-anchor at `box`
+//   moved under follow_min_move        -> unchanged, unless still for longer
+//                                         than the hold: no run, re-anchor
+//   measured, not a translation        -> no run (anchor moved to `box`)
+//   consistent with the run            -> run + 1, widen [run_low, run_high]
+//   any other translation              -> run 1, from the anchor's frame time
+//                                         if there was no run, else from `box`
+// Every measured case moves the anchor to `box`. A missed cycle and
+// rescale() end the run outside this function (update(), rescale()).
 void Tracker::measure_run(TrackState& state, Timestamp frame_time, const Rect& box) const noexcept {
   const Rect from = state.anchor;
   if (!same_size(from, box)) {
