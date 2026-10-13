@@ -1473,7 +1473,7 @@ TEST_CASE("requests waiting for the build thread are replaced, not queued", "[pl
   CHECK(rig.host.pipeline().generations() <= Pipeline::kMaxGenerations);
 }
 
-TEST_CASE("a failed build covers, and only a rebuild of settings built once is retried", "[plugin][pipeline][build]") {
+TEST_CASE("a failed build covers, and only a rebuild is retried", "[plugin][pipeline][build]") {
   BuildRig rig;
   const auto throwing = [] () -> SpecPtr { throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again)); };
   // A settings change whose generation cannot be built: covered, not retried.
@@ -1519,6 +1519,21 @@ TEST_CASE("a failed build covers, and only a rebuild of settings built once is r
   CHECK(rig.outcomes.back().ok);
   CHECK(count_masked(rig, 1410, 2000) > 10);
   CHECK_FALSE(rig.locked([](GenerationBuilder& b) { return b.failed(); }));
+
+  // A rebuild (a resize) that supersedes a settings change still waiting to
+  // be built is of the new settings: when it fails it is retried, so a
+  // transient failure does not cover the source until the next change.
+  rig.request(Kind::Settings, rig.faces(face_between(kFace, 0, 10'000)));
+  rig.request(Kind::Rebuild, throwing);
+  rig.run_builds();
+  CHECK_FALSE(rig.outcomes.back().ok);
+  CHECK(rig.frame(2000).kind == DrawKind::Solid);
+  CHECK(rig.locked([](GenerationBuilder& b) { return b.failed() && b.may_rebuild(); }));
+  CHECK(rig.builder.take_retry());
+  rig.request(Kind::Rebuild, rig.faces(face_between(kFace, 0, 10'000)));
+  rig.run_builds();
+  CHECK(rig.outcomes.back().ok);
+  CHECK(count_masked(rig, 2010, 2600) > 10);
 }
 
 TEST_CASE("a build that cannot be posted or prepared fails closed", "[plugin][pipeline][build]") {

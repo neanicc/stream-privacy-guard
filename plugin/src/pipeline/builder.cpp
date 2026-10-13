@@ -71,11 +71,11 @@ GenerationBuilder::GenerationBuilder(PipelineHost& host, Pipeline::Retire retire
 
 bool GenerationBuilder::request(Kind kind, Build build, Done done) noexcept {
   ++latest_;
+  latest_kind_ = kind;
   pending_ = true;
   if (kind == Kind::Settings) {
     // Nothing may run the old settings from here on: covered until the
     // generation for these is offered.
-    settings_built_ = false;
     failed_ = false;
     retry_ = false;
     host_->fail(Cover::SettingsChanged);
@@ -110,9 +110,9 @@ bool GenerationBuilder::request(Kind kind, Build build, Done done) noexcept {
 
 GenerationBuilder::Outcome GenerationBuilder::fail(Kind kind) noexcept {
   ++latest_;  // whatever is pending is never offered
+  latest_kind_ = kind;
   drop_next();
   if (kind == Kind::Settings) {
-    settings_built_ = false;
     failed_ = false;
     retry_ = false;
   }
@@ -122,7 +122,9 @@ GenerationBuilder::Outcome GenerationBuilder::fail(Kind kind) noexcept {
 GenerationBuilder::Outcome GenerationBuilder::failure() noexcept {
   const bool first = !(failed_ && retry_);
   failed_ = true;
-  retry_ = settings_built_;
+  // A Rebuild is of the current settings, so trying it again never runs
+  // superseded ones; a failed settings change is not retried.
+  retry_ = latest_kind_ == Kind::Rebuild;
   pending_ = false;
   host_->fail();
   if (retry_) {
@@ -185,7 +187,6 @@ void GenerationBuilder::run() noexcept {
       pending_ = false;
       failed_ = false;
       retry_ = false;
-      settings_built_ = true;
       outcome.ok = true;
     } else {
       outcome = failure();

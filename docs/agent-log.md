@@ -1675,9 +1675,9 @@ Template:
   the new one is offered; (3) only the latest request is offered: one
   superseded before it starts is never built, one superseded while building
   goes to the reaper; (4) a failed build covers (`NoDetection`), a failed
-  rebuild of settings built once is asked for again every `kRefitRetryNs`
-  (`RefitSchedule::failed` now forgets a fit marked done when it was asked
-  for), a settings change that never produced a generation is not retried.
+  rebuild (always of the current settings) is asked for again every
+  `kRefitRetryNs` (`RefitSchedule::failed` now forgets a fit marked done
+  when it was asked for), a failed settings change is not retried.
   The build copies everything it needs and runs without the settings lock;
   the build thread takes that lock only to hand the generation to
   `PipelineHost` and log. `tick` only try-locks it. The filter's destructor
@@ -1723,9 +1723,17 @@ Template:
   `TaskThread` with `SteadyClock` and checks both were made on the build
   thread. `main` at `33203c0` merged (agent-log conflict only); `build`
   and `test` passed, 337/337, and the 10 `[build]` cases passed 10 runs.
-- Open issues or follow-ups: a source resized while a settings change is
-  still building supersedes it with a rebuild of the new settings; if that
-  build fails it is not retried (no generation of those settings existed
-  yet), so the source stays covered until the next settings change. Fail
-  closed, but worth revisiting if refits fail in practice. Live check (OBS on
-  a real source) of the solid frames during a settings change: not done.
+- Second review round: a rebuild that superseded a settings change still
+  building (a resize meanwhile) and then failed was not retried, leaving the
+  source covered until the next settings change; any failed rebuild is now
+  retried, since it is always of the current settings (new assertions in
+  "a failed build covers, and only a rebuild is retried"). `PipelineHost::fail`
+  now stores the cover reason under the hand-off lock, so `frame()` never
+  pairs a failure with another call's reason. `build` and `test` passed
+  again after these changes (numbers in the PR).
+- Open issues or follow-ups: every settings change, including one that
+  cannot weaken detection (a longer hold, a wider margin), covers the source
+  until its generation is built; the staff review suggests covering only
+  when the new settings can scan less. Measure the cover time in the live
+  check first. Live check (OBS on a real source) of the solid frames during
+  a settings change: not done.

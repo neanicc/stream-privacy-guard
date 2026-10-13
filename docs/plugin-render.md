@@ -208,9 +208,10 @@ manual executor and with a real build thread:
   during a slow build do not pile up copies of the settings. At most two
   generations stay live, as before (`Pipeline::kMaxGenerations`).
 - A failed build covers every frame (solid, `NoDetection`). A failed
-  rebuild of settings that were built once is asked for again every
-  `kRefitRetryNs`; a settings change that never produced a generation is
-  not retried and covers until the next change.
+  rebuild (always of the current settings, even one that superseded a
+  settings change still building) is asked for again every
+  `kRefitRetryNs`; a failed settings change is not retried and covers
+  until the next change.
 - The filter's destructor stops the build thread: a build in progress
   finishes (the models are already loaded, so it is short), queued ones are
   dropped.

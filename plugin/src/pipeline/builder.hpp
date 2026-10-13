@@ -23,10 +23,10 @@
 //     once (requests wait in one slot, and at most one task is posted for
 //     it); one superseded while building is retired.
 //   * A failed build covers every frame (solid, Cover::NoDetection) until a
-//     later request is offered. A rebuild that fails is worth retrying
-//     (take_retry()) only when the current settings were built once; a
-//     settings change that never produced a generation is not retried, and
-//     covers until the next change.
+//     later request is offered. A failed Rebuild is worth retrying
+//     (take_retry()): it is always of the current settings, even one that
+//     superseded a settings change still building. A failed settings change
+//     is not retried, and covers until the next change.
 // Schedulers are never destroyed here: superseded ones go to `retire`.
 
 #include <atomic>
@@ -120,7 +120,7 @@ class GenerationBuilder {
   // Lock held. The latest request failed and nothing newer is pending.
   [[nodiscard]] bool failed() const noexcept { return failed_ && !pending_; }
   // Lock held. A Rebuild of the current settings may be requested: nothing
-  // failed, or the failure was a rebuild of settings built once.
+  // failed, or the failure was a Rebuild.
   [[nodiscard]] bool may_rebuild() const noexcept { return !failed_ || retry_; }
   // Any thread. True once after each failure worth retrying (FilterRender's
   // video tick then waits kRefitRetryNs before it asks again).
@@ -148,8 +148,8 @@ class GenerationBuilder {
   std::uint64_t latest_ = 0;
   bool pending_ = false;
   bool failed_ = false;
-  bool retry_ = false;           // failed_ is a rebuild failure worth retrying
-  bool settings_built_ = false;  // the current settings produced a generation
+  bool retry_ = false;              // failed_ is a Rebuild failure, worth retrying
+  Kind latest_kind_ = Kind::Settings;  // of the latest request
   std::atomic<bool> retry_due_{false};
 };
 

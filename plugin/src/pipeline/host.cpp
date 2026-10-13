@@ -44,14 +44,18 @@ void PipelineHost::offer(std::unique_ptr<PipelineSpec> spec) noexcept {
 }
 
 void PipelineHost::fail(Cover cover) noexcept {
-  fail_cover_.store(static_cast<std::uint8_t>(cover));
-  failed_.store(true);
   std::unique_ptr<PipelineSpec> replaced;
   try {
+    // Under the lock frame() reads them with, so it never pairs this failure
+    // with another call's reason.
     const std::lock_guard lock(handoff_mutex_);
+    fail_cover_.store(static_cast<std::uint8_t>(cover));
+    failed_.store(true);
     replaced = std::move(pending_);  // built for settings now superseded
   } catch (...) {
     // Cannot lock: the failure is flagged all the same.
+    fail_cover_.store(static_cast<std::uint8_t>(cover));
+    failed_.store(true);
   }
   has_news_.store(true, std::memory_order_release);
   if (replaced != nullptr && replaced->scheduler != nullptr) {
