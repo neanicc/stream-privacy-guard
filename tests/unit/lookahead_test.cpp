@@ -498,6 +498,92 @@ TEST_CASE("a detection masks earlier buffered frames within the retro window", "
   }
 }
 
+TEST_CASE("retroactive masks follow a moving track back to the frames before it was found", "[schedule]") {
+  // A box slides in from the right at 1 px/ms (a toast or a scrolling line):
+  // x = 700 - (t - 1150) from 1150 on. Cycles at 1200 and 1210 find it; the
+  // second confirms its track with a velocity. On 1150 the box is 60 px right
+  // of where the 1210 cycle saw it, beyond the margin, so a static
+  // retroactive rect would leave it uncovered (SPG-12, text suite seq-001).
+  const auto box_at = [](std::int64_t t) {
+    return Rect{static_cast<float>(700 - (t - 1150)), 200.0F, 80.0F, 16.0F};
+  };
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 100ms;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const std::int64_t ms = spg::to_ns(t) / 1'000'000;
+                                    std::vector<Detection> out;
+                                    if (ms >= 1150) {
+                                      const Rect b = box_at(ms);
+                                      out.push_back(face_at(b.x, b.y, b.width, b.height));
+                                    }
+                                    return out;
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  for (std::int64_t t = 1110; t <= 1300; t += 10) {
+    const bool scan = t == 1200 || t == 1210 || t == 1250 || t == 1300;
+    sim.push(t, scan);
+    if (scan) {
+      sim.scan_now();
+    }
+  }
+  const auto out = sim.release_at(1800);
+  REQUIRE(out.size() == 20);
+  for (const ReleasedFrame& r : out) {
+    const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+    CHECK(r.action == FallbackAction::None);
+    if (t >= 1150) {
+      INFO("frame " << t);
+      CHECK(covered_by(r.plan, box_at(t)));
+    }
+    if (t >= 1200) {
+      continue;
+    }
+    // The static rect where the 1210 cycle found it is still there too.
+    CHECK(covered_by(r.plan, box_at(1210)));
+  }
+}
+
+TEST_CASE("back-projection with a jittery velocity only adds rects and stays bounded", "[schedule]") {
+  // A static box whose detections jitter 12 px left and right each cycle: the
+  // track's velocity flips sign every 20 ms (an outlier-ridden estimate).
+  // Back-projection may put rects in the wrong place, but every static rect
+  // stays, and past max_retro_rects a frame's rects merge into one hull.
+  const auto box_at = [](std::int64_t t) {
+    return Rect{static_cast<float>((t / 20) % 2 == 0 ? 294 : 306), 200.0F, 80.0F, 16.0F};
+  };
+  SchedulerConfig config = small_config();
+  config.lookahead = 500ms;
+  config.retro = 100ms;
+  config.max_retro_rects = 6;
+  Sim sim(config, spg::ScanStages{std::make_shared<spg_test::ScriptedDetector>([&](Timestamp t, Size) {
+                                    const Rect b = box_at(spg::to_ns(t) / 1'000'000);
+                                    return std::vector<Detection>{face_at(b.x, b.y, b.width, b.height)};
+                                  }),
+                                  nullptr, nullptr, nullptr});
+  for (std::int64_t t = 1100; t <= 1400; t += 10) {
+    const bool scan = t % 20 == 0;
+    sim.push(t, scan);
+    if (scan) {
+      sim.scan_now();
+    }
+  }
+  const auto out = sim.release_at(2000);
+  REQUIRE(out.size() == 31);
+  for (const ReleasedFrame& r : out) {
+    const std::int64_t t = spg::to_ns(r.frame_time) / 1'000'000;
+    INFO("frame " << t);
+    CHECK(r.action == FallbackAction::None);
+    // Retro rects merge past their cap; the tracker adds at most its own cap.
+    CHECK(r.plan.rects.size() <= config.max_retro_rects + config.tracker.max_rects_per_track);
+    for (std::int64_t ts = t; ts <= t + 100 && ts <= 1400; ts += 10) {
+      if (ts % 20 == 0) {
+        CHECK(covered_by(r.plan, box_at(ts)));  // where every cycle in reach saw it
+      }
+    }
+  }
+}
+
 TEST_CASE("a frame counts as scanned only by a cycle within retro after it", "[schedule]") {
   SchedulerConfig config = small_config();
   config.lookahead = 500ms;
@@ -1458,6 +1544,12 @@ TEST_CASE("mask rect helpers round outward", "[schedule]") {
   const Rect s = spg::mask::scale_between(Rect{1, 1, 1, 1}, Size{3, 3}, Size{4, 4});
   CHECK(contains(s, Rect{4.0F / 3.0F, 4.0F / 3.0F, 4.0F / 3.0F, 4.0F / 3.0F}));
   CHECK(spg::mask::hull(Rect{0, 0, 1, 1}, Rect{5, 5, 1, 1}) == Rect{0, 0, 6, 6});
+  // moved(): back in time (negative seconds) and rounded outward.
+  CHECK(spg::mask::moved(Rect{100, 50, 20, 10}, spg::Velocity{-1000.0F, 200.0F}, -0.06) ==
+        Rect{160, 38, 20, 10});
+  const Rect m = spg::mask::moved(Rect{100, 50, 20, 10}, spg::Velocity{10.0F, -10.0F}, 0.025);
+  CHECK(m == Rect{100, 49, 21, 11});
+  CHECK(contains(m, Rect{100.25F, 49.75F, 20, 10}));
   // NaN edges cover rather than vanish.
   const Rect nan_rect = spg::mask::pixel_rect(std::nan(""), 0, 5, 5);
   CHECK(nan_rect.width > 1e6F);

@@ -88,7 +88,10 @@ or assert that the two agree.
 
 `masks(t)` covers detections seen at or before `t`. Applying a detection to
 buffered frames before it (retroactive masking within `retro_ms`) is the
-scheduler's job in SPG-10.
+scheduler's job in SPG-10. `update()` can report, per detection, the velocity
+of the track it joined (zero for a new track or one with no motion
+measurement yet); since SPG-12 the scheduler uses it to back-project
+retroactive rects ([scheduler.md](scheduler.md#masks)).
 
 ## Source resize
 

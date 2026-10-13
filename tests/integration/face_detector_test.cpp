@@ -252,6 +252,40 @@ TEST_CASE("FaceDetector finds several faces and keeps them apart", "[face][detec
   }
 }
 
+TEST_CASE("FaceDetector finds small faces in a large frame through scale-1 tiles", "[face][detector][model]") {
+  SPG_REQUIRE_YUNET();
+  // On the faces suite the whole-frame pass (1920x1080 into 640x640, 1/3)
+  // missed faces of 43 and 62 Source px (SPG-12); on these drawn faces it
+  // finds 6 of the 18 (none at 40 px). x = 600 lies in the overlap of the
+  // first two tile columns, so two tiles see that face whole.
+  const Size source{1920, 1080};
+  const double size = GENERATE(40.0, 56.0);
+  const double cx = GENERATE(300.0, 600.0, 1700.0);
+  const double cy = GENERATE(200.0, 560.0, 950.0);
+  CAPTURE(size, cx, cy);
+  Canvas canvas(source.width, source.height, {200, 200, 200});
+  canvas.face(cx, cy, size);
+  const auto frame = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
+  const auto found = detector().detect(frame.view, source);
+  // Exactly one box: the passes that see it agree after suppression.
+  REQUIRE(found.size() == 1);
+  const spg::Rect& r = found[0].box.rect;
+  CAPTURE(r.x, r.y, r.width, r.height, found[0].score);
+  CHECK(r.x < cx - 0.3 * size);
+  CHECK(r.x + r.width > cx + 0.3 * size);
+  CHECK(r.y < cy - 0.18 * size);
+  CHECK(r.y + r.height > cy);
+}
+
+TEST_CASE("FaceDetector rejects a tile overlap that is not below the input side", "[face][detector][model]") {
+  SPG_REQUIRE_YUNET();
+  FaceDetectorConfig config;
+  config.tile_overlap = 640;
+  CHECK_THROWS_AS(FaceDetector::open(shared_env(), yunet_path(), config, cpu_only()), FaceDetectorError);
+  config.tiles = false;  // the overlap only matters with tiles
+  CHECK_NOTHROW(FaceDetector::open(shared_env(), yunet_path(), config, cpu_only()));
+}
+
 TEST_CASE("FaceDetector gives the same answer from several threads", "[face][detector][model]") {
   SPG_REQUIRE_YUNET();
   Canvas canvas(960, 540, {200, 200, 200});

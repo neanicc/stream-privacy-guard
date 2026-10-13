@@ -1,6 +1,7 @@
 #include "spg/lookahead.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -263,17 +264,27 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
     }
     tracked.push_back(held);
   }
-  tracker_.update(job.frame_time, tracked);
+  // The velocity of the track each detection joined, for back-projection.
+  std::vector<Velocity> velocities;
+  tracker_.update(job.frame_time, tracked, &velocities);
 
   // Retroactive masking: the tracker only covers frames at or after the
   // frame a detection was seen on; earlier buffered frames get the boxes here.
+  // Each box is masked where it was found and, when its track is moving and
+  // no resize came between, also moved back along the track's velocity to
+  // where it was on the earlier frame (text sliding or scrolling in).
   const Timestamp from = job.frame_time - config_.retro;
+  const bool same_size = job.size_epoch == current;
   for (FrameRecord& frame : frames_) {
     if (frame.bad_timestamp || frame.t < from || frame.t > job.frame_time) {
       continue;
     }
     if (frame.t < job.frame_time) {
-      for (const Detection& d : result.detections) {
+      const double back = -std::chrono::duration<double>(
+                              std::min(job.frame_time - frame.t, config_.tracker.max_prediction))
+                              .count();
+      for (std::size_t i = 0; i < result.detections.size(); ++i) {
+        const Detection& d = result.detections[i];
         const Rect mask_here = mask::grow_by_margin(d.box.rect, margin_px, margin_ratio);
         Rect r = mask_here;
         if (frame.source != job.source) {
@@ -284,6 +295,10 @@ void Lookahead::apply(const ScanJob& job, const ScanResult& result) {
                          mask::scale_between(mask_here, job.source, frame.source));
         }
         add_retro(frame, r);
+        const Velocity v = velocities[i];
+        if (same_size && frame.source == job.source && (v.dx_per_s != 0.0F || v.dy_per_s != 0.0F)) {
+          add_retro(frame, mask::grow_by_margin(mask::moved(d.box.rect, v, back), margin_px, margin_ratio));
+        }
       }
     }
     // Only a complete cycle is a scan; a partial one only adds masks.

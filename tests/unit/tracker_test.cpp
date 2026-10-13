@@ -218,6 +218,27 @@ TEST_CASE("tracker: IoU association follows a moving box and estimates its veloc
   CHECK(tracks[0].box.rect == Rect{350.0F, 175.0F, 120.0F, 120.0F});
 }
 
+TEST_CASE("tracker: update reports the velocity of the track each detection joined", "[tracker]") {
+  ManualClock clock;
+  Tracker tracker(clock, TrackerConfig{});
+  std::vector<spg::Velocity> velocities{{9.0F, 9.0F}};
+  // A new track has no motion measurement yet: zero.
+  tracker.update(at_ms(0), std::vector<Detection>{face(100.0F, 100.0F, 50.0F, 50.0F)}, &velocities);
+  REQUIRE(velocities.size() == 1);
+  CHECK(velocities[0] == spg::Velocity{});
+  // The second confirmation measures 200 px/s right; a far box starts a track.
+  tracker.update(at_ms(100),
+                 std::vector<Detection>{face(600.0F, 600.0F, 50.0F, 50.0F), face(120.0F, 100.0F, 50.0F, 50.0F)},
+                 &velocities);
+  REQUIRE(velocities.size() == 2);
+  CHECK(velocities[0] == spg::Velocity{});
+  CHECK(std::abs(velocities[1].dx_per_s - 200.0F) < 0.01F);
+  CHECK(velocities[1].dy_per_s == 0.0F);
+  // Without the out parameter nothing changes.
+  tracker.update(at_ms(200), std::vector<Detection>{face(140.0F, 100.0F, 50.0F, 50.0F)});
+  CHECK(std::abs(tracker.tracks()[0].velocity.dx_per_s - 200.0F) < 0.01F);
+}
+
 TEST_CASE("tracker: constant-velocity prediction covers the box ahead, capped", "[tracker]") {
   ManualClock clock;
   TrackerConfig config;

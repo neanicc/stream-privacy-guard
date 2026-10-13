@@ -93,6 +93,31 @@ TEST_CASE("pii: IPv4 and IPv6 addresses", "[policy][pii]") {
   CHECK_FALSE(found(Category::PiiIp, "aa:bb:cc:dd:ee:ff"));
   CHECK_FALSE(found(Category::PiiIp, "std::move"));
   CHECK_FALSE(found(Category::PiiIp, "1::2::3"));
+  // OCR read "::" as one ':' (SPG-12, a HUD line on the text suite).
+  CHECK(found(Category::PiiIp, "Server 2001:db8:3a09:2728"));
+  CHECK(found(Category::PiiIp, "ip:2001:db8:cc6:bc63"));
+  CHECK_FALSE(found(Category::PiiIp, "12:30:45:07"));          // no group of three or more
+  CHECK_FALSE(found(Category::PiiIp, "2001:db8:3a09"));        // three groups
+}
+
+// The lost-"::" rule trades some over-blur for recall. These are clean
+// on-screen strings it must leave alone, so the over-blur stays bounded to
+// runs of 4 to 7 hex groups with two groups of 3 or more characters.
+TEST_CASE("pii: the lost-gap IPv6 rule leaves clean text alone", "[policy][pii]") {
+  using spg::Category;
+  CHECK_FALSE(found(Category::PiiIp, "[12:30:45] chat is live"));     // chat timestamp
+  CHECK_FALSE(found(Category::PiiIp, "split 01:23:45.678"));          // speedrun timer
+  CHECK_FALSE(found(Category::PiiIp, "uptime 1:02:03:04"));           // d:hh:mm:ss
+  CHECK_FALSE(found(Category::PiiIp, "mac 00:1a:2b:3c:4d:5e"));       // MAC address
+  CHECK_FALSE(found(Category::PiiIp, "16:9 at 1080p, John 3:16"));    // ratios, verses
+  CHECK_FALSE(found(Category::PiiIp, "score 1:100:2:3"));             // one long group
+  CHECK_FALSE(found(Category::PiiIp, "bad:cafe:face"));               // three groups
+  CHECK_FALSE(found(Category::PiiIp, "1:2:3:4:5:6:7:8:9:10"));        // ten groups
+  CHECK_FALSE(found(Category::PiiIp, "aaaaa:bbbbb:ccccc:ddddd"));     // groups too long
+  CHECK_FALSE(found(Category::PiiIp, "2026-10-12 12:30:45"));         // date and time
+  // Accepted over-blur, by design (recall over precision): four hex groups,
+  // two of them three long, read as an address that lost its "::".
+  CHECK(found(Category::PiiIp, "12:345:678:90"));
 }
 
 TEST_CASE("pii: street addresses and PO boxes", "[policy][pii]") {
@@ -128,6 +153,66 @@ TEST_CASE("pii: credential and stream key formats", "[policy][pii]") {
   CHECK_FALSE(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9 then a space"));  // header alone
   CHECK_FALSE(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9.ab"));            // payload too short
   CHECK_FALSE(found(Category::PiiToken, "Eyjafjallajokull.is"));                 // too short for a header
+}
+
+TEST_CASE("pii: tokens survive OCR misreads", "[policy][pii]") {
+  using spg::Category;
+  // A small-font token on the text suite was read with I as '|' and with a
+  // stray space (SPG-12); the '|' ended the body after 16 characters.
+  CHECK(found(Category::PiiToken, "ghp_SYNTHETIC0123456|SYNTHETIC0123456789"));
+  CHECK(found(Category::PiiToken, "|ive_123456789_SYNTHETICabcdefghij"));  // l of live_ read as '|'
+  // A '|' as a separator and a '|' as a misread letter on one line.
+  CHECK(found(Category::PiiToken, "key|ghp_SYNTHETIC0123456|SYNTHETIC0123456789"));
+  CHECK(found(Category::PiiToken, "key||ive_123456789_SYNTHETICabcdefghij|"));
+  CHECK_FALSE(found(Category::PiiToken, "x|ive_123456789_SYNTHETICabcdefghij"));  // "xlive_" starts no word
+  CHECK(found(Category::PiiToken, "ghp_SYNTHETIC0 123456SYNTHETIC0123456789"));
+  CHECK(found(Category::PiiToken, "ghp_SYNTH3TIC xyzw0123 SYNTHETIC"));  // needs both splits
+  // A split needs runs of at least six characters on both sides and a digit
+  // somewhere in the body, at most two splits join, and a JWT never splits.
+  CHECK_FALSE(found(Category::PiiToken, "ghp_SYNTH3TIC xyzw SYNTHETICabcdef"));
+  CHECK_FALSE(found(Category::PiiToken, "eyJhbGciOiJIUzI1NiJ9 tomorrow"));
+  CHECK_FALSE(found(Category::PiiToken, "live_streaming starting tomorrow evening"));
+  CHECK_FALSE(found(Category::PiiToken, "ghp_SYNTH3 abcdef ghijkl mnopqrstuv"));
+}
+
+TEST_CASE("pii: the OCR-tolerant rules keep every match the strict rules had", "[policy][pii]") {
+  using spg::Category;
+  // Pins what the rules before SPG-12 detected, so a change that narrows them
+  // fails here. Each known prefix with a body of exactly its minimum length,
+  // as is, with words after it, with a '|' or a space before it, and in a
+  // table cell ("key|<token>|"). Bodies are synthetic.
+  struct Format {
+    const char* prefix;
+    std::size_t min_body;
+  };
+  constexpr Format kFormats[] = {
+      {"live_", 20},  {"oauth:", 20},   {"ghp_", 20},     {"gho_", 20},     {"ghu_", 20},  {"ghs_", 20},
+      {"ghr_", 20},   {"github_pat_", 20}, {"glpat-", 20}, {"xoxb-", 10},   {"xoxp-", 10}, {"xoxa-", 10},
+      {"xoxr-", 10},  {"xoxs-", 10},    {"xoxe-", 10},    {"sk_live_", 16}, {"rk_live_", 16},
+      {"sk_test_", 16}, {"rk_test_", 16}, {"sk-", 20},     {"AKIA", 16},     {"ASIA", 16},  {"AIza", 30},
+      {"npm_", 30},   {"hf_", 30},      {"eyJ", 20},
+  };
+  const std::string body_chars = "SYNTH0123456789abcdefghijklmnopqrstuvwxyz";
+  for (const Format& f : kFormats) {
+    const std::string token = std::string(f.prefix) + body_chars.substr(0, f.min_body);
+    CAPTURE(token);
+    CHECK(found(Category::PiiToken, token));
+    CHECK(found(Category::PiiToken, token + " then plain words follow"));  // digit-free piece after a space
+    CHECK(found(Category::PiiToken, token + " 0123 more"));
+    CHECK(found(Category::PiiToken, "key|" + token + "|"));
+    CHECK(found(Category::PiiToken, "|" + token));
+    CHECK(found(Category::PiiToken, "key: " + token));
+    // One character short stays below the rule, as before.
+    CHECK_FALSE(found(Category::PiiToken, std::string(f.prefix) + body_chars.substr(0, f.min_body - 1)));
+  }
+  // IPv4 and IPv6 forms the strict rules found, with a '|' or a space around.
+  for (const char* ip : {"192.0.2.44", "2001:db8:0:0:0:0:2:1", "2001:db8::2:1", "fe80::1ff:fe23:4567:890a",
+                         "::ffff:192.0.2.128", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", "2001:db8::"}) {
+    CAPTURE(ip);
+    CHECK(found(Category::PiiIp, ip));
+    CHECK(found(Category::PiiIp, std::string("server|") + ip + "|"));
+    CHECK(found(Category::PiiIp, std::string("ip ") + ip + " up"));
+  }
 }
 
 TEST_CASE("pii: only enabled categories are reported", "[policy][pii]") {

@@ -40,6 +40,13 @@ Rect grow_by_margin(const Rect& box, float margin_px, float margin_ratio) noexce
                     bottom(box) + m);
 }
 
+Rect moved(const Rect& box, Velocity velocity, double seconds) noexcept {
+  const double dx = static_cast<double>(velocity.dx_per_s) * seconds;
+  const double dy = static_cast<double>(velocity.dy_per_s) * seconds;
+  return pixel_rect(static_cast<double>(box.x) + dx, static_cast<double>(box.y) + dy, right(box) + dx,
+                    bottom(box) + dy);
+}
+
 Rect scale_between(const Rect& box, Size from, Size to) noexcept {
   if (from == to || from.width == 0 || from.height == 0 || to.width == 0 || to.height == 0) {
     return pixel_rect(static_cast<double>(box.x), static_cast<double>(box.y), right(box), bottom(box));

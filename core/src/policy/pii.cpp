@@ -244,15 +244,48 @@ std::vector<Text> runs(Text t, Pred in_run) {
   return out;
 }
 
+// OCR often reads the "::" of a compressed address as one ':'
+// ("2001:db8:3a09::2728" as "2001:db8:3a09:2728"). Without "::", four to
+// seven hex groups of one to four characters, at least two of them three or
+// more long, count too; a time ("12:30:45") has three groups and a MAC
+// address ("aa:bb:cc:dd:ee:ff") only two-character groups.
+bool ipv6_lost_gap(Text run) {
+  if (run.find(U"::") != Text::npos) {
+    return false;
+  }
+  const std::vector<Text> groups = split(run, U':');
+  if (groups.size() < 4 || groups.size() > 7) {
+    return false;
+  }
+  std::size_t long_groups = 0;
+  for (const Text g : groups) {
+    if (g.empty() || g.size() > 4 || !std::all_of(g.begin(), g.end(), is_hex)) {
+      return false;
+    }
+    if (g.size() >= 3) {
+      ++long_groups;
+    }
+  }
+  return long_groups >= 2;
+}
+
 bool ipv6_candidate(Text run) {
-  return std::count(run.begin(), run.end(), U':') >= 2 && ipv6(run);
+  return std::count(run.begin(), run.end(), U':') >= 2 && (ipv6(run) || ipv6_lost_gap(run));
 }
 
 bool has_ip(Text t, Text d) {
-  for (const Text run : runs(d, [](char32_t c) { return is_digit(c) || c == U'.'; })) {
-    if (has_ipv4(run)) {
-      return true;
+  // The digit view, then the text as read: in the digit view a '|' or l next
+  // to an address ("ip|192.0.2.44|") reads as a 1 and spoils its end octets.
+  const auto ipv4_in = [](Text text) {
+    for (const Text run : runs(text, [](char32_t c) { return is_digit(c) || c == U'.'; })) {
+      if (has_ipv4(run)) {
+        return true;
+      }
     }
+    return false;
+  };
+  if (ipv4_in(d) || ipv4_in(t)) {
+    return true;
   }
   for (Text run : runs(t, [](char32_t c) { return is_hex(c) || c == U':' || c == U'.'; })) {
     while (!run.empty() && run.back() == U'.') {
@@ -370,28 +403,81 @@ bool has_jwt(Text t) {
   return false;
 }
 
-bool has_token(Text t) {
+// OCR splits a long unbroken string with a stray space now and then. A body
+// may continue past up to kMaxTokenSplits single spaces when the runs on both
+// sides have at least kMinTokenPiece characters; a body that needs a split
+// must hold a digit, so words after a short prefix-like word ("live_stream
+// starting tonight") do not count. Random keys almost always hold a digit.
+// JWTs ("eyj") never split: a header alone is not a token (has_jwt()).
+constexpr std::size_t kMaxTokenSplits = 2;
+constexpr std::size_t kMinTokenPiece = 6;
+
+std::size_t base64url_run(Text t, std::size_t begin) noexcept {
+  std::size_t end = begin;
+  while (end < t.size() && base64url(t[end])) {
+    ++end;
+  }
+  return end - begin;
+}
+
+// Characters of the token body starting at `begin`, spaces not counted.
+std::size_t token_body(Text t, std::size_t begin, bool may_split) {
+  std::size_t run = base64url_run(t, begin);
+  std::size_t total = run;
+  bool digit = std::any_of(t.begin() + static_cast<std::ptrdiff_t>(begin),
+                           t.begin() + static_cast<std::ptrdiff_t>(begin + run), is_digit);
+  std::size_t joined = total;  // body length that already stands without a split
+  for (std::size_t splits = 0; may_split && splits < kMaxTokenSplits && run >= kMinTokenPiece; ++splits) {
+    const std::size_t space = begin + run;
+    if (space >= t.size() || t[space] != U' ') {
+      break;
+    }
+    const std::size_t next = base64url_run(t, space + 1);
+    if (next < kMinTokenPiece) {
+      break;
+    }
+    digit = digit || std::any_of(t.begin() + static_cast<std::ptrdiff_t>(space + 1),
+                                 t.begin() + static_cast<std::ptrdiff_t>(space + 1 + next), is_digit);
+    begin = space + 1;
+    run = next;
+    total += next;
+  }
+  return digit ? total : joined;
+}
+
+// Known prefixes, JWTs and PEM headers. OCR reads l or I as '|', so prefixes
+// and bodies are read in a view where every '|' is an l, at the same offsets as
+// the text; whether a prefix starts a word is decided on the text as read,
+// where a '|' is a separator ("key|ghp_..."). So a '|' can be a misread letter
+// and a separator on one line, every match on the text as read is still one
+// here (prefixes hold no '|', and a body in the view is never shorter), and
+// token_body() only ever lengthens a body.
+bool has_token(Text raw) {
+  SecureU32String repaired;
+  Text view = raw;
+  if (raw.find(U'|') != Text::npos) {
+    repaired.assign(raw.begin(), raw.end());
+    std::replace(repaired.begin(), repaired.end(), U'|', U'l');
+    view = Text(repaired);
+  }
   for (const TokenFormat& format : kTokenFormats) {
-    for (std::size_t at = t.find(format.prefix); at != Text::npos; at = t.find(format.prefix, at + 1)) {
-      if (at > 0 && (is_alnum(t[at - 1]) || t[at - 1] == U'_')) {
+    for (std::size_t at = view.find(format.prefix); at != Text::npos; at = view.find(format.prefix, at + 1)) {
+      if (at > 0 && (is_alnum(raw[at - 1]) || raw[at - 1] == U'_')) {
         continue;
       }
-      std::size_t end = at + format.prefix.size();
-      while (end < t.size() && base64url(t[end])) {
-        ++end;
-      }
-      if (end - at - format.prefix.size() >= format.min_body) {
+      if (token_body(view, at + format.prefix.size(), format.prefix != U"eyj") >= format.min_body) {
         return true;
       }
     }
   }
-  if (has_jwt(t)) {
+  if (has_jwt(raw) || has_jwt(view)) {
     return true;
   }
   // A PEM private key header ("-----BEGIN OPENSSH PRIVATE KEY-----").
-  for (std::size_t at = t.find(U"begin"); at != Text::npos; at = t.find(U"begin", at + 1)) {
-    const bool after_dash = at > 0 && (t[at - 1] == U'-' || (at > 1 && t[at - 1] == U' ' && t[at - 2] == U'-'));
-    if (after_dash && t.find(U"private key", at) != Text::npos) {
+  for (std::size_t at = raw.find(U"begin"); at != Text::npos; at = raw.find(U"begin", at + 1)) {
+    const bool after_dash =
+        at > 0 && (raw[at - 1] == U'-' || (at > 1 && raw[at - 1] == U' ' && raw[at - 2] == U'-'));
+    if (after_dash && raw.find(U"private key", at) != Text::npos) {
       return true;
     }
   }

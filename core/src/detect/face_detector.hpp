@@ -10,9 +10,15 @@
 // OpenCV's FaceDetectorYN pads. Every coordinate conversion goes through
 // spg::convert() with the mapping that produced the input.
 //
-// Known recall gap: one fixed input for the whole frame scales a 1080p source
-// by 1/3, so faces under about 30 Source px may be missed. SPG-12 owns tiling
-// or a larger input; make no recall claim for small faces until then.
+// One fixed input for the whole frame scales a 1080p source by 1/3, and on the
+// faces suite that missed faces of 43 and 62 Source px outright (SPG-12). So
+// a frame larger than the input is also cut into input-sized tiles at scale 1
+// (grid_crops() in detect/tiling.hpp, shared with the text detector), each
+// run through the model, and the boxes of every pass are joined in Source
+// space: a box overlapping a better one by more than nms_iou_threshold merges
+// into it as their hull. Faces larger than the tile overlap that a tile edge
+// cuts are left to the whole frame pass, which sees them at a size YuNet
+// handles.
 //
 // No OBS, no globals, no logging; nothing here touches the network or the disk
 // except opening the model file.
@@ -43,6 +49,11 @@ struct FaceDetectorConfig {
   float nms_iou_threshold = 0.3F;
   // At most this many candidates enter NMS (OpenCV's top_k default).
   std::size_t top_k = 5000;
+  // Also run scale-1 tiles when the frame is larger than the model input.
+  bool tiles = true;
+  // Minimum overlap between neighbouring tiles, in readback pixels: a face
+  // up to this size is whole in some tile. Below the input's shorter side.
+  std::uint32_t tile_overlap = 128;
 };
 
 // Thrown for a model whose inputs or outputs are not YuNet's, or a config out
@@ -102,6 +113,10 @@ class FaceDetector {
   // frame is not scaled. Returns Source-space detections (kind Face, detector
   // YuNet) by descending score; an empty vector means no face scored above the
   // threshold. Safe to call from several threads at once.
+  //
+  // Cost: one model run for the whole frame plus, when `tiles` is set and the
+  // frame is larger than the input, one per tile (8 for 1920x1080 at a
+  // 640x640 input and the default overlap), run one after another.
   //
   // Throws on any failure so the caller can fail the frame closed:
   // ContractError for an invalid frame or zero-size source,
