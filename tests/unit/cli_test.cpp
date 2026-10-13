@@ -572,4 +572,18 @@ TEST_CASE("suite errors name files and counts, never the watch-list", "[cli]") {
     CHECK(r.code == 1);
     no_sentinel(r.out + r.err);
   }
+  SECTION("a policy below a floor writes no plans (SPG-08b)") {
+    // A hold or category set that would switch a protection off is refused,
+    // never run with that protection missing.
+    for (const char* rule : {R"("hold_ms": 0)", R"("hold_ms": 250)", R"("categories": [])", R"("margin_px": 0)"}) {
+      write_text(suite / "policy.json",
+                 R"({"schema": 1, "watchlist": [")" + std::string(kSentinel) + R"("], )" + rule + "}");
+      const fs::path plans = suite / "p-floor";
+      const Ran r = cli({"eval", "--suite", suite.string(), "--plans", plans.string()});
+      CHECK(r.code == 1);
+      CHECK(r.err.find("policy.json") != std::string::npos);
+      CHECK_FALSE(fs::exists(plans));
+      no_sentinel(r.out + r.err);
+    }
+  }
 }

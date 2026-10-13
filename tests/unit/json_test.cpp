@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <optional>
@@ -9,8 +10,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "spg/category.hpp"
 #include "spg/error.hpp"
 #include "spg/json.hpp"
+#include "spg/policy_config.hpp"
 
 using namespace std::chrono_literals;
 
@@ -74,8 +77,58 @@ TEST_CASE("json: policy config fixture parses", "[json][policy]") {
 
 TEST_CASE("json: a minimal policy config takes the plan defaults", "[json][policy]") {
   CHECK(spg::parse_policy_config(R"({"schema": 1})") == spg::PolicyConfig{});
-  const spg::PolicyConfig none = spg::parse_policy_config(R"({"schema": 1, "categories": []})");
-  CHECK(none.categories.empty());
+}
+
+TEST_CASE("json: policy configs at the floors and caps parse", "[json][policy]") {
+  const spg::PolicyConfig floors = spg::parse_policy_config(read_fixture("policy_config_floors.json"));
+  spg::CategorySet token_only;
+  token_only.insert(spg::Category::PiiToken);
+  CHECK(floors.categories == token_only);
+  CHECK(floors.lookahead == spg::kMinLookahead);
+  CHECK(floors.retro == spg::kMinRetro);
+  CHECK(floors.hold == spg::kMinHold);
+  CHECK(floors.margin_px == static_cast<float>(spg::kMinMarginPx));
+  CHECK(floors.margin_ratio == static_cast<float>(spg::kMinMarginRatio));
+
+  const spg::PolicyConfig caps = spg::parse_policy_config(read_fixture("policy_config_caps.json"));
+  CHECK(caps.categories == spg::CategorySet::all());
+  CHECK(caps.lookahead == spg::kMaxLookahead);
+  CHECK(caps.retro == spg::kMaxLookahead);
+  CHECK(caps.hold == spg::kMaxHold);
+  CHECK(caps.margin_px == static_cast<float>(spg::kMaxMarginPx));
+  CHECK(caps.margin_ratio == static_cast<float>(spg::kMaxMarginRatio));
+}
+
+// Fail closed: a config that would turn detection, the lookahead, the
+// retroactive window, the hold or the margins off is an error, not a quiet
+// "off". Each case in the fixture must be rejected with an error that names
+// its field.
+TEST_CASE("json: policy configs that switch a protection off are rejected", "[json][policy]") {
+  std::istringstream lines(read_fixture("policy_config_rejected.tsv"));
+  std::size_t cases = 0;
+  for (std::string line; std::getline(lines, line);) {
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    const std::size_t tab = line.find('\t');
+    REQUIRE(tab != std::string::npos);
+    const std::string field = line.substr(0, tab);
+    const std::string json = line.substr(tab + 1);
+    const std::string message = error_of(parse_config, json);
+    INFO(json << " -> " << message);
+    CHECK(message.rfind("policy config: ", 0) == 0);
+    CHECK(message.find(field) != std::string::npos);
+    ++cases;
+  }
+  CHECK(cases == 20);
+
+  // The serializer refuses to write such a config too.
+  spg::PolicyConfig none;
+  none.categories = spg::CategorySet{};
+  CHECK_THROWS_AS(spg::serialize_policy_config(none), spg::ContractError);
+  spg::PolicyConfig no_hold;
+  no_hold.hold = 0ms;
+  CHECK_THROWS_AS(spg::serialize_policy_config(no_hold), spg::ContractError);
 }
 
 TEST_CASE("json: policy configs round trip", "[json][policy][property]") {
@@ -85,8 +138,8 @@ TEST_CASE("json: policy configs round trip", "[json][policy][property]") {
   configs[1].categories.insert(spg::Category::PiiToken);
   configs[2].lookahead = 1200ms;
   configs[2].retro = 300ms;
-  configs[2].hold = 0ms;
-  configs[2].margin_px = 0.1F;
+  configs[2].hold = spg::kMinHold;
+  configs[2].margin_px = 2.1F;
   configs[2].margin_ratio = 1.0F / 3.0F;
   configs[2].fuzzy = {0U, 0.0, 1U};
   configs[3].fallback = spg::FallbackMode::HoldLastScanned;

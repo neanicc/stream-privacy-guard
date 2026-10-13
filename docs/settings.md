@@ -15,7 +15,7 @@ OBS-free in `plugin/src/settings/` and unit-tested on every OS.
 | Watch-list sensitivity | `sensitivity` | `standard` | `standard` = spg-core fuzzy defaults (2 edits, ratio 0.2, partials from 6 characters); `high` = 3, 0.3, 5. No preset below the defaults. Placeholders until SPG-12 measures them |
 | Lookahead | `lookahead_ms` | 500 | Clamped to [100, 2000] ms; the retroactive window equals it |
 | Video memory for the lookahead | `vram_budget_mb` | 512 | MiB, clamped to [64, 16384]. A lookahead that needs more at the source's size and frame rate is shortened to fit, with a warning ([plugin-render.md](plugin-render.md#vram-budget)); a low value only shortens it |
-| Mask hold | `hold_ms` | 750 | Clamped to [250, 10000] ms |
+| Mask hold | `hold_ms` | 750 | Clamped to [400, 10000] ms |
 | Fallback | `fallback` | `blur_source` | `blur_source`, `hold_last_scanned`, `solid_fill`; there is no fail-open choice |
 | Debug overlay | `debug_overlay` | off | Boxes and reason codes only, never text (drawn by SPG-14) |
 
@@ -23,8 +23,12 @@ Values loaded from a scene file are clamped and written back, so an old or
 hand-edited file cannot switch a protection off: a lookahead or hold below the
 floor is raised to it, and an unknown sensitivity or fallback name becomes the
 default. The ceilings are safe values that bound VRAM (lookahead) and keep the
-sliders usable. If SPG-08b sets spg-core floors above these, the plugin floors
-must rise to match; until then a config spg-core rejects fails closed.
+sliders usable. The floors are spg-core's own (`kMinLookahead`, `kMinHold` in
+`spg/policy_config.hpp`, SPG-08b), checked at compile time, so no slider value
+or clamped scene-file value builds a config spg-core rejects; a file saved with
+a hold of 250 to 399 ms (the earlier floor) is raised to 400. Any config
+spg-core still rejects (for example a watch-list entry that can never match)
+turns detection off and the filter covers the whole source.
 
 ## Watch-list storage
 

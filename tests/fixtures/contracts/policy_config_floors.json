@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "categories": ["pii:token"],
+  "lookahead_ms": 100,
+  "retro_ms": 100,
+  "hold_ms": 400,
+  "margin_px": 2,
+  "margin_ratio": 0.125
+}

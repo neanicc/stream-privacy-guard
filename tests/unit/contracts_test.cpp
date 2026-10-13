@@ -1,6 +1,8 @@
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -176,6 +178,83 @@ TEST_CASE("contracts: policy config defaults follow the plan and validate", "[co
   bad = config;
   bad.fuzzy.max_edit_ratio = 1.5;
   CHECK_THROWS_AS(spg::validate(bad), spg::ContractError);
+}
+
+namespace {
+
+// The error validate() throws for `config`, or "" when it accepts it.
+std::string validation_error(const spg::PolicyConfig& config) {
+  try {
+    spg::validate(config);
+  } catch (const spg::ContractError& e) {
+    return e.what();
+  }
+  return {};
+}
+
+}  // namespace
+
+TEST_CASE("contracts: policy config cannot switch a protection off", "[contracts][policy]") {
+  using Edit = void (*)(spg::PolicyConfig&);
+  struct Case {
+    const char* field;
+    Edit edit;
+  };
+  const std::vector<Case> rejected = {
+      {"categories", [](spg::PolicyConfig& c) { c.categories = spg::CategorySet{}; }},
+      {"lookahead_ms", [](spg::PolicyConfig& c) { c.lookahead = c.retro = 0ms; }},
+      {"lookahead_ms", [](spg::PolicyConfig& c) { c.lookahead = c.retro = spg::kMinLookahead - 1ms; }},
+      {"lookahead_ms", [](spg::PolicyConfig& c) { c.lookahead = spg::kMaxLookahead + 1ms; }},
+      {"lookahead_ms", [](spg::PolicyConfig& c) { c.lookahead = -1ms; }},
+      {"retro_ms", [](spg::PolicyConfig& c) { c.retro = 0ms; }},
+      {"retro_ms", [](spg::PolicyConfig& c) { c.retro = spg::kMinRetro - 1ms; }},
+      {"retro_ms", [](spg::PolicyConfig& c) { c.retro = c.lookahead + 1ms; }},
+      {"hold_ms", [](spg::PolicyConfig& c) { c.hold = 0ms; }},
+      {"hold_ms", [](spg::PolicyConfig& c) { c.hold = spg::kMinHold - 1ms; }},
+      {"hold_ms", [](spg::PolicyConfig& c) { c.hold = spg::kMaxHold + 1ms; }},
+      {"margin_px", [](spg::PolicyConfig& c) { c.margin_px = 0.0F; }},
+      {"margin_px", [](spg::PolicyConfig& c) { c.margin_px = 1.99F; }},
+      {"margin_px", [](spg::PolicyConfig& c) { c.margin_px = 256.5F; }},
+      {"margin_px", [](spg::PolicyConfig& c) { c.margin_px = std::numeric_limits<float>::quiet_NaN(); }},
+      {"margin_px", [](spg::PolicyConfig& c) { c.margin_px = std::numeric_limits<float>::infinity(); }},
+      {"margin_ratio", [](spg::PolicyConfig& c) { c.margin_ratio = 0.0F; }},
+      {"margin_ratio", [](spg::PolicyConfig& c) { c.margin_ratio = 0.12F; }},
+      {"margin_ratio", [](spg::PolicyConfig& c) { c.margin_ratio = 4.01F; }},
+      {"margin_ratio", [](spg::PolicyConfig& c) { c.margin_ratio = std::numeric_limits<float>::quiet_NaN(); }},
+  };
+  for (std::size_t i = 0; i < rejected.size(); ++i) {
+    spg::PolicyConfig config;
+    rejected[i].edit(config);
+    const std::string error = validation_error(config);
+    INFO("case " << i << " (" << rejected[i].field << "): " << error);
+    CHECK(error.rfind("policy config: ", 0) == 0);
+    CHECK(error.find(rejected[i].field) != std::string::npos);
+  }
+
+  // Every bound itself is allowed, and one enabled category is enough.
+  spg::PolicyConfig floors;
+  floors.categories = spg::CategorySet{};
+  floors.categories.insert(spg::Category::PiiToken);
+  floors.lookahead = spg::kMinLookahead;
+  floors.retro = spg::kMinRetro;
+  floors.hold = spg::kMinHold;
+  floors.margin_px = static_cast<float>(spg::kMinMarginPx);
+  floors.margin_ratio = static_cast<float>(spg::kMinMarginRatio);
+  CHECK(validation_error(floors).empty());
+  spg::PolicyConfig caps;
+  caps.lookahead = caps.retro = spg::kMaxLookahead;
+  caps.hold = spg::kMaxHold;
+  caps.margin_px = static_cast<float>(spg::kMaxMarginPx);
+  caps.margin_ratio = static_cast<float>(spg::kMaxMarginRatio);
+  CHECK(validation_error(caps).empty());
+
+  // The plan defaults sit inside the limits, with the floors below them.
+  const spg::PolicyConfig defaults;
+  CHECK(spg::kMinLookahead < defaults.lookahead);
+  CHECK(spg::kMinHold < defaults.hold);
+  CHECK(spg::kMinMarginPx < defaults.margin_px);
+  CHECK(spg::kMinMarginRatio < defaults.margin_ratio);
+  CHECK(spg::kMinRetro <= spg::kMinLookahead);
 }
 
 TEST_CASE("contracts: ground truth ids are unique per frame", "[contracts][ground-truth]") {

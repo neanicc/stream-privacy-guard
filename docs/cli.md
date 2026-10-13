@@ -22,7 +22,9 @@ platform order with CPU fallback, CoreML on macOS), `--readback-scale S`
 scanned at once), `--cycle-ms MS` (`run` and `eval` only, default 200). Exit
 codes: 0 done (for `scrub`: no leak), 1 failed (a missing model, an
 unreadable frame, a suite whose frame count or frame size disagrees with
-`suite.json`), 2 usage, 3 `scrub` found a leak. Output, plans and reports hold counts and timings
+`suite.json`, a policy file outside the limits in
+[contracts.md](contracts.md#policy-config), which writes no plans), 2 usage,
+3 `scrub` found a leak. Output, plans and reports hold counts and timings
 only; recognized text and watch-list entries are never printed, and parse
 errors name fields and offsets.
 

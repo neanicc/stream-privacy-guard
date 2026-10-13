@@ -19,8 +19,11 @@ enum class PixelFormat : std::uint8_t {
 [[nodiscard]] std::string_view to_string(PixelFormat format) noexcept;
 [[nodiscard]] std::size_t plane_count(PixelFormat format) noexcept;
 
-// Non-owning view of one video frame in Source space. The pixels belong to the
-// caller and must outlive every use of the view. Planar formats use one entry
+// Non-owning view of one video frame. It carries no Space tag: detectors get
+// the downscaled readback copy (Readback pixels, size() is the readback size)
+// with the Source size passed separately (docs/contracts.md, "Frames handed
+// to detectors"). The pixels belong to the caller and must outlive every use
+// of the view. Planar formats use one entry
 // per plane; entries past plane_count(format) are ignored. Chroma planes of odd
 // sizes round up.
 struct FrameView {

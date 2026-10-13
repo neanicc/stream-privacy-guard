@@ -1855,3 +1855,69 @@ Template:
   face check in scrub and an upscaled pass for very small text are possible
   follow-ups. Speed: about 0.85 s of text detection per 720p frame per
   worker on CPU, so a 30 s 1080p60 session takes tens of minutes.
+
+## 2026-10-12 — SPG-08b Reject fail-open policy configs (#28)
+
+- Decision / change: `validate(PolicyConfig)` and `parse_policy_config` now
+  reject a config that would switch a protection off, so a caller must fail
+  closed (blur the source) instead of running unprotected. `"categories": []`
+  is an error with no opt-in (the plan defines none; stopping detection means
+  disabling the filter). Floors, all below the plan defaults so tuning can
+  tighten but not remove a protection: `lookahead_ms` >= 100 (3 frames at
+  30 fps, the SPG-13 slider minimum; a scan slower than the lookahead already
+  fails closed, so a short lookahead costs over-blur, not leaks); `retro_ms`
+  >= 100 (0 would detect without masking earlier frames); `hold_ms` >= 400
+  (one detection cycle at the realtime p95 latency limit of 400 ms in
+  `eval/thresholds.toml`); `margin_px` in [2, 256] and `margin_ratio` in
+  [0.125, 4] (floors are half the defaults 4 and 0.25; caps reject typos such
+  as 4000 for 4.0). Bounds are exact in binary and checked on the parsed
+  double before narrowing. Constants live in `spg/policy_config.hpp`.
+  `docs/contracts.md` documents the limits and that detectors take the
+  readback `FrameView` with the source size passed separately.
+- Catch-up (merge of main at 79dd38b, 15 merges since #30): the plugin
+  floors are now spg-core's constants (`kMinLookaheadMs = kMinLookahead`,
+  `kMinHoldMs = kMinHold`), so the hold slider and scene-file clamp move from
+  250 to 400 ms (the lookahead floor was already 100); `static_assert`s keep
+  the plugin range, default and retro (= lookahead) inside spg-core's limits.
+  A scene file saved with a hold of 250 to 399 ms is raised to 400 and written
+  back. A config spg-core still rejects already fails closed: `FilterIssue::
+  InvalidConfig` leaves no policy, which the render side covers whole
+  (`Cover::NoDetection`). Margins are not plugin settings; the PolicyConfig
+  defaults (4 px, 0.25) are inside the new bounds. Later catch-ups (main at
+  c338c0c, then 52db92e) brought SPG-11's `spg-cli`, which reads every policy through
+  `parse_policy_config`: a policy below a floor exits 1 and writes no plans
+  (`cli_test.cpp` "a policy below a floor writes no plans"), and the eval
+  suite generators write defaults plus a synthetic watch-list, inside the
+  limits; `spg-cli scrub` (SPG-18) builds a watch-list-only config with
+  default timing. `SchedulerConfig` and `TrackerConfig` keep their
+  non-negative checks: they are internal, the VRAM fit (SPG-14c) may shorten
+  the scheduler's lookahead below 100 ms (more frames covered, never fewer),
+  and their tests drive scheduler mechanics directly. The one test that built
+  an invalid PolicyConfig (`from_policy carries ...`: hold 0, no category)
+  now uses valid values and checks `validate()` accepts them.
+- Schema: the policy JSON stays `"schema": 1` although it now rejects values
+  it used to accept (raised by both PR reviewers). No release has shipped
+  and every in-tree writer stays inside the limits, so no stored document
+  can break; `docs/contracts.md` records the
+  tightening and that a later change rejecting what a released reader
+  accepted bumps `schema`. The "must be in [lo, hi]" text for both readers
+  comes from one internal helper (`core/src/contracts/range_text.hpp`).
+- Evidence (automated, dev Mac, macOS 26.5 arm64, AppleClang 21): after the
+  last catch-up (main at 52db92e), `scripts/ci/run.sh setup`, `build` and
+  `test` pass, 381 ctest tests (plugin and CLI included). New fixtures `policy_config_floors.json`,
+  `policy_config_caps.json` (accepted) and `policy_config_rejected.tsv` (20
+  cases, each error must name its field); struct-level `validate()` cases
+  include NaN and infinite margins. `plugin/tests/settings_test.cpp` checks
+  that every slider end, the old 250 ms hold and out-of-range scene-file
+  values sanitize into a config `validate()` accepts.
+- Eval delta: none. `scripts/ci/run.sh eval` (ci mode, text suite, seed
+  20261012, dev Mac with CoreML) gives the same values as the `eval-report`
+  artifacts of main's c338c0c and 52db92e Check runs: watchlist_pair_recall 1.0000, first-frame recall
+  1.0000, pii_pair_recall 0.9390, leak_frame_rate 0.1263 (FAIL, limit 0.02),
+  clean_frame_blur_area 0.0000, decoy_blur_rate 0.3987 (FAIL, limit 0.25);
+  `THRESHOLDS: FAIL` on both, as main's report-only eval job (#64) expects.
+- Open issues or follow-ups: the scheduler already counts a frame as scanned
+  only through a cycle on a frame at most `retro_ms` after it (SPG-10,
+  `lookahead_test.cpp` "a frame counts as scanned only by a cycle within
+  retro after it"), so the retro floor needs no further ticket. Live OBS
+  check of the hold slider's new minimum not done.
