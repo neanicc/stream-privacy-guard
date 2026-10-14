@@ -7,6 +7,8 @@
 #include <exception>
 #include <iterator>
 #include <memory>
+#include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -85,6 +87,181 @@ ScanResult failed(ScanFailure failure) noexcept {
   return result;
 }
 
+// What one lane of a cycle (faces, or text with its recognizer and policy)
+// kept and how it ended. A lane stops at its own first failure.
+struct Lane {
+  std::vector<Detection> kept;
+  ScanFailure failure = ScanFailure::None;
+  bool lost = false;  // an allocation failed while collecting boxes
+};
+
+// The face lane. Never throws.
+Lane face_lane(const Detector& detector, const ScanJob& job) noexcept {
+  Lane lane;
+  try {
+    std::vector<Detection> faces;
+    try {
+      faces = detector.detect(job.readback->view(), job.source);
+    } catch (...) {
+      lane.failure = ScanFailure::FaceDetector;
+      return lane;
+    }
+    if (!valid_output(faces, DetectionKind::Face)) {
+      lane.failure = ScanFailure::InvalidOutput;
+      keep_valid(lane.kept, faces, DetectionKind::Face);
+      return lane;
+    }
+    lane.kept = std::move(faces);
+  } catch (...) {
+    lane.lost = true;
+    lane.failure = ScanFailure::InvalidOutput;
+  }
+  return lane;
+}
+
+// The text lane, in two steps (detectors, then reading): detect() runs the
+// text detector, read() the recognizer and the policy on the regions it
+// found. Neither throws.
+class TextLane {
+ public:
+  TextLane(const ScanStages& stages, const ScanJob& job, const ScanLimits& limits) noexcept
+      : stages_(stages), job_(job), limits_(limits) {}
+
+  void detect() noexcept {
+    try {
+      std::vector<Detection> found;
+      try {
+        found = stages_.text->detect(job_.readback->view(), job_.source);
+      } catch (...) {
+        lane_.failure = ScanFailure::TextDetector;
+        return;
+      }
+      if (!valid_output(found, DetectionKind::TextRegion)) {
+        lane_.failure = ScanFailure::InvalidOutput;
+        keep_valid(lane_.kept, found, DetectionKind::TextRegion);
+        return;
+      }
+      regions_ = std::move(found);
+      detected_ = true;
+    } catch (...) {
+      lane_.lost = true;
+      lane_.failure = ScanFailure::InvalidOutput;
+    }
+  }
+
+  void read() noexcept {
+    if (!detected_) {
+      return;
+    }
+    try {
+      if (stages_.recognizer == nullptr || stages_.policy == nullptr) {
+        // Nothing can clear these regions: mask them all (recall over precision).
+        lane_.kept = regions_;
+        return;
+      }
+      if (regions_.empty()) {
+        return;
+      }
+      // From here on a failure masks every region: none was cleared by a
+      // text stage that finished.
+      const FrameView& frame = job_.readback->view();
+      std::vector<Secret> texts;
+      try {
+        texts = stages_.recognizer->recognize(frame, job_.source, regions_);
+      } catch (...) {
+        mask_all(ScanFailure::Recognizer);
+        return;
+      }
+      if (texts.size() != regions_.size()) {
+        mask_all(ScanFailure::InvalidOutput);
+        return;
+      }
+      std::vector<bool> masked(regions_.size(), false);
+      for (std::size_t i = 0; i < regions_.size(); ++i) {
+        masked[i] = texts[i].size() > limits_.max_text_bytes;
+        if (!masked[i]) {
+          try {
+            masked[i] = stages_.policy->evaluate(texts[i]).sensitive();
+          } catch (...) {
+            mask_all(ScanFailure::Policy);
+            return;
+          }
+        }
+      }
+      for (std::size_t i = 0; i < regions_.size(); ++i) {
+        if (masked[i]) {
+          lane_.kept.push_back(regions_[i]);
+        }
+      }
+    } catch (...) {
+      // Some of the regions may be missing from `kept`.
+      lane_.lost = true;
+      lane_.failure = ScanFailure::InvalidOutput;
+    }
+  }
+
+  [[nodiscard]] Lane& lane() noexcept { return lane_; }
+
+ private:
+  void mask_all(ScanFailure failure) {
+    lane_.failure = failure;
+    lane_.kept = regions_;  // may throw; read() records the loss
+  }
+
+  const ScanStages& stages_;
+  const ScanJob& job_;
+  const ScanLimits& limits_;
+  std::vector<Detection> regions_;
+  bool detected_ = false;
+  Lane lane_;
+};
+
+// Runs the face lane on a thread of its own, joined by finish() or on
+// destruction. When no thread was started, finish() runs the lane on the
+// calling thread instead.
+class FaceHelper {
+ public:
+  FaceHelper(const Detector& detector, const ScanJob& job) noexcept : detector_(detector), job_(job) {}
+  FaceHelper(const FaceHelper&) = delete;
+  FaceHelper& operator=(const FaceHelper&) = delete;
+  ~FaceHelper() { join(); }
+
+  // Starts the lane beside the caller; false when no thread could start.
+  bool start() noexcept {
+    try {
+      thread_ = std::thread([this] { lane_ = face_lane(detector_, job_); });
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+  // The lane's result: joins a started thread, or runs the lane here.
+  Lane& finish() noexcept {
+    if (thread_.joinable()) {
+      join();
+    } else {
+      lane_ = face_lane(detector_, job_);
+    }
+    return lane_;
+  }
+
+ private:
+  void join() noexcept {
+    if (thread_.joinable()) {
+      try {
+        thread_.join();
+      } catch (...) {
+        // join() throws only for a thread that is not joinable or is this one.
+      }
+    }
+  }
+
+  const Detector& detector_;
+  const ScanJob& job_;
+  Lane lane_;
+  std::thread thread_;
+};
+
 }  // namespace
 
 std::shared_ptr<const OwnedFrame> OwnedFrame::copy(const FrameView& frame) {
@@ -133,77 +310,57 @@ ScanResult run_scan(const ScanStages& stages, const ScanJob& job, const ScanLimi
   if ((want_faces && stages.faces == nullptr) || (want_text && stages.text == nullptr)) {
     return failed(ScanFailure::MissingStage);
   }
-  const FrameView& frame = job.readback->view();
-  ScanResult result;
-  try {
+  // Two lanes, each stopping at its own first failure: faces, and text
+  // (detector, recognizer, policy). With both enabled the face detector runs
+  // on a helper thread beside the text detector, so the cycle waits for the
+  // slower of the two rather than their sum (SPG-16e).
+  Lane faces;
+  std::optional<TextLane> text;
+  {
+    std::optional<FaceHelper> helper;
     if (want_faces) {
-      std::vector<Detection> faces;
-      try {
-        faces = stages.faces->detect(frame, job.source);
-      } catch (...) {
-        return failed(std::move(result), ScanFailure::FaceDetector);
+      helper.emplace(*stages.faces, job);
+      if (want_text) {
+        (void)helper->start();  // when it cannot start, finish() runs it here
       }
-      if (!valid_output(faces, DetectionKind::Face)) {
-        keep_valid(result.detections, faces, DetectionKind::Face);
-        return failed(std::move(result), ScanFailure::InvalidOutput);
-      }
-      result.detections.insert(result.detections.end(), faces.begin(), faces.end());
     }
-
     if (want_text) {
-      std::vector<Detection> regions;
-      try {
-        regions = stages.text->detect(frame, job.source);
-      } catch (...) {
-        return failed(std::move(result), ScanFailure::TextDetector);
-      }
-      if (!valid_output(regions, DetectionKind::TextRegion)) {
-        keep_valid(result.detections, regions, DetectionKind::TextRegion);
-        return failed(std::move(result), ScanFailure::InvalidOutput);
-      }
-      if (stages.recognizer == nullptr || stages.policy == nullptr) {
-        // Nothing can clear these regions: mask them all (recall over precision).
-        result.detections.insert(result.detections.end(), regions.begin(), regions.end());
-      } else if (!regions.empty()) {
-        // From here on a failure masks every region: none was cleared by a
-        // text stage that finished.
-        const auto mask_all = [&](ScanFailure failure) {
-          result.detections.insert(result.detections.end(), regions.begin(), regions.end());
-          return failed(std::move(result), failure);
-        };
-        std::vector<Secret> texts;
-        try {
-          texts = stages.recognizer->recognize(frame, job.source, regions);
-        } catch (...) {
-          return mask_all(ScanFailure::Recognizer);
-        }
-        if (texts.size() != regions.size()) {
-          return mask_all(ScanFailure::InvalidOutput);
-        }
-        std::vector<bool> masked(regions.size(), false);
-        for (std::size_t i = 0; i < regions.size(); ++i) {
-          masked[i] = texts[i].size() > limits.max_text_bytes;
-          if (!masked[i]) {
-            try {
-              masked[i] = stages.policy->evaluate(texts[i]).sensitive();
-            } catch (...) {
-              return mask_all(ScanFailure::Policy);
-            }
-          }
-        }
-        for (std::size_t i = 0; i < regions.size(); ++i) {
-          if (masked[i]) {
-            result.detections.push_back(regions[i]);
-          }
-        }
-      }
+      text.emplace(stages, job, limits);
+      text->detect();
     }
+    if (helper) {
+      faces = std::move(helper->finish());
+    }
+  }
+  // Reading only matters when the face lane finished (see below).
+  if (text && faces.failure == ScanFailure::None) {
+    text->read();
+  }
+
+  // The result is what running the stages one after another returns: a
+  // failed face lane ends the cycle with its own boxes, as if text never ran
+  // (docs/scheduler.md, "Partial cycles"); otherwise the faces and what the
+  // text lane kept, named by the text lane's failure.
+  ScanResult result;
+  Lane none;
+  Lane& texts = text && faces.failure == ScanFailure::None ? text->lane() : none;
+  const ScanFailure failure = faces.failure != ScanFailure::None ? faces.failure : texts.failure;
+  try {
+    result.detections = std::move(faces.kept);
+    result.detections.insert(result.detections.end(), texts.kept.begin(), texts.kept.end());
   } catch (...) {
-    // Allocation failure while collecting the boxes a stage returned: some
+    // Allocation failure while collecting the boxes the lanes returned: some
     // are missing from `detections`, so the scheduler must fail closed
     // their whole window (retro and hold) rather than hold only what is here.
     result.detections_lost = true;
     return failed(std::move(result), ScanFailure::InvalidOutput);
+  }
+  if (faces.lost || texts.lost) {
+    result.detections_lost = true;
+    return failed(std::move(result), ScanFailure::InvalidOutput);
+  }
+  if (failure != ScanFailure::None) {
+    return failed(std::move(result), failure);
   }
   result.complete = true;
   return result;

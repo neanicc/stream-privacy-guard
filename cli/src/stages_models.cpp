@@ -10,6 +10,7 @@
 #include "detect/face_detector.hpp"
 #include "detect/text_detector.hpp"
 #include "image_io.hpp"
+#include "ocr/cached_recognizer.hpp"
 #include "ocr/text_recognizer.hpp"
 #include "runtime/onnx_session.hpp"
 #include "spg/category.hpp"
@@ -21,8 +22,8 @@ namespace spg::cli {
 namespace {
 
 // The SPG-07 recognizer as a scan stage: one Secret per region, in order.
-// The per-track recognition cache needs track ids, which run_scan() does not
-// have; every region is read on every cycle (costs time, never recall).
+// open_stages() puts ocr::CachedRecognizer in front of it, so a region whose
+// crop is pixel-identical to one read recently is not read again (SPG-16e).
 class OcrRecognizer final : public TextRecognizer {
  public:
   OcrRecognizer(std::shared_ptr<runtime::Environment> env, std::shared_ptr<const ocr::TextRecognizer> impl)
@@ -107,7 +108,17 @@ OpenedStages open_stages(const ModelPaths& models, const PolicyConfig& policy, c
       auto rec = std::make_shared<const ocr::TextRecognizer>(
           ocr::TextRecognizer::open(*env, models.text_recognizer, rec_config, session));
       out.providers += "recognize=" + provider_name(rec->session());
-      out.stages.recognizer = std::make_shared<OcrRecognizer>(env, rec);
+      auto reader = std::make_shared<OcrRecognizer>(env, rec);
+      if (options.recognition_cache) {
+        auto cached = std::make_shared<ocr::CachedRecognizer>(reader);
+        out.recognition_counts = [cached] {
+          const ocr::CacheTotals totals = cached->totals();
+          return RecognitionCounts{totals.hits, totals.misses};
+        };
+        out.stages.recognizer = std::move(cached);
+      } else {
+        out.stages.recognizer = std::move(reader);
+      }
     }
     // Errors name the entry's index, never its text.
     out.stages.policy = std::make_shared<EnginePolicy>(std::make_shared<const PolicyEngine>(policy));

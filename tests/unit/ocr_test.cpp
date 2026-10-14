@@ -25,6 +25,8 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "../integration/synthetic_frames.hpp"
+#include "fail_alloc.hpp"
+#include "ocr/cached_recognizer.hpp"
 #include "ocr/crop_plan.hpp"
 #include "ocr/ctc_decode.hpp"
 #include "ocr/recognition_cache.hpp"
@@ -962,4 +964,317 @@ TEST_CASE("run_batches rethrows when every lane fails", "[ocr][parallel]") {
   // Each lane stops at its first error.
   CHECK(calls.load() >= 1);
   CHECK(calls.load() <= static_cast<int>(lanes));
+}
+
+// --- Content-keyed cache in front of the scan stage (SPG-16e) ---------------
+
+namespace {
+
+// Stands in for the model: a region "reads" as a digest of exactly the crop
+// pixels the real recognizer reads, so two crops read alike only when their
+// pixels are identical, and any change to a crop changes what it reads.
+// Counts the regions it was asked to read.
+class PixelReader final : public spg::TextRecognizer {
+ public:
+  [[nodiscard]] std::vector<spg::Secret> recognize(const spg::FrameView& frame, spg::Size source,
+                                                   std::span<const spg::Detection> regions) const override {
+    if (fail) {
+      throw std::runtime_error("InferenceFailed");
+    }
+    std::vector<spg::Secret> out;
+    for (const spg::Detection& region : regions) {
+      out.push_back(read(frame, source, region));
+    }
+    out.resize(out.size() - std::min(out.size(), short_by));
+    regions_read.fetch_add(regions.size());
+    return out;
+  }
+  // What a fresh read of `region` returns.
+  [[nodiscard]] static spg::Secret read(const spg::FrameView& frame, spg::Size source,
+                                        const spg::Detection& region) {
+    return spg::Secret(std::to_string(ocr::content_key(ocr::fingerprint(frame, source, region.box))));
+  }
+  mutable std::atomic<std::size_t> regions_read{0};
+  bool fail = false;
+  std::size_t short_by = 0;
+};
+
+spg::Detection text_region(float x, float y, float w, float h) {
+  spg::Detection d;
+  d.kind = spg::DetectionKind::TextRegion;
+  d.box = {{x, y, w, h}, spg::Space::Source};
+  d.score = 0.9F;
+  return d;
+}
+
+// A 400 x 120 panel with two lines of strokes, `dy` pixels lower than at
+// rest. Line 0 is a field with `typed` more strokes than at rest (typing).
+Canvas field(std::uint32_t typed, std::uint32_t dy = 0, Bgr paper = {230, 230, 230}) {
+  Canvas canvas(400, 120, paper);
+  for (std::uint32_t k = 0; k < 4 + typed; ++k) {
+    canvas.rect(30 + 10 * k, 12 + dy, 33 + 10 * k, 26 + dy, {20, 20, 20});
+  }
+  for (std::uint32_t k = 0; k < 6; ++k) {
+    canvas.rect(30 + 12 * k, 52 + dy, 34 + 12 * k, 66 + dy, {20, 20, 20});
+  }
+  return canvas;
+}
+
+const spg::Size kField{400, 120};
+
+std::vector<spg::Detection> field_boxes(std::uint32_t dy = 0) {
+  const auto y = static_cast<float>(dy);
+  return {text_region(20, 8 + y, 200, 22), text_region(20, 48 + y, 200, 22)};
+}
+
+struct Cycle {
+  std::vector<spg::Secret> texts;
+  std::size_t read = 0;  // regions the inner recognizer read
+};
+
+// One cycle through `cache` at frame time `ms`, checked against a fresh read
+// of every region: a cached answer is always what reading the crop returns.
+Cycle cycle(const ocr::CachedRecognizer& cache, const PixelReader& inner, const Canvas& canvas,
+            const std::vector<spg::Detection>& boxes, std::int64_t ms) {
+  spg::test::OwnedFrame frame = spg::test::to_frame(canvas, spg::PixelFormat::BGRA);
+  frame.view.timestamp = at_ms(ms);
+  const std::size_t before = inner.regions_read.load();
+  Cycle out;
+  out.texts = cache.recognize(frame.view, kField, boxes);
+  out.read = inner.regions_read.load() - before;
+  REQUIRE(out.texts.size() == boxes.size());
+  for (std::size_t i = 0; i < boxes.size(); ++i) {
+    CHECK(out.texts[i] == PixelReader::read(frame.view, kField, boxes[i]));
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("CachedRecognizer reads only new or changed content", "[ocr][cache][content]") {
+  const auto inner = std::make_shared<PixelReader>();
+  const ocr::CachedRecognizer cache(inner);
+
+  // First cycle: everything is new.
+  const Cycle first = cycle(cache, *inner, field(0), field_boxes(), 0);
+  CHECK(first.read == 2);
+  // Nothing changed: nothing is read.
+  CHECK(cycle(cache, *inner, field(0), field_boxes(), 200).read == 0);
+
+  SECTION("text that changes in place is read again on the next cycle") {
+    // One more character typed into the field: same box, other pixels.
+    const Cycle typed = cycle(cache, *inner, field(1), field_boxes(), 400);
+    CHECK(typed.read == 1);  // only the field; line 1 is unchanged
+    CHECK_FALSE(typed.texts[0] == first.texts[0]);
+    CHECK(typed.texts[1] == first.texts[1]);
+    // And again for each keystroke.
+    for (std::uint32_t keys = 2; keys <= 5; ++keys) {
+      CHECK(cycle(cache, *inner, field(keys), field_boxes(), 400 + 100 * keys).read == 1);
+    }
+  }
+  SECTION("text whose crop changes by one pixel is read again") {
+    Canvas dotted = field(0);
+    dotted.set(150, 20, {20, 20, 20});  // inside the field's box, away from its strokes
+    const Cycle next = cycle(cache, *inner, dotted, field_boxes(), 400);
+    CHECK(next.read == 1);
+    CHECK_FALSE(next.texts[0] == first.texts[0]);
+  }
+  SECTION("text changed back to content read before reads as before") {
+    CHECK(cycle(cache, *inner, field(1), field_boxes(), 400).read == 1);
+    const Cycle back = cycle(cache, *inner, field(0), field_boxes(), 600);
+    CHECK(back.read == 0);  // the first read is still within max_age
+    CHECK(back.texts[0] == first.texts[0]);
+  }
+  SECTION("text that moves with exactly its pixels is not read again") {
+    // Both lines move down 7 px on a uniform panel, their boxes with them:
+    // the same crops at another position.
+    const Cycle moved = cycle(cache, *inner, field(0, 7), field_boxes(7), 400);
+    CHECK(moved.read == 0);
+    CHECK(moved.texts[0] == first.texts[0]);
+    CHECK(moved.texts[1] == first.texts[1]);
+  }
+  SECTION("text that moves over other pixels is read again") {
+    // The same move, but what shows behind the strokes changed by one level
+    // (a translucent panel over a gradient): every crop differs.
+    const Cycle moved = cycle(cache, *inner, field(0, 7, {231, 230, 230}), field_boxes(7), 400);
+    CHECK(moved.read == 2);
+    CHECK_FALSE(moved.texts[0] == first.texts[0]);
+  }
+  SECTION("a resized box is read again") {
+    std::vector<spg::Detection> wider = field_boxes();
+    wider[0].box.rect.width += 1.0F;
+    CHECK(cycle(cache, *inner, field(0), wider, 400).read == 1);
+  }
+  SECTION("an entry older than max_age is read again") {
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 1000).read == 0);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 1001).read == 2);  // read at 0
+  }
+  SECTION("a frame time before the read misses") {
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), -1).read == 2);
+  }
+  CHECK(cache.totals().misses == inner->regions_read.load());
+}
+
+TEST_CASE("CachedRecognizer: a failed read stores nothing and fails the call", "[ocr][cache][content]") {
+  const auto inner = std::make_shared<PixelReader>();
+  const ocr::CachedRecognizer cache(inner);
+  spg::test::OwnedFrame frame = spg::test::to_frame(field(0), spg::PixelFormat::BGRA);
+  frame.view.timestamp = at_ms(0);
+  const std::vector<spg::Detection> boxes = field_boxes();
+
+  inner->fail = true;
+  CHECK_THROWS_AS(cache.recognize(frame.view, kField, boxes), std::runtime_error);
+  inner->fail = false;
+  inner->short_by = 1;  // one text short: the call fails rather than shift texts
+  CHECK_THROWS_AS(cache.recognize(frame.view, kField, boxes), ocr::DecodeError);
+  inner->short_by = 0;
+  CHECK(cycle(cache, *inner, field(0), boxes, 100).read == 2);  // nothing was cached
+
+  // A region outside the frame has an empty crop: never cached, always read.
+  const std::vector<spg::Detection> outside{text_region(600, 8, 50, 20)};
+  CHECK(cycle(cache, *inner, field(0), outside, 200).read == 1);
+  CHECK(cycle(cache, *inner, field(0), outside, 300).read == 1);
+  // An invalid box fails the call before anything is read.
+  const std::size_t read = inner->regions_read.load();
+  CHECK_THROWS_AS(cache.recognize(frame.view, kField, std::vector<spg::Detection>{text_region(0, 0, -5, 5)}),
+                  spg::ContractError);
+  CHECK(inner->regions_read.load() == read);
+  CHECK_THROWS_AS(ocr::CachedRecognizer(nullptr), spg::ContractError);
+}
+
+TEST_CASE("CachedRecognizer: workers share one cache", "[ocr][cache][content][parallel]") {
+  const auto inner = std::make_shared<PixelReader>();
+  const ocr::CachedRecognizer cache(inner);
+  std::vector<std::thread> workers;
+  std::atomic<int> wrong{0};
+  for (std::uint32_t w = 0; w < 4; ++w) {
+    workers.emplace_back([&, w] {
+      for (std::uint32_t i = 0; i < 25; ++i) {
+        spg::test::OwnedFrame frame = spg::test::to_frame(field((w + i) % 3), spg::PixelFormat::BGRA);
+        frame.view.timestamp = at_ms(10 * i);
+        const std::vector<spg::Detection> boxes = field_boxes();
+        const std::vector<spg::Secret> texts = cache.recognize(frame.view, kField, boxes);
+        for (std::size_t r = 0; r < boxes.size(); ++r) {
+          if (!(texts[r] == PixelReader::read(frame.view, kField, boxes[r]))) {
+            wrong.fetch_add(1);
+          }
+        }
+      }
+    });
+  }
+  for (std::thread& t : workers) {
+    t.join();
+  }
+  CHECK(wrong.load() == 0);
+  CHECK(cache.totals().hits > 0);
+}
+
+TEST_CASE("content_key: equal crops share a key, a reshaped crop does not", "[ocr][cache][content]") {
+  const ocr::Fingerprint a = print_of(strokes({30, 40, 50, 60}));
+  CHECK(ocr::content_key(a) == ocr::content_key(print_of(strokes({30, 40, 50, 60}))));
+  ocr::Fingerprint reshaped = a;
+  reshaped.crop = {a.crop.height, a.crop.width};  // same bytes, other shape
+  CHECK_FALSE(ocr::content_key(reshaped) == ocr::content_key(a));
+}
+
+// Greptile on PR #99: store() put the key in the LRU list and counted its
+// bytes before inserting the entry, so a failed insert left a key that a
+// later eviction looked up and dropped as a missing entry.
+TEST_CASE("RecognitionCache: a failed store leaves the cache usable", "[ocr][cache][alloc]") {
+  ocr::RecognitionCacheConfig config;
+  config.capacity = 3;
+  const ocr::Fingerprint print = print_of(strokes({30, 40, 50, 60}));
+  const ocr::Fingerprint other = print_of(strokes({30, 45, 50, 60}));
+  int failed = 0;
+  for (std::uint64_t n = 0;; ++n) {
+    REQUIRE(n < 1000);
+    ocr::RecognitionCache cache(config);
+    cache.store(1, print, reading("one"), at_ms(0));
+    cache.store(2, other, reading("two"), at_ms(0));
+    bool fired = false;
+    bool threw = false;
+    {
+      const spg_test::FailAllocations fail(n);
+      try {
+        cache.store(3, print, reading("three"), at_ms(10));
+      } catch (const std::bad_alloc&) {
+        threw = true;
+      }
+      fired = fail.fired();
+    }
+    INFO("allocation " << n);
+    CHECK(threw == fired);
+    CHECK(cache.find(3, print, at_ms(10)).has_value() == !threw);
+    CHECK(cache.size() == (threw ? 2U : 3U));
+    CHECK(cache.bytes() == cache.size() * print.pixels.size());
+    // Churn past the capacity: every eviction finds its entry.
+    for (spg::TrackId t = 10; t < 20; ++t) {
+      cache.store(t, t % 2 == 0 ? print : other, reading("churn"), at_ms(20));
+      CHECK(cache.size() <= config.capacity);
+    }
+    for (spg::TrackId t = 1; t < 20; ++t) {
+      cache.erase(t);
+    }
+    CHECK(cache.size() == 0);
+    CHECK(cache.bytes() == 0);
+    failed += threw ? 1 : 0;
+    if (!fired) {
+      break;
+    }
+  }
+  CHECK(failed >= 1);
+}
+
+TEST_CASE("CachedRecognizer: a failed allocation fails the call and the cache stays right",
+          "[ocr][cache][content][alloc]") {
+  ocr::RecognitionCacheConfig config;
+  config.capacity = 2;  // every call evicts
+  for (std::uint64_t n = 0;; ++n) {
+    REQUIRE(n < 5000);
+    const auto inner = std::make_shared<PixelReader>();
+    const ocr::CachedRecognizer cache(inner, config);
+    (void)cycle(cache, *inner, field(0), field_boxes(), 0);
+    bool fired = false;
+    {
+      spg::test::OwnedFrame frame = spg::test::to_frame(field(1), spg::PixelFormat::BGRA);
+      frame.view.timestamp = at_ms(100);
+      const spg_test::FailAllocations fail(n);
+      try {
+        (void)cache.recognize(frame.view, kField, field_boxes());
+      } catch (const std::bad_alloc&) {
+      }
+      fired = fail.fired();
+    }
+    INFO("allocation " << n);
+    // Whatever failed, later cycles read what a fresh read returns (cycle()
+    // checks every text) and keep evicting without a fault.
+    for (std::uint32_t keys = 0; keys < 4; ++keys) {
+      (void)cycle(cache, *inner, field(keys), field_boxes(), 200 + 100 * keys);
+    }
+    if (!fired) {
+      break;
+    }
+  }
+}
+
+TEST_CASE("CachedRecognizer: crops past the byte bounds are read, not copied", "[ocr][cache][content]") {
+  const std::size_t one = ocr::fingerprint(spg::test::to_frame(field(0), spg::PixelFormat::BGRA).view, kField,
+                                           field_boxes()[0].box)
+                              .pixels.size();
+  SECTION("over max_bytes in one call") {
+    ocr::RecognitionCacheConfig config;
+    config.max_bytes = one;  // room for the first region's crop only
+    const auto inner = std::make_shared<PixelReader>();
+    const ocr::CachedRecognizer cache(inner, config);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 0).read == 2);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 100).read == 1);  // the second is never cached
+  }
+  SECTION("over max_entry_bytes") {
+    ocr::RecognitionCacheConfig config;
+    config.max_entry_bytes = one - 1;
+    const auto inner = std::make_shared<PixelReader>();
+    const ocr::CachedRecognizer cache(inner, config);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 0).read == 2);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 100).read == 2);
+  }
 }

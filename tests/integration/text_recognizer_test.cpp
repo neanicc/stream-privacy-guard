@@ -27,6 +27,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "detect/text_detector.hpp"
+#include "ocr/cached_recognizer.hpp"
 #include "ocr/recognition_cache.hpp"
 #include "ocr/text_recognizer.hpp"
 #include "runtime/onnx_session.hpp"
@@ -782,4 +783,73 @@ TEST_CASE("Models that are not CTC recognizers are refused when opened", "[ocr][
   TextRecognizerConfig bad = fixture_config();
   bad.max_batch = 0;
   CHECK_THROWS_AS(open_fixture("rec_softmax.onnx", bad), ocr::TextRecognizerError);
+}
+
+// --- The content-keyed cache in front of the scan stage (SPG-16e) ------------
+
+namespace {
+
+// The pinned recognizer as a scan stage, as spg-cli and the plugin wrap it.
+class ModelStage final : public spg::TextRecognizer {
+ public:
+  [[nodiscard]] std::vector<spg::Secret> recognize(const spg::FrameView& frame, Size source,
+                                                   std::span<const spg::Detection> regions) const override {
+    std::vector<spg::Secret> out;
+    for (Recognition& r : recognizer().recognize(frame, source, regions)) {
+      out.push_back(std::move(r.text));
+    }
+    return out;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("The scan-stage cache reads typed and moved text as a fresh read does", "[ocr][model][cache]") {
+  SPG_REQUIRE_MODEL(rec_path());
+  const Size size{900, 200};
+  const Bgr paper{240, 240, 240};
+  const Bgr ink{30, 30, 30};
+  const ModelStage fresh;
+  const ocr::CachedRecognizer cached(std::make_shared<ModelStage>());
+  const auto read = [&](const Canvas& canvas, const std::vector<spg::Detection>& regions, std::int64_t ms) {
+    OwnedFrame frame = spg::test::to_frame(canvas, PixelFormat::BGRA);
+    frame.view.timestamp = at_ms(ms);
+    const ocr::CacheTotals before = cached.totals();
+    std::vector<spg::Secret> texts = cached.recognize(frame.view, size, regions);
+    const std::vector<spg::Secret> direct = fresh.recognize(frame.view, size, regions);
+    REQUIRE(texts.size() == direct.size());
+    for (std::size_t i = 0; i < texts.size(); ++i) {
+      CHECK(texts[i] == direct[i]);  // a cached answer is what reading again returns
+    }
+    return std::pair{std::move(texts), cached.totals().misses - before.misses};
+  };
+
+  // Typing into a field: each frame shows one more character in the same box.
+  const std::vector<std::string> typed = {"zorbly quan", "zorbly quant", "zorbly quanti"};
+  std::vector<Scene> frames;
+  for (const std::string& field : typed) {
+    frames.push_back(panel(size, paper, ink, {field, "Maple Street 4417"}, 14.0));
+  }
+  const Rect field_box = unite(frames.front().lines[0].ink, frames.back().lines[0].ink);
+  const std::vector<spg::Detection> boxes = {region(field_box, size, size),
+                                             region(frames.front().lines[1].ink, size, size)};
+  auto [first, first_read] = read(frames[0].canvas, boxes, 0);
+  CHECK(first_read == 2);
+  CHECK(reads_as(first[0], typed[0], 1));
+  CHECK(read(frames[0].canvas, boxes, 100).second == 0);  // unchanged: nothing read
+  for (std::size_t k = 1; k < typed.size(); ++k) {
+    auto [texts, misses] = read(frames[k].canvas, boxes, 100 + 100 * static_cast<std::int64_t>(k));
+    CHECK(misses == 1);  // the field, on the very next cycle; the other line is unchanged
+    CHECK(reads_as(texts[0], typed[k], 1));
+    CHECK_FALSE(texts[0] == first[0]);
+  }
+
+  // Moving: the same lines drawn 13 px to the right on the same paper, boxes
+  // with them, are the same crops; drawn on other paper they are not.
+  const Scene at_rest = panel(size, paper, ink, {"Room 7B, door code 2958", "hello@example.com"}, 14.0, 20);
+  const Scene moved = panel(size, paper, ink, {"Room 7B, door code 2958", "hello@example.com"}, 14.0, 33);
+  const Scene repainted = panel(size, {238, 240, 240}, ink, {"Room 7B, door code 2958", "hello@example.com"}, 14.0, 33);
+  CHECK(read(at_rest.canvas, regions_of(at_rest, size), 500).second == 2);
+  CHECK(read(moved.canvas, regions_of(moved, size), 600).second == 0);
+  CHECK(read(repainted.canvas, regions_of(repainted, size), 700).second == 2);
 }

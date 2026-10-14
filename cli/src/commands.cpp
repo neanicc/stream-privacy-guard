@@ -76,6 +76,8 @@ constexpr std::string_view kUsage =
     "                         scheduler's, as the plugin runs)\n"
     "  --threads N            ONNX Runtime threads per model (default: its own choice)\n"
     "  --recognizer-runs N    recognizer runs side by side per cycle, in [1, 16] (default 4)\n"
+    "  --no-recognition-cache read every text region on every cycle (default: reuse the\n"
+    "                         text of a region whose crop is pixel-identical; to measure it)\n"
     "\n"
     "  --version  print the version and exit\n"
     "  --help     print this help and exit\n";
@@ -164,6 +166,7 @@ PipelineSetup pipeline_setup(const Options& o, bool simulated_fixed) {
   PipelineSetup s;
   s.cache = o.get("--cache") ? fs::path(*o.get("--cache")) : default_cache_dir();
   s.stages.cpu_only = o.flag("--cpu");
+  s.stages.recognition_cache = !o.flag("--no-recognition-cache");
   if (const auto v = o.get("--readback-scale")) {
     s.driver.readback_scale = parse_number(*v, "--readback-scale");
     if (!(s.driver.readback_scale > 0.0 && s.driver.readback_scale <= 1.0)) {
@@ -298,7 +301,7 @@ struct Totals {
 };
 
 json report_json(std::string_view command, std::string_view mode, std::uint32_t fps, const PipelineSetup& setup,
-                 const std::string& providers, const Totals& totals, const StageTimes& times) {
+                 const OpenedStages& opened, const Totals& totals, const StageTimes& times) {
   json stages = json::object();
   for (const auto& [name, s] : times.summary()) {
     stages[name] = summary_json(s);
@@ -315,7 +318,7 @@ json report_json(std::string_view command, std::string_view mode, std::uint32_t 
            {"scan_interval_ms", to_ms(driver_config(PolicyConfig{}, setup.driver).scan_interval)},
            {"threads", setup.stages.intra_op_threads},
            {"recognizer_runs", setup.stages.recognizer_runs},
-           {"providers", providers},
+           {"providers", opened.providers},
            {"frames", totals.frames},
            {"padding_frames", totals.padding},
            {"late_frames", totals.late},
@@ -327,6 +330,12 @@ json report_json(std::string_view command, std::string_view mode, std::uint32_t 
            {"scheduler", totals.scheduler},
            {"sequences", totals.sequences}};
   doc["cycle_ms"] = setup.driver.cycle ? json(to_ms(*setup.driver.cycle)) : json(nullptr);
+  if (opened.recognition_counts) {
+    const RecognitionCounts counts = opened.recognition_counts();
+    doc["recognition_cache"] = json{{"hits", counts.hits}, {"misses", counts.misses}};
+  } else {
+    doc["recognition_cache"] = json(nullptr);
+  }
   return doc;
 }
 
@@ -341,7 +350,7 @@ void print_stages(std::ostream& out, const StageTimes& times) {
   out.unsetf(std::ios::floatfield);
 }
 
-void print_summary(std::ostream& out, std::string_view command, std::string_view mode, const std::string& providers,
+void print_summary(std::ostream& out, std::string_view command, std::string_view mode, const OpenedStages& opened,
                    const Totals& totals, const StageTimes& times) {
   out << "spg-cli " << command << " (" << mode << "): " << totals.frames << " frames, " << totals.fail_closed
       << " fail-closed, " << totals.padding << " padding";
@@ -349,8 +358,12 @@ void print_summary(std::ostream& out, std::string_view command, std::string_view
     out << ", " << totals.late << " fed late";
   }
   out << '\n';
-  if (!providers.empty()) {
-    out << "providers: " << providers << '\n';
+  if (!opened.providers.empty()) {
+    out << "providers: " << opened.providers << '\n';
+  }
+  if (opened.recognition_counts) {
+    const RecognitionCounts counts = opened.recognition_counts();
+    out << "recognition cache: " << counts.hits << " regions reused, " << counts.misses << " read\n";
   }
   const StageSummary lat = summarize(totals.latencies_ms);
   out << std::fixed << std::setprecision(1);
@@ -363,7 +376,7 @@ void print_summary(std::ostream& out, std::string_view command, std::string_view
 int cmd_run(std::span<const std::string_view> args, std::ostream& out, std::ostream& err, const CliHooks& hooks) {
   std::set<std::string_view> valued = kPipelineValued;
   valued.insert({"--frames", "--policy", "--out", "--fps", "--timing", "--write-frames"});
-  const Options o(args, valued, {"--cpu"});
+  const Options o(args, valued, {"--cpu", "--no-recognition-cache"});
   PipelineSetup setup = pipeline_setup(o, true);
   FrameSequence seq;
   seq.name = "run";
@@ -390,9 +403,9 @@ int cmd_run(std::span<const std::string_view> args, std::ostream& out, std::ostr
   write_plans(out_file, result.plans);
   Totals totals;
   totals.add(seq.name, result);
-  print_summary(out, "run", "simulated", opened.providers, totals, *times);
+  print_summary(out, "run", "simulated", opened, totals, *times);
   if (const auto timing = o.get("--timing")) {
-    write_json(*timing, report_json("run", "simulated", seq.fps, setup, opened.providers, totals, *times));
+    write_json(*timing, report_json("run", "simulated", seq.fps, setup, opened, totals, *times));
   }
   return kExitOk;
 }
@@ -400,7 +413,7 @@ int cmd_run(std::span<const std::string_view> args, std::ostream& out, std::ostr
 int cmd_suite(std::span<const std::string_view> args, std::ostream& out, const CliHooks& hooks) {
   std::set<std::string_view> valued = kPipelineValued;
   valued.insert({"--suite", "--plans", "--timing"});
-  const Options o(args, valued, {"--cpu"});
+  const Options o(args, valued, {"--cpu", "--no-recognition-cache"});
   const PipelineSetup setup = pipeline_setup(o, true);
   const Suite suite = read_suite(o.need("--suite"));
   const fs::path plans = o.need("--plans");
@@ -414,9 +427,9 @@ int cmd_suite(std::span<const std::string_view> args, std::ostream& out, const C
     totals.add(seq.name, result);
     out << seq.name << ": " << result.plans.size() << " frames, " << result.fail_closed << " fail-closed\n";
   }
-  print_summary(out, "eval", "simulated", opened.providers, totals, *times);
+  print_summary(out, "eval", "simulated", opened, totals, *times);
   if (const auto timing = o.get("--timing")) {
-    write_json(*timing, report_json("eval", "simulated", suite.fps, setup, opened.providers, totals, *times));
+    write_json(*timing, report_json("eval", "simulated", suite.fps, setup, opened, totals, *times));
   }
   return kExitOk;
 }
@@ -424,7 +437,7 @@ int cmd_suite(std::span<const std::string_view> args, std::ostream& out, const C
 int cmd_bench(std::span<const std::string_view> args, std::ostream& out, const CliHooks& hooks) {
   std::set<std::string_view> valued = kPipelineValued;
   valued.insert({"--frames", "--policy", "--fps", "--suite", "--resolution", "--out", "--plans", "--report"});
-  const Options o(args, valued, {"--cpu", "--realtime"});
+  const Options o(args, valued, {"--cpu", "--realtime", "--no-recognition-cache"});
   const bool realtime = o.flag("--realtime");
   PipelineSetup setup = pipeline_setup(o, false);
   setup.driver.compose = !realtime;
@@ -483,9 +496,9 @@ int cmd_bench(std::span<const std::string_view> args, std::ostream& out, const C
     totals.add(seq.name, result);
   }
   const std::string_view mode = realtime ? "realtime" : "simulated";
-  print_summary(out, "bench", mode, opened.providers, totals, *times);
+  print_summary(out, "bench", mode, opened, totals, *times);
   if (const auto report = o.get("--report")) {
-    write_json(*report, report_json("bench", mode, fps, setup, opened.providers, totals, *times));
+    write_json(*report, report_json("bench", mode, fps, setup, opened, totals, *times));
   }
   return kExitOk;
 }
