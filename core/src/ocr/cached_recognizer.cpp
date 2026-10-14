@@ -1,5 +1,6 @@
 #include "ocr/cached_recognizer.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <optional>
@@ -31,15 +32,30 @@ CachedRecognizer::CachedRecognizer(std::shared_ptr<const spg::TextRecognizer> in
 
 std::vector<Secret> CachedRecognizer::recognize(const FrameView& readback, Size source,
                                                 std::span<const Detection> regions) const {
+  validate(readback);
   const Timestamp now = readback.timestamp;
-  std::vector<Fingerprint> prints;
-  std::vector<TrackId> keys;
-  prints.reserve(regions.size());
-  keys.reserve(regions.size());
-  for (const Detection& region : regions) {
-    validate(region);
-    prints.push_back(fingerprint(readback, source, region.box));
-    keys.push_back(content_key(prints.back()));
+  const RecognitionCacheConfig& limits = cache_.config();
+  const ReadbackMapping mapping(source, readback.size());
+  std::vector<Fingerprint> prints(regions.size());
+  std::vector<TrackId> keys(regions.size(), 0);
+  // Fingerprints are copies of crop pixels, so they share the cache's byte
+  // bounds: a crop over max_entry_bytes could never be stored, and past
+  // max_bytes in one call the rest are not copied. A region without a
+  // fingerprint is simply read (an empty print never hits).
+  std::size_t taken = 0;
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+    validate(regions[i]);
+    const PixelRect crop = readback_crop(regions[i].box, mapping);
+    if (crop.width <= 0 || crop.height <= 0) {
+      continue;
+    }
+    const std::size_t bytes = std::size_t{3} * static_cast<std::size_t>(crop.width) * static_cast<std::size_t>(crop.height);
+    if (bytes > limits.max_entry_bytes || bytes > limits.max_bytes - std::min(taken, limits.max_bytes)) {
+      continue;
+    }
+    taken += bytes;
+    prints[i] = fingerprint(readback, source, regions[i].box);
+    keys[i] = content_key(prints[i]);
   }
 
   std::vector<std::optional<Recognition>> found(regions.size());
@@ -48,7 +64,9 @@ std::vector<Secret> CachedRecognizer::recognize(const FrameView& readback, Size 
     const std::lock_guard lock(mutex_);
     cache_.prune(now);  // nothing past max_age stays in memory while hits keep coming
     for (std::size_t i = 0; i < regions.size(); ++i) {
-      found[i] = cache_.find(keys[i], prints[i], now);
+      if (!prints[i].pixels.empty()) {
+        found[i] = cache_.find(keys[i], prints[i], now);
+      }
       if (!found[i]) {
         missing.push_back(i);
       }
@@ -70,6 +88,9 @@ std::vector<Secret> CachedRecognizer::recognize(const FrameView& readback, Size 
     const std::lock_guard lock(mutex_);
     for (std::size_t k = 0; k < missing.size(); ++k) {
       const std::size_t i = missing[k];
+      if (prints[i].pixels.empty()) {
+        continue;  // nothing to file it under
+      }
       Recognition entry;
       entry.text = read[k];
       cache_.store(keys[i], std::move(prints[i]), std::move(entry), now);

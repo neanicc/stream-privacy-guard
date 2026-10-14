@@ -186,8 +186,11 @@ if(SPG_WITH_DEPS)
   string(JSON _spg_ppocr_rec_version GET "${_spg_models_json}" models ppocr-rec-en version)
   string(JSON _spg_ppocr_rec_file GET "${_spg_models_json}" models ppocr-rec-en file)
   # Crops are made-up strings drawn at test time (synthetic_text.hpp).
+  # fail_alloc.cpp replaces operator new here too, so the cache's allocation
+  # failures can be swept (SPG-16e).
   add_executable(spg-ocr-tests
     unit/ocr_test.cpp
+    unit/fail_alloc.cpp
     integration/text_recognizer_test.cpp)
   add_dependencies(spg-ocr-tests spg-runtime-fixtures)
   target_link_libraries(spg-ocr-tests PRIVATE spg::ocr spg::opencv Catch2::Catch2WithMain)

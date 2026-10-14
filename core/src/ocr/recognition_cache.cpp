@@ -141,9 +141,21 @@ void RecognitionCache::store(TrackId track, Fingerprint print, Recognition recog
   while (!entries_.empty() && (entries_.size() >= config_.capacity || bytes_ + size > config_.max_bytes)) {
     drop(entries_.find(lru_.back()));
   }
-  lru_.push_front(track);
+  // Each step either completes or leaves the cache as it was, so a failed
+  // allocation never leaves a key in lru_ without an entry (which a later
+  // eviction would look up) or bytes_ counting pixels nobody holds. A print
+  // that is never stored is zeroed by its destructor.
+  // erase(track) above means this always inserts.
+  const auto it = entries_.emplace(track, Entry{std::move(print), std::move(recognition), now, {}}).first;
+  try {
+    lru_.push_front(track);
+  } catch (...) {
+    release(it->second.print);
+    entries_.erase(it);
+    throw;
+  }
+  it->second.use = lru_.begin();
   bytes_ += size;
-  entries_.emplace(track, Entry{std::move(print), std::move(recognition), now, lru_.begin()});
 }
 
 void RecognitionCache::erase(TrackId track) {

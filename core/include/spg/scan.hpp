@@ -189,8 +189,10 @@ struct ScanResult {
 // beside the text detector and is joined before the recognizer starts (on
 // the calling thread when no thread can start), so a cycle waits for the
 // slower detector rather than both (SPG-16e). Each lane stops at its own first
-// failure; the result keeps every lane's valid boxes and names the first
-// failure in stage order (faces, text detector, recognizer, policy).
+// failure. The result is what running the stages one after another returns:
+// a face failure keeps only its valid face boxes (text boxes are discarded
+// and nothing is read); otherwise the faces and the text lane's valid boxes,
+// named by the text lane's first failure (text detector, recognizer, policy).
 // Never throws: any exception from a stage (InferenceFailed, DecodeError,
 // ContractError, bad_alloc, or a non-std exception) or invalid output yields
 // an incomplete result with the detections found; an allocation failure

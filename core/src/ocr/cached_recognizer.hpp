@@ -24,7 +24,14 @@
 //
 // Memory and secrecy are RecognitionCache's: recognized text only in Secret,
 // crop pixels zeroed whenever an entry or an unkept fingerprint is let go,
-// bounded entries and bytes, memory only, nothing logged.
+// bounded entries and bytes, memory only, nothing logged. The fingerprints a
+// call takes before it looks up share those bounds: a crop over
+// max_entry_bytes, or past max_bytes summed over the call's regions, gets no
+// fingerprint and is simply read. Entries past max_age are dropped on the
+// next recognize() call (or when the cache is destroyed), not on a timer: a
+// cycle with no text region makes no call, so what was cached stays in
+// memory (as Secret and zeroed pixels on release) until text is seen again
+// or the stages are rebuilt.
 //
 // Thread-safe: workers share one instance. The cache is locked only to look
 // up and to store, never while the inner recognizer runs.

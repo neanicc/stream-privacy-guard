@@ -25,6 +25,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "../integration/synthetic_frames.hpp"
+#include "fail_alloc.hpp"
 #include "ocr/cached_recognizer.hpp"
 #include "ocr/crop_plan.hpp"
 #include "ocr/ctc_decode.hpp"
@@ -1174,4 +1175,106 @@ TEST_CASE("content_key: equal crops share a key, a reshaped crop does not", "[oc
   ocr::Fingerprint reshaped = a;
   reshaped.crop = {a.crop.height, a.crop.width};  // same bytes, other shape
   CHECK_FALSE(ocr::content_key(reshaped) == ocr::content_key(a));
+}
+
+// Greptile on PR #99: store() put the key in the LRU list and counted its
+// bytes before inserting the entry, so a failed insert left a key that a
+// later eviction looked up and dropped as a missing entry.
+TEST_CASE("RecognitionCache: a failed store leaves the cache usable", "[ocr][cache][alloc]") {
+  ocr::RecognitionCacheConfig config;
+  config.capacity = 3;
+  const ocr::Fingerprint print = print_of(strokes({30, 40, 50, 60}));
+  const ocr::Fingerprint other = print_of(strokes({30, 45, 50, 60}));
+  int failed = 0;
+  for (std::uint64_t n = 0;; ++n) {
+    REQUIRE(n < 1000);
+    ocr::RecognitionCache cache(config);
+    cache.store(1, print, reading("one"), at_ms(0));
+    cache.store(2, other, reading("two"), at_ms(0));
+    bool fired = false;
+    bool threw = false;
+    {
+      const spg_test::FailAllocations fail(n);
+      try {
+        cache.store(3, print, reading("three"), at_ms(10));
+      } catch (const std::bad_alloc&) {
+        threw = true;
+      }
+      fired = fail.fired();
+    }
+    INFO("allocation " << n);
+    CHECK(threw == fired);
+    CHECK(cache.find(3, print, at_ms(10)).has_value() == !threw);
+    CHECK(cache.size() == (threw ? 2U : 3U));
+    CHECK(cache.bytes() == cache.size() * print.pixels.size());
+    // Churn past the capacity: every eviction finds its entry.
+    for (spg::TrackId t = 10; t < 20; ++t) {
+      cache.store(t, t % 2 == 0 ? print : other, reading("churn"), at_ms(20));
+      CHECK(cache.size() <= config.capacity);
+    }
+    for (spg::TrackId t = 1; t < 20; ++t) {
+      cache.erase(t);
+    }
+    CHECK(cache.size() == 0);
+    CHECK(cache.bytes() == 0);
+    failed += threw ? 1 : 0;
+    if (!fired) {
+      break;
+    }
+  }
+  CHECK(failed >= 1);
+}
+
+TEST_CASE("CachedRecognizer: a failed allocation fails the call and the cache stays right",
+          "[ocr][cache][content][alloc]") {
+  ocr::RecognitionCacheConfig config;
+  config.capacity = 2;  // every call evicts
+  for (std::uint64_t n = 0;; ++n) {
+    REQUIRE(n < 5000);
+    const auto inner = std::make_shared<PixelReader>();
+    const ocr::CachedRecognizer cache(inner, config);
+    (void)cycle(cache, *inner, field(0), field_boxes(), 0);
+    bool fired = false;
+    {
+      spg::test::OwnedFrame frame = spg::test::to_frame(field(1), spg::PixelFormat::BGRA);
+      frame.view.timestamp = at_ms(100);
+      const spg_test::FailAllocations fail(n);
+      try {
+        (void)cache.recognize(frame.view, kField, field_boxes());
+      } catch (const std::bad_alloc&) {
+      }
+      fired = fail.fired();
+    }
+    INFO("allocation " << n);
+    // Whatever failed, later cycles read what a fresh read returns (cycle()
+    // checks every text) and keep evicting without a fault.
+    for (std::uint32_t keys = 0; keys < 4; ++keys) {
+      (void)cycle(cache, *inner, field(keys), field_boxes(), 200 + 100 * keys);
+    }
+    if (!fired) {
+      break;
+    }
+  }
+}
+
+TEST_CASE("CachedRecognizer: crops past the byte bounds are read, not copied", "[ocr][cache][content]") {
+  const std::size_t one = ocr::fingerprint(spg::test::to_frame(field(0), spg::PixelFormat::BGRA).view, kField,
+                                           field_boxes()[0].box)
+                              .pixels.size();
+  SECTION("over max_bytes in one call") {
+    ocr::RecognitionCacheConfig config;
+    config.max_bytes = one;  // room for the first region's crop only
+    const auto inner = std::make_shared<PixelReader>();
+    const ocr::CachedRecognizer cache(inner, config);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 0).read == 2);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 100).read == 1);  // the second is never cached
+  }
+  SECTION("over max_entry_bytes") {
+    ocr::RecognitionCacheConfig config;
+    config.max_entry_bytes = one - 1;
+    const auto inner = std::make_shared<PixelReader>();
+    const ocr::CachedRecognizer cache(inner, config);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 0).read == 2);
+    CHECK(cycle(cache, *inner, field(0), field_boxes(), 100).read == 2);
+  }
 }

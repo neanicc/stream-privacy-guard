@@ -129,7 +129,11 @@ release) from the moment it is decoded until the verdict:
 
 The scan path adds one copy, also a `Secret`: `ocr::CachedRecognizer` (the
 recognizer stage in `spg-cli` and the plugin) keeps each text it read in its
-cache for at most `max_age` (1 s) of frame time. `run_scan()`
+cache and reuses it for at most `max_age` (1 s) of frame time. Expired
+entries (text and zeroed crop pixels) are dropped on the next recognition
+call or when the cache is destroyed (the filter's stages are rebuilt or the
+filter goes away); a cycle with no text region makes no call, so they can
+stay in memory longer than `max_age` while nothing on screen is read. `run_scan()`
 (`core/src/schedule/scan.cpp`) gets a `std::vector<Secret>` from the
 recognizer stage, compares each one's size
 with `max_text_bytes` and passes it to the policy by reference;
