@@ -2669,10 +2669,6 @@ Template:
     `--threads 2 --recognizer-runs 4`), recognizer runs 6 or 8, Core ML
     `SpecializationStrategy=FastPrediction` and
     `AllowLowPrecisionAccumulationOnGPU`: no change beyond noise.
-- Machine state. The Mac ran on battery for the whole session; at 18:48 it
-  was at 3% and throttling (every stage about 30% slower than an hour
-  before, on both revisions). Load from my own runs and that drain make the
-  realtime numbers below noisy.
 - Simulated eval (`run.sh eval --local`, same generated suites): every mask
   plan of the local text and faces suites is byte-identical to main
   e89ec32's, so every text and faces metric is unchanged: watch-list pair
@@ -2681,14 +2677,37 @@ Template:
   0.5284 (2459/4654); face recall 1.0, face leak 0, faces clean blur 0. The
   cache answered 1796 of 3728 text-suite regions (48%) and 414 of 590 in
   the faces suite.
-- Realtime, `run.sh eval --local`, fail-closed / p95 latency, in run order
-  (load is the 1-minute average before the run): main 17:36 0.0104 / 256
-  ms (load 2.1); branch 18:34 0 / 231 ms (2.9); main 18:37 0.215 / 402 ms
-  (2.9); branch 18:41 0.170 / 413 ms (3.0); main 18:45 0.235 / 409 ms
-  (3.0). The last three ran on a battery under 5%, throttled (text
-  detection p50 about 127 ms on both revisions against 82 to 96 ms before);
-  they show the branch ahead of main in the same state, not the quiet
-  distribution #96 asks for.
-- Open: the five-run branch / three-run main realtime series on a quiet,
-  powered machine was not finished in this session (see the PR). Live OBS
-  not tested.
+- Realtime, the series #96 asks for: `bash scripts/ci/run.sh eval --local`
+  on AC power after a reboot, branch 6ba2665 and main e89ec32 interleaved,
+  each run after a 2 minute rest and once the 1-minute load was under 3 with
+  no other build or spg-cli running (no other agent ran). Fail-closed / p95
+  latency (load before the run):
+
+  | Run | Branch | Main |
+  | --- | --- | --- |
+  | 1 | 0.0015 (2/1350) / 227 ms (2.6) | 0.0141 (19/1350) / 264 ms (1.9) |
+  | 2 | 0 / 216 ms (1.6) | 0.0074 (10/1350) / 253 ms (1.9) |
+  | 3 | 0.0052 (7/1350) / 238 ms (1.8) | 0.0193 (26/1350) / 282 ms (2.2) |
+  | 4 | 0.0022 (3/1350) / 242 ms (2.6) | |
+  | 5 | 0 / 225 ms (2.6) | |
+
+  Branch: median 0.0015, range 0 to 0.0052, every run passes 0.01; p95 216
+  to 242 ms. Main: median 0.0141, range 0.0074 to 0.0193, two of three fail;
+  p95 253 to 282 ms. Under load (two busy-loop processes for the whole run):
+  branch 0.0126 (17/1350) / 245 ms, main 0.0407 (55/1350) / 297 ms; both
+  miss 0.01 there.
+- Realtime recall and leak, same runs (the realtime suite scores them but
+  has no limits for them): branch watch-list pair recall 0.9985 to 1.0,
+  first-frame 0.972 to 1.0, PII 0.9996 to 1.0, leak 0 to 0.0040; main 0.9996
+  to 1.0, 0.972 to 1.0, 0.9950 to 0.9983, leak 0.0040 to 0.0096. Realtime
+  decoy blur: branch 0.488 to 0.511, main 0.494 to 0.502.
+- CI-mode eval (`bash scripts/ci/run.sh eval`), branch and main: identical
+  text metrics, `THRESHOLDS: PASS` on both: watch-list 1.0 (557/557),
+  first-frame 1.0 (15/15), PII 1.0 (590/590), leak 0 (0/285), clean blur 0,
+  decoy blur 0.4255 (380/893).
+- Footnote, discarded: an earlier battery session ran out of charge.
+  Throttled runs at 3% (text detection p50 about 127 ms on both revisions)
+  gave main 0.215 and 0.235 and the branch 0.170. Before that, quiet main
+  gave 0.0104 and the branch gave 0.
+- Open: live OBS not tested. The margin under load is small (0.0126 with two
+  burners); a cheaper pass for sources below 1080p (#86) stays open.
