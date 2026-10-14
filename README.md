@@ -215,23 +215,6 @@ bash scripts/package.sh build dist --with-models    # local only: also bundle th
 
 </details>
 
-## Roadmap
-
-- [x] Faces, watch-list and personal-data detection in a fail-closed realtime pipeline
-- [x] Retroactive masking, motion tracking and temporal hold
-- [x] Synthetic evaluation passing every limit in [`eval/thresholds.toml`](eval/thresholds.toml)
-- [ ] Live OBS test and human leak test ([#71](https://github.com/neanicc/stream-privacy-guard/issues/71))
-- [ ] First release, v0.1.0
-- [ ] More headroom on busy machines ([#86](https://github.com/neanicc/stream-privacy-guard/issues/86))
-- [ ] Less over-blurring near secrets ([#97](https://github.com/neanicc/stream-privacy-guard/issues/97))
-- [ ] Windows GPU inference ([#25](https://github.com/neanicc/stream-privacy-guard/issues/25))
-
-## How this repository is built
-
-Coding agents write most of the code here, working through GitHub issues and pull requests. Every PR runs CI on Linux, macOS and Windows and gets a staff review against [AGENTS.md](AGENTS.md) plus a Greptile review, and nothing merges until a gate confirms green CI, an approving staff review with no P0 or P1 findings and a score of 85 or more, and no open review threads ([docs/autopilot.md](docs/autopilot.md) has the full list). I own the thresholds, the CI workflows and the live testing; agents can propose changes to those but can't merge them.
-
-[docs/agent-log.md](docs/agent-log.md) records every decision along the way.
-
 ## License
 
 GPL-2.0, because OBS plugins link against libobs. See [LICENSE](LICENSE).
