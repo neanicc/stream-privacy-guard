@@ -35,7 +35,7 @@
 
 Streamers leak personal details by accident: a notification with their real name, an address in a delivery app, a card number in a browser tab. Once a frame has aired, it can't be taken back.
 
-Stream Privacy Guard holds each frame back for half a second, scans it, and blurs anything sensitive before OBS encodes it. When it can't finish scanning a frame in time, it blurs the whole source instead of letting an unchecked frame through.
+Stream Privacy Guard holds each frame back for half a second by default, scans it, and blurs anything sensitive before OBS encodes it. When it can't finish scanning a frame in time, it blurs the whole source instead of letting an unchecked frame through.
 
 > [!IMPORTANT]
 > **This is a safety net, not a guarantee.** It lowers the chance that something private airs, but some things will still get through. Keep personal information off screen; treat this filter as a second line of defence.
@@ -49,7 +49,7 @@ Stream Privacy Guard holds each frame back for half a second, scans it, and blur
 | **Personal data** | Detects email addresses, phone numbers, payment card numbers, IP addresses, street addresses, and API and stream keys. |
 | **Retroactive masking** | When the filter finds something, it also blurs the earlier frames still waiting in the lookahead buffer, so the blur usually covers a secret from its first frame. It can't reach frames that already aired. |
 | **Fails closed** | If the scan misses a frame's deadline, the filter blurs the whole source. No setting airs an unscanned frame. |
-| **Follows motion** | Masks move with scrolling chat and dragged windows, and stay on for 750 ms after the last detection. |
+| **Follows motion** | Masks move with scrolling chat and dragged windows, and by default stay on for 750 ms after the last detection. |
 | **Fully local** | The plugin makes no network calls and has no accounts or telemetry. Watch-list entries never reach logs or scene collections. |
 
 ## How it works
@@ -176,7 +176,7 @@ Read these before you rely on the filter.
 - **No network at runtime.** The plugin makes no network calls and has no accounts, telemetry or crash upload. The only download is the one you run yourself, `scripts/fetch_models.py`, which pulls from pinned URLs and checks SHA-256.
 - **Watch-list entries stay out of scene collections.** People share scene collections when they ask for help, so the filter settings hold only a random reference. The entries sit in a separate file that only your user can read on macOS and Linux.
 - **Entries stay out of logs, and out of crash dumps where the OS allows it.** The plugin never logs entries or recognized text. It keeps them in memory that it wipes on release and locks against swapping where it can, and it excludes that memory from Linux crash dumps and Windows Error Reporting dumps. macOS has no equivalent exclusion, and on any OS a debugger can still read the memory. [docs/settings.md](docs/settings.md#watch-list-text-in-memory) covers the gaps.
-- **Frames never touch the disk.** The plugin keeps them in memory for the lookahead and nowhere else.
+- **Frames never touch the disk.** The plugin has no frame-capture option; it keeps frames in memory for the lookahead and nowhere else.
 
 ## Build from source
 
@@ -228,12 +228,12 @@ bash scripts/package.sh build dist --with-models    # local only: also bundle th
 
 ## How this repository is built
 
-Coding agents write most of the code here, working through GitHub issues and pull requests. Every PR runs CI on Linux, macOS and Windows and gets a staff review against [AGENTS.md](AGENTS.md) plus a Greptile review, and nothing merges until a gate confirms green CI, a review score of 85 or more and no open review threads. I own the thresholds, the CI workflows and the live testing; agents can propose changes to those but can't merge them.
+Coding agents write most of the code here, working through GitHub issues and pull requests. Every PR runs CI on Linux, macOS and Windows and gets a staff review against [AGENTS.md](AGENTS.md) plus a Greptile review, and nothing merges until a gate confirms green CI, an approving staff review with no P0 or P1 findings and a score of 85 or more, and no open review threads ([docs/autopilot.md](docs/autopilot.md) has the full list). I own the thresholds, the CI workflows and the live testing; agents can propose changes to those but can't merge them.
 
-[docs/autopilot.md](docs/autopilot.md) describes the workflow, and [docs/agent-log.md](docs/agent-log.md) records every decision along the way.
+[docs/agent-log.md](docs/agent-log.md) records every decision along the way.
 
 ## License
 
 GPL-2.0, because OBS plugins link against libobs. See [LICENSE](LICENSE).
 
-Packages include the licenses of ONNX Runtime (MIT), OpenCV (Apache-2.0) and nlohmann/json (MIT). The detection models, YuNet (MIT) and PP-OCR via RapidOCR (Apache-2.0), aren't bundled; [`models/manifest.json`](models/manifest.json) records where each comes from and its license.
+Packages include the licenses of ONNX Runtime (MIT), OpenCV (Apache-2.0) and nlohmann/json (MIT). The detection models, YuNet (MIT) and PP-OCR via RapidOCR (Apache-2.0), aren't in the default packages, though `--with-models` adds them with their license texts. [`models/manifest.json`](models/manifest.json) records where each comes from and its license.
