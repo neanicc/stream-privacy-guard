@@ -2722,5 +2722,13 @@ Template:
   call); other regions are read. Docs now say expired entries are dropped
   on the next recognition call, not on a timer, and `run_scan()`'s contract
   says a face failure keeps only faces. Simulated metrics are unchanged.
+- Staff review follow-up: `docs/scheduler.md` now records why the overlapped
+  detectors are safe to run together. Each owns its own session, neither has
+  mutable state, and only the ONNX Runtime environment is shared. There is
+  no TSan evidence because the repository has no sanitizer build. A pruning
+  call on cycles without text was not added. It would call the recognizer
+  stage with no regions, and with `--no-recognition-cache` that reaches the
+  model recognizer directly. The longer lifetime stays documented in
+  `docs/policy.md`.
 - Open: live OBS not tested. The margin under load is small (0.0126 with two
   burners); a cheaper pass for sources below 1080p (#86) stays open.

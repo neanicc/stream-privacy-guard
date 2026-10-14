@@ -291,6 +291,19 @@ then waits for the slower detector instead of both. If no thread can start,
 the face detector runs on the worker's thread after the text detector. The
 result is the same either way, for any outcome of any stage.
 
+The overlap adds no new thread-safety requirement. `spg::Detector` already
+requires `detect()` to be safe from several threads at once, since workers
+share one stage. The two detectors also share no mutable state. Each of
+`detect::FaceDetector` and `detect::TextDetector` owns its own
+`runtime::Session`, whose `run()` is documented as safe to call
+concurrently. Both are used only through `const` methods with no `mutable`
+members, and they read the same readback frame only through a `const
+FrameView`. The one shared object is the process-wide
+`runtime::Environment` (the ONNX Runtime environment), which ONNX Runtime
+shares across sessions by design. The fake stages in the unit tests cannot
+show races in a real model, and the repository has no thread-sanitizer
+build yet, so this rests on those contracts and not on a TSan run.
+
 On the dev Mac (Apple M4, Core ML) both detectors run on the GPU and slow
 each other (text detection about 84 to 97 ms, faces 36 to 50 ms), but the
 cycle still gets shorter: realtime detection latency p50 fell from about 168
