@@ -2,7 +2,7 @@
 
 # Stream Privacy Guard
 
-**An OBS Studio filter that blurs faces, your personal details and other sensitive data before they reach your stream.**
+**An OBS Studio filter that blurs faces, your real name and address, and personal data like card numbers before OBS encodes the frame.**
 
 [![Check](https://github.com/neanicc/stream-privacy-guard/actions/workflows/check.yml/badge.svg?branch=main)](https://github.com/neanicc/stream-privacy-guard/actions/workflows/check.yml)
 [![License: GPL-2.0](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
@@ -24,8 +24,8 @@
 -->
 <table><tr><td align="center" width="760">
 <br>
-🎬 <b>Demo coming soon</b><br>
-<sub>A recording of the filter running live in OBS will go here.</sub>
+<b>Demo video coming soon</b><br>
+<sub>It'll show the filter running live in OBS, using made-up details.</sub>
 <br><br>
 </td></tr></table>
 
@@ -35,7 +35,7 @@
 
 Streamers leak personal details by accident: a notification with their real name, an address in a delivery app, a card number in a browser tab. Once a frame has aired, it can't be taken back.
 
-Stream Privacy Guard holds each frame back for a moment, scans it, and blurs anything sensitive **before** OBS encodes it. If a frame can't be scanned in time, it blurs the whole source rather than let an unchecked frame through.
+Stream Privacy Guard holds each frame back for half a second, scans it, and blurs anything sensitive before OBS encodes it. When it can't finish scanning a frame in time, it blurs the whole source instead of letting an unchecked frame through.
 
 > [!IMPORTANT]
 > **This is a safety net, not a guarantee.** It lowers the chance that something private airs, but some things will still get through. Keep personal information off screen; treat this filter as a second line of defence.
@@ -44,32 +44,32 @@ Stream Privacy Guard holds each frame back for a moment, scans it, and blurs any
 
 | | |
 | --- | --- |
-| 🙂 **Faces** | Blurs faces in camera, window and display captures (YuNet). |
-| 📝 **Your watch-list** | Blurs strings you add, such as your real name, address or alt accounts. Matching is fuzzy, so small misreadings by the text reader still match. |
-| 💳 **Personal data** | Detects email addresses, phone numbers, payment card numbers, IP addresses, street addresses, and API and stream keys. |
-| ⏪ **Retroactive masking** | When something is found, the blur also reaches back to earlier frames still waiting in the lookahead buffer, so a secret is usually covered from its first frame. Frames that have already aired can't be protected. |
-| 🔒 **Fails closed** | If a frame can't be scanned before its deadline, the whole source is blurred. No setting airs an unscanned frame. |
-| 🏃 **Follows motion** | Masks track scrolling chat and moving windows, and stay on for a short hold after the last detection. |
-| 🛜 **Fully local** | No network calls, accounts or telemetry. Watch-list entries never reach logs or scene collections. |
+| **Faces** | Blurs faces in camera, window and display captures (YuNet). |
+| **Your watch-list** | Blurs strings you add, such as your real name, address or alt accounts. Matching is fuzzy, so the filter still catches a name the OCR reads with a typo. |
+| **Personal data** | Detects email addresses, phone numbers, payment card numbers, IP addresses, street addresses, and API and stream keys. |
+| **Retroactive masking** | When the filter finds something, it also blurs the earlier frames still waiting in the lookahead buffer, so the blur usually covers a secret from its first frame. It can't reach frames that already aired. |
+| **Fails closed** | If the scan misses a frame's deadline, the filter blurs the whole source. No setting airs an unscanned frame. |
+| **Follows motion** | Masks move with scrolling chat and dragged windows, and stay on for 750 ms after the last detection. |
+| **Fully local** | The plugin makes no network calls and has no accounts or telemetry. Watch-list entries never reach logs or scene collections. |
 
 ## How it works
 
 ![Stream Privacy Guard architecture](docs/architecture.svg)
 
-<sub>The diagram is an Excalidraw drawing. To edit it, open <a href="docs/architecture.excalidraw"><code>docs/architecture.excalidraw</code></a> (or the SVG itself, which embeds the scene) at <a href="https://excalidraw.com">excalidraw.com</a>.</sub>
+<sub>Drawn in Excalidraw. To edit it, open <a href="docs/architecture.excalidraw"><code>docs/architecture.excalidraw</code></a> or the SVG, which embeds the scene, at <a href="https://excalidraw.com">excalidraw.com</a>.</sub>
 
-1. **Capture.** The filter keeps each full-resolution frame in a **lookahead ring** on the GPU (500 ms by default) and reads back a downscaled copy for scanning.
-2. **Scan.** On worker threads, the **scheduler** runs the face detector beside the text detector. The text recognizer reads the detected text, and only reads a region again when its pixels change.
-3. **Decide.** The **policy engine** fuzzy-matches recognized text against your watch-list and checks it against personal-data patterns. The **tracker** keeps masks on moving content.
-4. **Mask.** The **mask planner** applies new masks to every buffered frame that hasn't aired yet. The render thread only composes masks and blurs on the GPU; it never waits for detection.
+1. **Capture.** The filter keeps each full-resolution frame in a lookahead ring on the GPU, 500 ms deep by default, and reads back a downscaled copy to scan.
+2. **Scan.** On worker threads, the scheduler runs the face detector and the text detector side by side. The recognizer then reads the text, skipping any region whose pixels haven't changed since its last read.
+3. **Decide.** The policy engine fuzzy-matches what it read against your watch-list and checks it for personal-data patterns, while the tracker keeps masks on content that moves.
+4. **Mask.** The mask planner adds new masks to every buffered frame that hasn't aired yet. The render thread only draws masks and runs the GPU blur; it never waits on detection.
 5. **Fail closed.** If a frame reaches its deadline unscanned, the fallback applies: blur the whole source (the default), repeat the last scanned frame, or a solid fill.
 
-The core (`spg-core`) has no OBS dependency, so the same pipeline runs headless in `spg-cli` and in CI. Design details: [docs/plan.md](docs/plan.md), [docs/scheduler.md](docs/scheduler.md), [docs/policy.md](docs/policy.md) and [docs/plugin-render.md](docs/plugin-render.md).
+The core library, `spg-core`, doesn't depend on OBS, which is why the same pipeline runs headless in `spg-cli` and in CI. Design notes live in [docs/plan.md](docs/plan.md), [docs/scheduler.md](docs/scheduler.md), [docs/policy.md](docs/policy.md) and [docs/plugin-render.md](docs/plugin-render.md).
 
 ## Install
 
 > [!NOTE]
-> **No release has been published yet.** Until then, use the `packages-<os>` artifacts from a green [Check run](https://github.com/neanicc/stream-privacy-guard/actions/workflows/check.yml), or [build from source](#build-from-source).
+> **There's no release yet.** Until there is, grab the `packages-<os>` artifacts from a green [Check run](https://github.com/neanicc/stream-privacy-guard/actions/workflows/check.yml) or [build from source](#build-from-source).
 <!-- TODO (after the live test): once v0.1.0 is published, replace the note above with:
 > **[Download the latest release](https://github.com/neanicc/stream-privacy-guard/releases/latest)**
 -->
@@ -91,15 +91,15 @@ The core (`spg-core`) has no OBS dependency, so the same pipeline runs headless 
    ```sh
    python3 scripts/fetch_models.py      # Windows: python scripts\fetch_models.py
    ```
-   This downloads YuNet and PP-OCR from the pinned URLs in [`models/manifest.json`](models/manifest.json), checks each file's SHA-256, and installs them in `~/.cache/spg/models`. Nothing downloads at runtime.
+   The script pulls YuNet and PP-OCR from the pinned URLs in [`models/manifest.json`](models/manifest.json), checks each file's SHA-256 and puts them in `~/.cache/spg/models`. The plugin itself never downloads anything.
 4. **Start OBS.** To uninstall, delete what you copied. Watch-list files stay in OBS's `plugin_config/obs-spg/` folder and the models stay in the cache until you delete them.
 
 ## Usage
 
 1. Right-click the source to protect (a display, window or camera capture) and choose **Filters**. Click **+** under *Effect Filters* and add **Privacy Guard**.
-2. **Add watch-list entries.** Type your real name, address, account names or other strings into **New entry**, which is masked as you type, then click **Add entry**. An entry can't be read back after you add it.
+2. **Add watch-list entries.** Type your real name, address, account names or other strings into **New entry**, which hides each character as you type, then click **Add entry**. After that the filter won't show the entry again, not even to you.
 3. **Choose what to detect.** Faces, watch-list entries and every personal-data category are on by default.
-4. **Sync your audio.** The filter delays video by the lookahead (500 ms by default) but can't delay audio. In **Edit › Advanced Audio Properties**, set **Sync Offset** to the lookahead on every audio source that goes with this video. If the video memory budget shortens the lookahead, the filter's properties show a warning with the actual value: use that value, or raise the budget.
+4. **Sync your audio.** The filter delays video by the lookahead (500 ms by default) but can't delay audio. In **Edit › Advanced Audio Properties**, set **Sync Offset** to the lookahead on every audio source that goes with this video. If the video memory budget forces a shorter lookahead, the filter's properties show a warning with the real number, so use that or raise the budget.
 
 <details>
 <summary><b>Settings at a glance</b></summary>
@@ -107,13 +107,13 @@ The core (`spg-core`) has no OBS dependency, so the same pipeline runs headless 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | Lookahead | 500 ms (100–2000) | How long frames are held for scanning. Longer means more scanning time, but more stream delay. |
-| Video memory for the lookahead | 512 MiB | Caps the frames held on the GPU. If the lookahead doesn't fit, it is shortened and a warning shows the actual value. |
+| Video memory for the lookahead | 512 MiB | Caps the frames held on the GPU. If the lookahead doesn't fit, the filter shortens it and warns you with the real value. |
 | Mask hold | 750 ms | How long a region stays blurred after its last detection. |
 | Watch-list sensitivity | Standard | Standard or High fuzzy-matching tolerance. |
-| When a frame can't be scanned in time | Blur the whole source | Alternatives: repeat the last scanned frame, or a solid fill. No option shows an unscanned frame. |
+| When a frame can't be scanned in time | Blur the whole source | You can also repeat the last scanned frame or show a solid fill. No option shows an unscanned frame. |
 | Debug overlay | Off | Draws mask outlines on the source. The outlines air too, so use it only for testing. |
 
-The properties panel also counts the frames aired with only detected regions masked, the frames covered whole, and the last reason. Full reference: [docs/settings.md](docs/settings.md).
+The properties panel also counts how many frames aired with only their detected regions masked and how many aired fully covered, along with the last reason. [docs/settings.md](docs/settings.md) has the full reference.
 
 </details>
 
@@ -121,7 +121,7 @@ The properties panel also counts the frames aired with only detected regions mas
 
 ### Synthetic evaluation
 
-The pipeline is scored on generated scenes: chat, documents, notifications, scrolling text and faces. The commit tested is `f5502ce`, on an Apple M4 MacBook Air (fanless, on AC power), with `bash scripts/ci/run.sh eval --local`. The realtime fail-closed row is the median and range of 7 interleaved runs of the change that introduced it (#99). Timing varies from run to run, and a busy machine does worse (see [Limitations](#limitations)). Limits are set in [`eval/thresholds.toml`](eval/thresholds.toml), and the metrics are defined in [docs/eval.md](docs/eval.md).
+`bash scripts/ci/run.sh eval --local` scores the pipeline on generated scenes with chat, documents, notifications, scrolling text and faces. These numbers come from commit `f5502ce` on a fanless Apple M4 MacBook Air plugged into power. Timing moves around between runs, so the realtime fail-closed row gives the median and range of 7 interleaved runs from #99; a busy machine does worse, as [Limitations](#limitations) explains. [`eval/thresholds.toml`](eval/thresholds.toml) sets the targets and [docs/eval.md](docs/eval.md) defines each metric.
 
 | Suite | Metric | Result | Target |
 | --- | --- | ---: | ---: |
@@ -136,7 +136,7 @@ The pipeline is scored on generated scenes: chat, documents, notifications, scro
 | Realtime (1080p60) | Frames covered by the fail-closed fallback | **0.22%** median (0–1.04% over 7 runs) | ≤ 1% |
 | Realtime (1080p60) | Detection latency, p95 | **255 ms** | ≤ 400 ms |
 
-Synthetic results don't prove live behaviour: generated scenes are simpler than a real desktop.
+Generated scenes are simpler than a real desktop, so none of this proves how the filter behaves on a live stream.
 
 ### Live test
 
@@ -155,45 +155,28 @@ Synthetic results don't prove live behaviour: generated scenes are simpler than 
 | Render cost (Stats dock, filter on vs off) | _pending_ |
 | Fail-closed under CPU load | _pending_ |
 
-The protocol is in [docs/live-check.md](docs/live-check.md).
+[docs/live-check.md](docs/live-check.md) has the full protocol.
 
 ## Limitations
 
 Read these before you rely on the filter.
 
 - **Anything missed has already aired.** No setting makes detection complete.
-- **Not yet verified in a live session.** See [Live test](#live-test). CI loads the module into a headless libobs, but the GPU readback and blur need a real graphics context.
+- **Nobody has run it in a live session yet.** CI loads the module into a headless libobs, but the GPU readback and the blur need a real graphics context. [Live test](#live-test) tracks this.
   <!-- TODO (after the live test): reword this bullet to state what was tested and on what hardware. -->
-- **Heavy CPU load.** When the machine is busy, for example with a game and encoding, more frames miss their deadline and get covered whole. In the tests, 1.3% of frames fell back under two busy CPU loops.
-- **Known recall gaps.**
-  - Faces under about 30 px at 1080p may be missed.
-  - Text with a cap height under about 10 px may be missed, and upside-down text isn't read.
-  - Text the reader misreads beyond the fuzzy-match tolerance is missed.
-- **Over-blurring near secrets.** Harmless text close to sensitive text, especially in scrolling chat, is often blurred too, because the filter prefers blurring too much to too little. About half of the decoy text in the synthetic suite gets blurred ([#97](https://github.com/neanicc/stream-privacy-guard/issues/97) tracks reducing this).
-- **Delay and memory.** Video airs one lookahead late, and you set the audio Sync Offset yourself.
-  - At 1080p60, the 500 ms lookahead holds about 240 MB of video memory.
-  - At 4K, the default budget shortens the lookahead.
-- **Hardware.**
-  - On Windows and Linux, inference runs on the CPU only.
-  - On macOS, ONNX Runtime may use Core ML.
-  - HDR sources are captured as 8-bit and are untested.
-- **Platforms.**
-  - macOS 14+ on Apple Silicon (no Intel build).
-  - Windows x64.
-  - Linux x86_64, built on Ubuntu 24.04.
-- **Unsigned packages.** See [Install](#install).
+- **A busy machine covers more frames.** With a game and an encoder fighting over the CPU, more frames miss their deadline and air fully blurred; under two busy CPU loops in testing, 1.3% of frames fell back.
+- **Some things slip past detection.** Faces smaller than about 30 px at 1080p, text with a cap height under about 10 px, upside-down text, and text the OCR misreads beyond the fuzzy-match tolerance can all get through.
+- **It blurs too much near secrets.** Harmless text next to sensitive text often gets blurred too, especially in scrolling chat. In the synthetic suite that's about half of the decoy text. Erring toward blur is deliberate, and [#97](https://github.com/neanicc/stream-privacy-guard/issues/97) tracks bringing it down without opening a leak.
+- **Video airs late, and you fix the audio.** Video runs one lookahead behind and you set the audio Sync Offset yourself. At 1080p60 the 500 ms lookahead holds about 240 MB of video memory, and at 4K the default budget shortens it.
+- **Hardware and platforms.** Windows and Linux run inference on the CPU only, while macOS may use Core ML through ONNX Runtime. Builds exist for macOS 14+ on Apple Silicon (no Intel), Windows x64, and Linux x86_64 built on Ubuntu 24.04. The filter captures HDR sources as 8-bit, and nobody has tested HDR yet.
+- **Packages aren't signed.** See [Install](#install).
 
 ## Privacy
 
-- **No network at runtime.** The plugin has no network calls, accounts, telemetry or crash upload. The only download is the one you run yourself: `scripts/fetch_models.py`, from pinned URLs, with SHA-256 checks.
-- **Watch-list entries stay out of scene collections.** People often share scene collections for support, so the filter settings hold only a random reference. The entries live in a separate file that only your user can read on macOS and Linux.
-- **Kept out of logs and, where the OS allows, out of crash dumps.**
-  - Entries and recognized text are never logged.
-  - They're held in memory that is wiped on release and locked against swapping where possible.
-  - They're excluded from crash dumps on Linux and from Windows Error Reporting dumps.
-  - macOS has no equivalent exclusion.
-  - Details: [docs/settings.md](docs/settings.md#watch-list-text-in-memory).
-- **Frames are never written to disk.** They live only in memory, for the lookahead.
+- **No network at runtime.** The plugin makes no network calls and has no accounts, telemetry or crash upload. The only download is the one you run yourself, `scripts/fetch_models.py`, which pulls from pinned URLs and checks SHA-256.
+- **Watch-list entries stay out of scene collections.** People share scene collections when they ask for help, so the filter settings hold only a random reference. The entries sit in a separate file that only your user can read on macOS and Linux.
+- **Entries stay out of logs, and out of crash dumps where the OS allows it.** The plugin never logs entries or recognized text. It keeps them in memory that it wipes on release and locks against swapping where it can, and it excludes that memory from Linux crash dumps and Windows Error Reporting dumps. macOS has no equivalent exclusion, and on any OS a debugger can still read the memory. [docs/settings.md](docs/settings.md#watch-list-text-in-memory) covers the gaps.
+- **Frames never touch the disk.** The plugin keeps them in memory for the lookahead and nowhere else.
 
 ## Build from source
 
@@ -226,12 +209,9 @@ bash scripts/ci/run.sh package                      # dist/obs-spg-<version>-<os
 bash scripts/package.sh build dist --with-models    # local only: also bundle the cached models
 ```
 
-`scripts/package.sh` stages the plugin with `INSTALL.txt`, the license, third-party notices and the model fetch script. Before writing the archive and `SHA256SUMS.txt`, it checks the staged tree:
-- every library the plugin imports is shipped beside it, or comes from OBS or the OS;
-- macOS rpaths stay inside the bundle and its signature verifies;
-- no model file is included unless `--with-models` is given.
+`scripts/package.sh` stages the plugin with `INSTALL.txt`, the license, third-party notices and the model fetch script. Before it writes the archive and `SHA256SUMS.txt`, it checks that every library the plugin imports either ships beside it or comes from OBS or the OS, that macOS rpaths stay inside the bundle and the signature verifies, and that no model file slipped in unless you passed `--with-models`.
 
-CI checks: [docs/ci.md](docs/ci.md). Draft release notes: [docs/release-notes/0.1.0.md](docs/release-notes/0.1.0.md).
+[docs/ci.md](docs/ci.md) lists the CI checks, and the draft release notes are in [docs/release-notes/0.1.0.md](docs/release-notes/0.1.0.md).
 
 </details>
 
@@ -248,15 +228,12 @@ CI checks: [docs/ci.md](docs/ci.md). Draft release notes: [docs/release-notes/0.
 
 ## How this repository is built
 
-Most of the code here is written by coding agents working through GitHub issues and pull requests.
-- Every PR gets CI on Linux, macOS and Windows, a staff review against [AGENTS.md](AGENTS.md), and a Greptile review.
-- A strict merge gate decides what lands.
-- A human owns the thresholds, CI workflows and live testing.
+Coding agents write most of the code here, working through GitHub issues and pull requests. Every PR runs CI on Linux, macOS and Windows and gets a staff review against [AGENTS.md](AGENTS.md) plus a Greptile review, and nothing merges until a gate confirms green CI, a review score of 85 or more and no open review threads. I own the thresholds, the CI workflows and the live testing; agents can propose changes to those but can't merge them.
 
-The workflow is in [docs/autopilot.md](docs/autopilot.md), and the decision history is in [docs/agent-log.md](docs/agent-log.md).
+[docs/autopilot.md](docs/autopilot.md) describes the workflow, and [docs/agent-log.md](docs/agent-log.md) records every decision along the way.
 
 ## License
 
 GPL-2.0, because OBS plugins link against libobs. See [LICENSE](LICENSE).
 
-Packages include the licenses of ONNX Runtime (MIT), OpenCV (Apache-2.0) and nlohmann/json (MIT). The detection models are YuNet (MIT) and PP-OCR via RapidOCR (Apache-2.0); fetching them separately keeps their licenses alongside.
+Packages include the licenses of ONNX Runtime (MIT), OpenCV (Apache-2.0) and nlohmann/json (MIT). The detection models, YuNet (MIT) and PP-OCR via RapidOCR (Apache-2.0), aren't bundled; [`models/manifest.json`](models/manifest.json) records where each comes from and its license.
