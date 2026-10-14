@@ -2691,8 +2691,12 @@ Template:
   | 4 | 0.0022 (3/1350) / 242 ms (2.6) | |
   | 5 | 0 / 225 ms (2.6) | |
 
-  Branch: median 0.0015, range 0 to 0.0052, every run passes 0.01; p95 216
-  to 242 ms. Main: median 0.0141, range 0.0074 to 0.0193, two of three fail;
+  After the review fixes below (off the timing path), two more runs on
+  ff5a860: 0.0104 (14/1350, all in seq-000, the first sequence after the
+  process starts) / 229 ms (1.6) and 0.0037 (5/1350) / 238 ms (2.1).
+  Branch over all seven runs: median 0.0022, range 0 to 0.0104, six of
+  seven pass 0.01; p95 216 to 242 ms. The five runs on 6ba2665 alone:
+  median 0.0015, range 0 to 0.0052, all pass. Main: median 0.0141, range 0.0074 to 0.0193, two of three fail;
   p95 253 to 282 ms. Under load (two busy-loop processes for the whole run):
   branch 0.0126 (17/1350) / 245 ms, main 0.0407 (55/1350) / 297 ms; both
   miss 0.01 there.
@@ -2701,13 +2705,22 @@ Template:
   first-frame 0.972 to 1.0, PII 0.9996 to 1.0, leak 0 to 0.0040; main 0.9996
   to 1.0, 0.972 to 1.0, 0.9950 to 0.9983, leak 0.0040 to 0.0096. Realtime
   decoy blur: branch 0.488 to 0.511, main 0.494 to 0.502.
-- CI-mode eval (`bash scripts/ci/run.sh eval`), branch and main: identical
-  text metrics, `THRESHOLDS: PASS` on both: watch-list 1.0 (557/557),
+- CI-mode eval (`bash scripts/ci/run.sh eval`), branch (6ba2665 and
+  ff5a860) and main: identical text metrics, `THRESHOLDS: PASS` on both: watch-list 1.0 (557/557),
   first-frame 1.0 (15/15), PII 1.0 (590/590), leak 0 (0/285), clean blur 0,
   decoy blur 0.4255 (380/893).
 - Footnote, discarded: an earlier battery session ran out of charge.
   Throttled runs at 3% (text detection p50 about 127 ms on both revisions)
   gave main 0.215 and 0.235 and the branch 0.170. Before that, quiet main
   gave 0.0104 and the branch gave 0.
+- Review fixes (Greptile on #99). `RecognitionCache::store()` put the key in
+  the LRU list and counted its bytes before inserting the entry, so a failed
+  insert left a key that a later eviction dropped as a missing entry; the
+  new allocation sweeps segfaulted on it. The entry now goes in first and is
+  rolled back if the LRU insert fails. `CachedRecognizer` copies a crop for
+  its fingerprint only within the cache's byte bounds (per crop and per
+  call); other regions are read. Docs now say expired entries are dropped
+  on the next recognition call, not on a timer, and `run_scan()`'s contract
+  says a face failure keeps only faces. Simulated metrics are unchanged.
 - Open: live OBS not tested. The margin under load is small (0.0126 with two
   burners); a cheaper pass for sources below 1080p (#86) stays open.
