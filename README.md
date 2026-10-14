@@ -47,7 +47,7 @@ Stream Privacy Guard holds each frame back for a moment, scans it, and blurs any
 | 🙂 **Faces** | Blurs faces in camera, window and display captures (YuNet). |
 | 📝 **Your watch-list** | Blurs strings you add, such as your real name, address or alt accounts. Matching is fuzzy, so small misreadings by the text reader still match. |
 | 💳 **Personal data** | Detects email addresses, phone numbers, payment card numbers, IP addresses, street addresses, and API and stream keys. |
-| ⏪ **Retroactive masking** | When something is found, the blur is also applied to the buffered frames before it. A secret is covered from its very first frame. |
+| ⏪ **Retroactive masking** | When something is found, the blur also reaches back to earlier frames still waiting in the lookahead buffer, so a secret is usually covered from its first frame. Frames that have already aired can't be protected. |
 | 🔒 **Fails closed** | If a frame can't be scanned before its deadline, the whole source is blurred. No setting airs an unscanned frame. |
 | 🏃 **Follows motion** | Masks track scrolling chat and moving windows, and stay on for a short hold after the last detection. |
 | 🛜 **Fully local** | No network calls, accounts or telemetry. Watch-list entries never reach logs or scene collections. |
@@ -99,7 +99,7 @@ The core (`spg-core`) has no OBS dependency, so the same pipeline runs headless 
 1. Right-click the source to protect (a display, window or camera capture) and choose **Filters**. Click **+** under *Effect Filters* and add **Privacy Guard**.
 2. **Add watch-list entries.** Type your real name, address, account names or other strings into **New entry**, which is masked as you type, then click **Add entry**. An entry can't be read back after you add it.
 3. **Choose what to detect.** Faces, watch-list entries and every personal-data category are on by default.
-4. **Sync your audio.** The filter delays video by the lookahead (500 ms by default) but can't delay audio. In **Edit › Advanced Audio Properties**, set **Sync Offset** to the same number of milliseconds on every audio source that goes with this video.
+4. **Sync your audio.** The filter delays video by the lookahead (500 ms by default) but can't delay audio. In **Edit › Advanced Audio Properties**, set **Sync Offset** to the lookahead on every audio source that goes with this video. If the video memory budget shortens the lookahead, the filter's properties show a warning with the actual value: use that value, or raise the budget.
 
 <details>
 <summary><b>Settings at a glance</b></summary>
@@ -121,7 +121,7 @@ The properties panel also counts the frames aired with only detected regions mas
 
 ### Synthetic evaluation
 
-The pipeline is scored on generated scenes: chat, documents, notifications, scrolling text and faces. The commit tested is `f5502ce`, on an Apple M4 MacBook Air, with `bash scripts/ci/run.sh eval --local`. Limits are set in [`eval/thresholds.toml`](eval/thresholds.toml), and the metrics are defined in [docs/eval.md](docs/eval.md).
+The pipeline is scored on generated scenes: chat, documents, notifications, scrolling text and faces. The commit tested is `f5502ce`, on an Apple M4 MacBook Air (fanless, on AC power), with `bash scripts/ci/run.sh eval --local`. The realtime fail-closed row is the median and range of 7 interleaved runs of the change that introduced it (#99). Timing varies from run to run, and a busy machine does worse (see [Limitations](#limitations)). Limits are set in [`eval/thresholds.toml`](eval/thresholds.toml), and the metrics are defined in [docs/eval.md](docs/eval.md).
 
 | Suite | Metric | Result | Target |
 | --- | --- | ---: | ---: |
@@ -130,9 +130,10 @@ The pipeline is scored on generated scenes: chat, documents, notifications, scro
 | Text | Personal-data recall | **99.9%** | ≥ 90% |
 | Text | Frames with a leak | **0.36%** | ≤ 2% |
 | Text | Blurred area on clean frames | **0.25%** | ≤ 3% |
+| Text | Harmless text blurred near secrets (decoy blur) | **52.8%** | ≤ 55% |
 | Faces | Face recall | **100%** | ≥ 90% |
 | Faces | Frames with a leak | **0%** | ≤ 5% |
-| Realtime (1080p60) | Frames covered by the fail-closed fallback | **0–1%** | ≤ 1% |
+| Realtime (1080p60) | Frames covered by the fail-closed fallback | **0.22%** median (0–1.04% over 7 runs) | ≤ 1% |
 | Realtime (1080p60) | Detection latency, p95 | **255 ms** | ≤ 400 ms |
 
 Synthetic results don't prove live behaviour: generated scenes are simpler than a real desktop.
@@ -168,7 +169,7 @@ Read these before you rely on the filter.
   - Faces under about 30 px at 1080p may be missed.
   - Text with a cap height under about 10 px may be missed, and upside-down text isn't read.
   - Text the reader misreads beyond the fuzzy-match tolerance is missed.
-- **Over-blurring near secrets.** Harmless text close to sensitive text, especially in scrolling chat, is often blurred too, because the filter prefers blurring too much to too little.
+- **Over-blurring near secrets.** Harmless text close to sensitive text, especially in scrolling chat, is often blurred too, because the filter prefers blurring too much to too little. About half of the decoy text in the synthetic suite gets blurred ([#97](https://github.com/neanicc/stream-privacy-guard/issues/97) tracks reducing this).
 - **Delay and memory.** Video airs one lookahead late, and you set the audio Sync Offset yourself.
   - At 1080p60, the 500 ms lookahead holds about 240 MB of video memory.
   - At 4K, the default budget shortens the lookahead.
@@ -210,7 +211,7 @@ bash scripts/ci/run.sh test    # run every test with ctest
 bash scripts/ci/run.sh eval    # generate the CI text suite, run the pipeline on it and score it
 ```
 
-The plugin builds to `build/plugin/`. The command-line tool `build/cli/spg-cli` runs the same pipeline on PNG frames: `run`, `bench`, `eval`, and `scrub` for checking a recording for leaks. See [docs/cli.md](docs/cli.md).
+The plugin builds to `build/plugin/`. The command-line tool `build/cli/spg-cli` on Linux and macOS (`build/cli/Release/spg-cli.exe` on Windows) runs the same pipeline on PNG frames: `run`, `bench`, `eval`, and `scrub` for checking a recording for leaks. See [docs/cli.md](docs/cli.md).
 
 <details>
 <summary><b>Dependencies, caching and packaging</b></summary>

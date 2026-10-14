@@ -2732,3 +2732,18 @@ Template:
   `docs/policy.md`.
 - Open: live OBS not tested. The margin under load is small (0.0126 with two
   burners); a cheaper pass for sources below 1080p (#86) stays open.
+
+## 2026-10-14 — README reorganization and architecture diagram (#101)
+
+- Decision / change: reorganized the README for visitors and added an
+  Excalidraw architecture diagram (`docs/architecture.svg`, editable source
+  `docs/architecture.excalidraw`). Two stale claims are corrected: that
+  accuracy was unmeasured, and that the CPU compositor had not landed. The
+  results section now shows the synthetic eval on main f5502ce, including the
+  decoy blur rate near its limit and the realtime fail-closed spread. Live
+  results, the demo media and the release link stay as marked placeholders
+  until the live test (#71).
+- Evidence: synthetic eval figures come from `bash scripts/ci/run.sh eval --local`
+  on f5502ce and the #99 run series; `python3 scripts/check_agent_files.py` passes.
+- Eval delta: none (docs only).
+- Open issues or follow-ups: #71, which fills in the placeholders.
